@@ -79,11 +79,11 @@ double OscillatingPlatformController::readSdfDouble(const std::shared_ptr<const 
 gz::math::Vector3d OscillatingPlatformController::sinusoidalPosition(double time_sec) const
 {
 	const double x = _initial_pose.Pos().X()
-			 + _x_amplitude * std::sin(2.0 * GZ_PI * _x_frequency * time_sec + _x_phase);
+			+ _x_amplitude * std::sin(2.0 * GZ_PI * _x_frequency * time_sec + _x_phase);
 	const double y = _initial_pose.Pos().Y()
-			 + _y_amplitude * std::sin(2.0 * GZ_PI * _y_frequency * time_sec + _y_phase);
+			+ _y_amplitude * std::sin(2.0 * GZ_PI * _y_frequency * time_sec + _y_phase);
 	const double z = _initial_pose.Pos().Z()
-			 + _z_amplitude * std::sin(2.0 * GZ_PI * _z_frequency * time_sec + _z_phase);
+			+ _z_amplitude * std::sin(2.0 * GZ_PI * _z_frequency * time_sec + _z_phase);
 
 	return {x, y, z};
 }

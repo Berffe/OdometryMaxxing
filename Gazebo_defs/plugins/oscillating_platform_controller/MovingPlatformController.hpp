@@ -25,17 +25,17 @@ class OscillatingPlatformController:
 {
 public:
 	void Configure(const gz::sim::Entity &entity,
-		       const std::shared_ptr<const sdf::Element> &sdf,
-		       gz::sim::EntityComponentManager &ecm,
-		       gz::sim::EventManager &eventMgr) override;
+			const std::shared_ptr<const sdf::Element> &sdf,
+			gz::sim::EntityComponentManager &ecm,
+			gz::sim::EventManager &eventMgr) override;
 
 	void PreUpdate(const gz::sim::UpdateInfo &info,
-		       gz::sim::EntityComponentManager &ecm) final;
+			gz::sim::EntityComponentManager &ecm) final;
 
 private:
 	double readSdfDouble(const std::shared_ptr<const sdf::Element> &sdf,
-			     const char *tag,
-			     double default_value) const;
+				const char *tag,
+				double default_value) const;
 
 	gz::math::Vector3d sinusoidalPosition(double time_sec) const;
 

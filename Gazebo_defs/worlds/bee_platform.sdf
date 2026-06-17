@@ -1,87 +1,89 @@
 <sdf version="1.9">
-  <world name="bee_platform">
-    <physics name="1ms" type="ignored">
-      <max_step_size>0.004</max_step_size>
-      <real_time_factor>1.0</real_time_factor>
-    </physics>
+<world name="bee_platform">
+	<physics name="1ms" type="ignored">
+	<max_step_size>0.004</max_step_size>
+	<real_time_factor>1.0</real_time_factor>
+	</physics>
 
-    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
-    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
-    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+	<plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+	<plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+	<plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
 
-    <light name="sun" type="directional">
-      <cast_shadows>true</cast_shadows>
-      <pose>0 0 10 0 0 0</pose>
-      <diffuse>0.8 0.8 0.8 1</diffuse>
-      <specular>0.2 0.2 0.2 1</specular>
-      <direction>-0.5 0.1 -0.9</direction>
-    </light>
+	<light name="sun" type="directional">
+	<cast_shadows>true</cast_shadows>
+	<pose>0 0 10 0 0 0</pose>
+	<diffuse>0.8 0.8 0.8 1</diffuse>
+	<specular>0.2 0.2 0.2 1</specular>
+	<direction>-0.5 0.1 -0.9</direction>
+	</light>
 
-    <model name="ground_plane">
-      <static>true</static>
-      <link name="ground_link">
-        <collision name="collision">
-          <geometry>
-            <box>
-              <size>20 20 0.02</size>
-            </box>
-          </geometry>
-        </collision>
-        <visual name="visual">
-          <geometry>
-            <box>
-              <size>20 20 0.02</size>
-            </box>
-          </geometry>
-          <material>
-            <ambient>0.35 0.45 0.35 1</ambient>
-            <diffuse>0.35 0.45 0.35 1</diffuse>
-          </material>
-        </visual>
-      </link>
-    </model>
+	<model name="ground_plane">
+	<static>true</static>
+	<link name="ground_link">
+		<collision name="collision">
+		<geometry>
+			<box>
+			<size>20 20 0.02</size>
+			</box>
+		</geometry>
+		</collision>
+		<visual name="visual">
+		<geometry>
+			<box>
+			<size>20 20 0.02</size>
+			</box>
+		</geometry>
+		<material>
+			<ambient>0.35 0.45 0.35 1</ambient>
+			<diffuse>0.35 0.45 0.35 1</diffuse>
+		</material>
+		</visual>
+	</link>
+	</model>
 
-    <model name="bee_platform">
-      <pose>0 0 2 0 0 0</pose>
-      <static>true</static>
+	<model name="bee_platform">
+	<pose>0 0 2 0 0 0</pose>
+	<static>true</static>
 
-      <link name="platform_link">
-        <visual name="visual">
-          <geometry>
-            <box>
-              <size>2 2 0.2</size>
-            </box>
-          </geometry>
-          <material>
-            <ambient>0.95 0.70 0.15 1</ambient>
-            <diffuse>0.95 0.70 0.15 1</diffuse>
-          </material>
-        </visual>
+	<link name="platform_link">
+	<visual name="visual">
+		<geometry>
+		<cylinder>
+			<radius>1.0</radius>
+			<length>0.2</length>
+		</cylinder>
+		</geometry>
+		<material>
+		<ambient>0.95 0.70 0.15 1</ambient>
+		<diffuse>0.95 0.70 0.15 1</diffuse>
+		</material>
+	</visual>
 
-        <collision name="collision">
-          <geometry>
-            <box>
-              <size>2 2 0.2</size>
-            </box>
-          </geometry>
-        </collision>
-      </link>
+	<collision name="collision">
+		<geometry>
+		<cylinder>
+			<radius>1.0</radius>
+			<length>0.2</length>
+		</cylinder>
+		</geometry>
+	</collision>
+	</link>
 
-      <plugin filename="libOscillatingPlatformController.so" name="custom::OscillatingPlatformController">
-        <link_name>platform_link</link_name>
+	<plugin filename="libOscillatingPlatformController.so" name="custom::OscillatingPlatformController">
+		<link_name>platform_link</link_name>
 
-        <x_amplitude>1.0</x_amplitude>
-        <x_frequency>0.10</x_frequency>
-        <x_phase>0.0</x_phase>
+		<x_amplitude>1.0</x_amplitude>
+		<x_frequency>0.10</x_frequency>
+		<x_phase>0.0</x_phase>
 
-        <y_amplitude>0.0</y_amplitude>
-        <y_frequency>0.0</y_frequency>
-        <y_phase>0.0</y_phase>
+		<y_amplitude>0.0</y_amplitude>
+		<y_frequency>0.0</y_frequency>
+		<y_phase>0.0</y_phase>
 
-        <z_amplitude>0.30</z_amplitude>
-        <z_frequency>0.20</z_frequency>
-        <z_phase>0.0</z_phase>
-      </plugin>
-    </model>
-  </world>
+		<z_amplitude>0.30</z_amplitude>
+		<z_frequency>0.20</z_frequency>
+		<z_phase>0.0</z_phase>
+	</plugin>
+	</model>
+</world>
 </sdf>
