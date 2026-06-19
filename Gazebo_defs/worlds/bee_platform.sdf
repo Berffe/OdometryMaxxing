@@ -4,10 +4,25 @@
 	<max_step_size>0.004</max_step_size>
 	<real_time_factor>1.0</real_time_factor>
 	</physics>
+	<magnetic_field>5.5645e-06 2.28758e-05 -4.23884e-05</magnetic_field>
 
 	<plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
 	<plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
 	<plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+	<plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors"/>
+	<plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu"/>
+	<plugin filename="gz-sim-air-pressure-system" name="gz::sim::systems::AirPressure"/>
+	<plugin filename="gz-sim-magnetometer-system" name="gz::sim::systems::Magnetometer"/>
+	<plugin filename="gz-sim-navsat-system" name="gz::sim::systems::NavSat"/>
+	
+	<spherical_coordinates>
+	<surface_model>EARTH_WGS84</surface_model>
+	<world_frame_orientation>ENU</world_frame_orientation>
+	<latitude_deg>43.5297</latitude_deg>
+	<longitude_deg>5.4474</longitude_deg>
+	<elevation>0</elevation>
+	<heading_deg>0</heading_deg>
+	</spherical_coordinates>
 
 	<light name="sun" type="directional">
 	<cast_shadows>true</cast_shadows>
@@ -72,16 +87,16 @@
 	<plugin filename="libOscillatingPlatformController.so" name="custom::OscillatingPlatformController">
 		<link_name>platform_link</link_name>
 
-		<x_amplitude>1.0</x_amplitude>
-		<x_frequency>0.10</x_frequency>
+		<x_amplitude>0.0</x_amplitude>
+		<x_frequency>0.0</x_frequency>
 		<x_phase>0.0</x_phase>
 
 		<y_amplitude>0.0</y_amplitude>
 		<y_frequency>0.0</y_frequency>
 		<y_phase>0.0</y_phase>
 
-		<z_amplitude>0.30</z_amplitude>
-		<z_frequency>0.20</z_frequency>
+		<z_amplitude>0.0</z_amplitude>
+		<z_frequency>0.0</z_frequency>
 		<z_phase>0.0</z_phase>
 	</plugin>
 	</model>

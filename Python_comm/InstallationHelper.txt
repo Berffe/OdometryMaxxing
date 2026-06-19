@@ -1,0 +1,54 @@
+To help you install ROS and its dependencies :
+
+# Enable UTF-8 locale (usually already set, but confirm)
+locale  # check for UTF-8
+
+sudo apt update && sudo apt install locales
+sudo locale-gen en_US en_US.UTF-8
+sudo update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+
+# Add the ROS 2 apt repository
+sudo apt install software-properties-common
+sudo add-apt-repository universe
+
+sudo apt update && sudo apt install curl -y
+sudo curl -sSL https://raw.githubusercontent.com/ros/rosdistro/master/ros.key \
+  -o /usr/share/keyrings/ros-archive-keyring.gpg
+
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/ros-archive-keyring.gpg] \
+http://packages.ros.org/ros2/ubuntu $(. /etc/os-release && echo $UBUNTU_CODENAME) main" \
+  | sudo tee /etc/apt/sources.list.d/ros2.list > /dev/null
+
+# Install
+sudo apt update
+sudo apt install ros-jazzy-ros-base -y
+sudo apt install ros-dev-tools -y
+
+# Dev tools (colcon, rosdep — needed for building px4_msgs later)
+sudo apt install ros-dev-tools -y
+
+
+source /opt/ros/jazzy/setup.bash    # 1. ROS environment first
+source ~/.control_venv/bin/activate  # 2. then your venv
+
+
+## Structure
+					┌─────────────┐
+                    │  Gazebo Sim │
+                    │  (camera,   │
+                    │  platform)  │
+                    └──────┬──────┘
+                           │
+              ┌────────────┴────────────┐
+              ▼                         ▼
+      ros_gz_bridge              gz_bridge (built into PX4)
+              │                         │
+              ▼                         ▼
+       ROS 2 topics              uXRCE-DDS → ROS 2 topics
+      (/camera/image)           (/fmu/out/..., /fmu/in/...)
+              │                         │
+              └───────────┬─────────────┘
+                           ▼
+                  Your Python rclpy node
+                  (sees camera + PX4 state,
+                   can publish setpoints)
