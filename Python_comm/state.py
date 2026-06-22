@@ -39,9 +39,9 @@ class FlowResult:
 
 	timestamp: float = 0.0
 	valid: bool = False
-	flow_field: object = None
 	mean_flow_x: float = 0.0
 	mean_flow_y: float = 0.0
+	divergence: float = 0.0
 
 
 @dataclass

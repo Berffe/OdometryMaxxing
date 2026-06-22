@@ -1,49 +1,76 @@
 """
 Low-frequency vision-only control law.
 
-This module turns a TargetEstimate into a desired attitude/thrust
-setpoint. It deliberately does not read PX4 position or velocity; PX4
-keeps the fast inner stabilization loop, while this law only produces
-slow attitude/thrust references from vision-derived quantities.
+This module turns a TargetEstimate + FlowResult into a desired
+attitude/thrust setpoint.
+
+PX4 keeps the fast inner stabilization loop. This controller only
+produces slow attitude/thrust references from vision-derived quantities:
+
+    roll_cmd   = -Kx * offset_x
+    pitch_cmd  = -Ky * offset_y
+    thrust_cmd = hover_thrust + Kdiv * (divergence - divergence_setpoint)
+    yaw_cmd    = yaw_setpoint
+
+No PX4 position or velocity feedback is used here.
 """
 
-from .state import AttitudeSetpoint, TargetEstimate
+from .state import AttitudeSetpoint, FlowResult, TargetEstimate
 
 
 class ControlLaw:
 	"""
-	Simple first implementation of the target-centering law:
+	Simple first implementation of the target-centering + divergence
+	landing law.
 
-		roll_cmd  = -Kx * (cx - cx*)
-		pitch_cmd = -Ky * (cy - cy*)
-		thrust    = hover_thrust
-		yaw       = yaw_setpoint
+	Target centering:
 
-	TargetAcquisition returns normalized image offsets, not raw pixels:
-		offset_x = (cx - image_center_x) / (image_width  / 2)
-		offset_y = (cy - image_center_y) / (image_height / 2)
+		roll_cmd  = -roll_gain  * target.offset_x
+		pitch_cmd = -pitch_gain * target.offset_y
 
-	So offset_x and offset_y are approximately in [-1, 1]. This makes the
-	gains easy to interpret: Kx and Ky are roughly the maximum attitude
-	command [rad] requested for a target at the image border, before
-	saturation.
+	Optical-flow divergence landing:
 
-	The signs follow the mathematical convention proposed in the control
-	design. If the first flight test moves away from the target instead of
-	towards it, flip the sign of roll_gain and/or pitch_gain rather than
-	changing the rest of the code.
+		thrust = hover_thrust + divergence_gain * (
+			flow.divergence - divergence_setpoint
+		)
+
+	Interpretation with positive divergence_gain:
+
+		flow.divergence < divergence_setpoint
+			=> thrust decreases
+			=> drone descends faster
+
+		flow.divergence > divergence_setpoint
+			=> thrust increases
+			=> drone slows down its descent
+
+	The signs may need to be flipped after the first Gazebo test depending
+	on camera convention, PX4 attitude convention, and the sign of the
+	divergence estimator.
 	"""
 
 	def __init__(
 		self,
 		hover_thrust: float = 0.5,
 		yaw_setpoint: float = 0.0,
+
+		# Lateral target-centering gains.
 		roll_gain: float = 0.10,
 		pitch_gain: float = 0.10,
+
+		# Divergence-based vertical control.
+		divergence_gain: float = 0.05,
+		divergence_setpoint: float = 0.15,
+
+		# Safety limits.
 		roll_limit: float = 0.15,
 		pitch_limit: float = 0.15,
 		thrust_min: float = 0.20,
 		thrust_max: float = 0.80,
+
+		# Conservative default:
+		# only use divergence landing when the target is found.
+		require_target_for_descent: bool = True,
 	):
 		self._hover_thrust = hover_thrust
 		self._yaw_setpoint = yaw_setpoint
@@ -51,46 +78,91 @@ class ControlLaw:
 		self._roll_gain = roll_gain
 		self._pitch_gain = pitch_gain
 
+		self._divergence_gain = divergence_gain
+		self._divergence_setpoint = divergence_setpoint
+
 		self._roll_limit = abs(roll_limit)
 		self._pitch_limit = abs(pitch_limit)
+
 		self._thrust_min = thrust_min
 		self._thrust_max = thrust_max
 
-	def compute(self, target: TargetEstimate, dt: float) -> AttitudeSetpoint:
+		self._require_target_for_descent = require_target_for_descent
+
+	def compute(
+		self,
+		target: TargetEstimate,
+		flow: FlowResult,
+		dt: float,
+	) -> AttitudeSetpoint:
 		"""
 		Compute the latest attitude/thrust setpoint.
 
-		dt is accepted now so the public API is already compatible with the
-		future PI/PID version, but the current first implementation is purely
-		proportional and therefore does not use dt.
+		dt is accepted so the public API is already compatible with future
+		integral/derivative terms, but this first version does not use it.
 		"""
-		thrust = self._clamp(self._hover_thrust, self._thrust_min, self._thrust_max)
 
-		if not target.found:
-			# No reliable target yet: stay neutral and hover-ish instead of
-			# integrating or commanding a blind correction.
-			return AttitudeSetpoint(
-				timestamp=target.timestamp,
-				roll=0.0,
-				pitch=0.0,
-				yaw=self._yaw_setpoint,
-				thrust=thrust,
+		# ------------------------------------------------------------
+		# 1. Default command: neutral attitude, hover thrust.
+		# ------------------------------------------------------------
+		roll_cmd = 0.0
+		pitch_cmd = 0.0
+		yaw_cmd = self._yaw_setpoint
+		thrust_cmd = self._hover_thrust
+
+		# ------------------------------------------------------------
+		# 2. Lateral target-centering control.
+		# ------------------------------------------------------------
+		if target.found:
+			roll_cmd = -self._roll_gain * target.offset_x
+			pitch_cmd = -self._pitch_gain * target.offset_y
+
+			roll_cmd = self._clamp(
+				roll_cmd,
+				-self._roll_limit,
+				self._roll_limit,
 			)
 
-		roll_cmd = -self._roll_gain * target.offset_x
-		pitch_cmd = -self._pitch_gain * target.offset_y
+			pitch_cmd = self._clamp(
+				pitch_cmd,
+				-self._pitch_limit,
+				self._pitch_limit,
+			)
 
-		roll_cmd = self._clamp(roll_cmd, -self._roll_limit, self._roll_limit)
-		pitch_cmd = self._clamp(pitch_cmd, -self._pitch_limit, self._pitch_limit)
+		# ------------------------------------------------------------
+		# 3. Divergence-based thrust control.
+		# ------------------------------------------------------------
+		can_use_divergence = flow is not None and flow.valid
+
+		if self._require_target_for_descent:
+			can_use_divergence = can_use_divergence and target.found
+
+		if can_use_divergence:
+			divergence_error = flow.divergence - self._divergence_setpoint
+
+			thrust_cmd = (
+				self._hover_thrust
+				+ self._divergence_gain * divergence_error
+			)
+
+		# ------------------------------------------------------------
+		# 4. Final thrust saturation.
+		# ------------------------------------------------------------
+		thrust_cmd = self._clamp(
+			thrust_cmd,
+			self._thrust_min,
+			self._thrust_max,
+		)
 
 		return AttitudeSetpoint(
 			timestamp=target.timestamp,
 			roll=roll_cmd,
 			pitch=pitch_cmd,
-			yaw=self._yaw_setpoint,
-			thrust=thrust,
+			yaw=yaw_cmd,
+			thrust=thrust_cmd,
 		)
 
 	@staticmethod
 	def _clamp(value: float, lower: float, upper: float) -> float:
 		return max(lower, min(upper, float(value)))
+	

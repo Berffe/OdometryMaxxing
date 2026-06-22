@@ -103,20 +103,47 @@ class TargetAcquisition:
 
 	def update(self, frame_bgr, flow_result: Optional[FlowResult] = None) -> TargetEstimate:
 		"""
-		Detect the landing target in the current camera frame.
+		Production function used by bee_node.py.
 
-		Returns found=False when no sufficiently reliable contour is detected.
+		This must always return the original TargetEstimate structure:
+			timestamp
+			found
+			offset_x
+			offset_y
+			confidence
+
+		No debug data is returned here.
 		"""
-		debug = self.process_debug(frame_bgr, flow_result)
-		return debug["target"]
+		timestamp = flow_result.timestamp if flow_result is not None else 0.0
+
+		if frame_bgr is None:
+			return TargetEstimate(timestamp=timestamp, found=False)
+
+		height, width = frame_bgr.shape[:2]
+		if width <= 0 or height <= 0:
+			return TargetEstimate(timestamp=timestamp, found=False)
+
+		masks = self._build_masks(frame_bgr)
+		clean_mask = masks["clean_mask"]
+
+		contour = self._select_best_contour(clean_mask, width, height)
+
+		if contour is None:
+			return TargetEstimate(timestamp=timestamp, found=False)
+
+		return self._target_from_contour(
+			contour=contour,
+			width=width,
+			height=height,
+			timestamp=timestamp,
+		)
 
 	def process_debug(self, frame_bgr, flow_result: Optional[FlowResult] = None) -> dict:
 		"""
-		Same detection pipeline as update(), but returns intermediate images
-		and the selected contour for visualization/debugging.
+		Debug-only function.
 
-		This is useful for tuning thresholds before connecting the detector
-		to the live Gazebo camera.
+		Returns intermediate images and selected contour for visualization.
+		This function is not used by the controller.
 		"""
 		timestamp = flow_result.timestamp if flow_result is not None else 0.0
 
@@ -153,7 +180,12 @@ class TargetAcquisition:
 		if contour is None:
 			target = TargetEstimate(timestamp=timestamp, found=False)
 		else:
-			target = self._target_from_contour(contour, width, height, timestamp)
+			target = self._target_from_contour(
+				contour=contour,
+				width=width,
+				height=height,
+				timestamp=timestamp,
+			)
 
 		return {
 			"frame": frame_bgr,
@@ -386,6 +418,7 @@ class TargetAcquisition:
 		timestamp: float,
 	) -> TargetEstimate:
 		moments = cv2.moments(contour)
+
 		if abs(moments["m00"]) < 1e-6:
 			return TargetEstimate(timestamp=timestamp, found=False)
 
@@ -397,6 +430,7 @@ class TargetAcquisition:
 
 		area = cv2.contourArea(contour)
 		area_fraction = area / float(width * height)
+
 		confidence = self._estimate_confidence(contour, area_fraction)
 
 		return TargetEstimate(
