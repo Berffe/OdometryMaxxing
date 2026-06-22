@@ -394,8 +394,8 @@ class TargetAcquisition:
 
 if __name__ == "__main__":
 	try:
-		from .target_acquisition_debug import test
+		from ._target_acquisition_debug import test
 	except ImportError:
-		from target_acquisition_debug import test
+		from Python_comm._target_acquisition_debug import test
 
 	test()

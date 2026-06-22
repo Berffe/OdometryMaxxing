@@ -44,7 +44,7 @@ class OpticalFlowEstimator:
 		poly_n: int = 5,
 		poly_sigma: float = 1.2,
 		require_target_roi: bool = True,
-		roi_margin_fraction: float = 0.25,
+		roi_margin_fraction: float = 0.05,
 		min_roi_size_px: int = 32,
 		divergence_smoothing: float = 0.6,
 		store_debug: bool = False,
@@ -352,8 +352,8 @@ class OpticalFlowEstimator:
 
 if __name__ == "__main__":
 	try:
-		from .optical_flow_debug import test
+		from ._optical_flow_debug import test
 	except ImportError:
-		from optical_flow_debug import test
+		from _optical_flow_debug import test
 
 	test()

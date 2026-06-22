@@ -26,7 +26,7 @@ try:
 	from .target_acquisition import TargetAcquisition
 	from .optical_flow import OpticalFlowEstimator
 
-	from .target_acquisition_debug import (
+	from ._target_acquisition_debug import (
 		_make_dummy_frame,
 		_draw_detection_debug,
 		_to_bgr_for_display,
@@ -34,7 +34,7 @@ try:
 		_label_tile,
 	)
 
-	from .optical_flow_debug import (
+	from ._optical_flow_debug import (
 		_draw_flow_arrows,
 		_flow_to_color,
 		_divergence_to_heatmap,
@@ -44,7 +44,7 @@ except ImportError:
 	from target_acquisition import TargetAcquisition
 	from optical_flow import OpticalFlowEstimator
 
-	from target_acquisition_debug import (
+	from _target_acquisition_debug import (
 		_make_dummy_frame,
 		_draw_detection_debug,
 		_to_bgr_for_display,
@@ -52,7 +52,7 @@ except ImportError:
 		_label_tile,
 	)
 
-	from optical_flow_debug import (
+	from _optical_flow_debug import (
 		_draw_flow_arrows,
 		_flow_to_color,
 		_divergence_to_heatmap,
@@ -268,7 +268,7 @@ def test():
 
 	flow_estimator = OpticalFlowEstimator(
 		require_target_roi=True,
-		roi_margin_fraction=0.25,
+		roi_margin_fraction=0.05,
 		min_roi_size_px=32,
 		divergence_smoothing=0.6,
 		store_debug=True,
