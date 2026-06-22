@@ -52,6 +52,8 @@ class TargetEstimate:
 	found: bool = False
 	offset_x: float = 0.0
 	offset_y: float = 0.0
+	detection_width : float = 0.0 ; 
+	detection_height : float = 0.0
 	confidence: float = 0.0
 
 
