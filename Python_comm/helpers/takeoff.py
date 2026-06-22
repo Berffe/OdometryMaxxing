@@ -31,7 +31,7 @@ EKF2_SETTLE_TIME = 5.0  # seconds
 
 async def run():
 	drone = System()
-	await drone.connect(system_address="udpin:0.0.0.0:14540")
+	await drone.connect(system_address="udp://0.0.0.0:14540")
 
 	# ── Wait for connection ──────────────────────────────────────────────────
 	print("Waiting for drone connection...")
@@ -82,14 +82,14 @@ async def run():
 			break
 
 	# ── Hover then land ──────────────────────────────────────────────────────
-	await asyncio.sleep(5)
-	print("Landing...")
-	await drone.action.land()
+	# await asyncio.sleep(5)
+	# print("Landing...")
+	# await drone.action.land()
 
-	async for armed in drone.telemetry.armed():
-		if not armed:
-			print("Disarmed. Done.")
-			break
+	# async for armed in drone.telemetry.armed():
+	# 	if not armed:
+	# 		print("Disarmed. Done.")
+	# 		break
 
 
 if __name__ == "__main__":

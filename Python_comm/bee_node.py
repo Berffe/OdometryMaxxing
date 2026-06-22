@@ -19,11 +19,13 @@ from .optical_flow import OpticalFlowEstimator
 from .target_acquisition import TargetAcquisition
 from .control_law import ControlLaw
 from .px4_interface import PX4Interface
+from .diagnostics_writer import DiagnosticsWriter
 
 
 HEARTBEAT_PERIOD_SEC = 0.1
 CONTROL_PERIOD_SEC = 0.5
 ARM_AFTER_HEARTBEATS = 10
+SHOW_CAMERA = True
 
 
 class BeeLandNode(Node):
@@ -52,6 +54,16 @@ class BeeLandNode(Node):
 		self.optical_flow = OpticalFlowEstimator()
 		self.target_acquisition = TargetAcquisition()
 		self.control_law = ControlLaw()
+
+		self.diagnostics = DiagnosticsWriter(
+			output_dir="logs",
+			filename=None,
+			flush_every_row=True,
+		)
+
+		self.get_logger().info(
+			f"Diagnostics CSV: {self.diagnostics.filepath}"
+		)
 
 		px4_qos = QoSProfile(
 			reliability=QoSReliabilityPolicy.BEST_EFFORT,
@@ -86,7 +98,8 @@ class BeeLandNode(Node):
 		self.create_timer(HEARTBEAT_PERIOD_SEC, self.on_heartbeat_timer)
 		self.create_timer(CONTROL_PERIOD_SEC, self.on_control_timer)
 
-		cv2.namedWindow("Bee Land - Camera", cv2.WINDOW_NORMAL)
+		if SHOW_CAMERA : 
+			cv2.namedWindow("Bee Land - Camera", cv2.WINDOW_NORMAL)
 
 		self.get_logger().info("bee_land_node started.")
 		self.get_logger().info("Waiting for PX4 local position on /fmu/out/vehicle_local_position_v1")
@@ -106,13 +119,15 @@ class BeeLandNode(Node):
 			)
 
 		try:
-			frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
+			src = self.bridge.imgmsg_to_cv2(msg, desired_encoding="bgr8")
 		except CvBridgeError as exc:
 			self.get_logger().error(f"cv_bridge conversion failed: {exc}")
 			return
 
-		cv2.imshow("Bee Land - Camera", frame)
-		cv2.waitKey(1)
+		if SHOW_CAMERA : 
+			frame = cv2.rotate(src, cv2.ROTATE_180)
+			cv2.imshow("Bee Land - Camera", frame)
+			cv2.waitKey(1)
 
 		# Same timestamp for target and flow.
 		stamp = time.time()
@@ -175,6 +190,14 @@ class BeeLandNode(Node):
 			self._latest_flow,
 			CONTROL_PERIOD_SEC,
 		)
+	
+		self.diagnostics.write(
+			wall_timestamp=time.time(),
+			target=self._latest_target,
+			flow=self._latest_flow,
+			setpoint=self._latest_setpoint,
+			vehicle_state=self._vehicle_state,
+		)
 
 
 def main(args=None):
@@ -187,8 +210,11 @@ def main(args=None):
 	except KeyboardInterrupt:
 		pass
 	finally:
+		node.diagnostics.close()
 		node.destroy_node()
-		cv2.destroyAllWindows()
+
+		if SHOW_CAMERA : 
+			cv2.destroyAllWindows()
 		rclpy.shutdown()
 
 

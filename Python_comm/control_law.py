@@ -21,17 +21,22 @@ from .state import AttitudeSetpoint, FlowResult, TargetEstimate
 class ControlLaw:
 	def __init__(
 		self,
-		hover_thrust: float = 0.5,
-		yaw_setpoint: float = 0.0,
-		roll_gain: float = 0.10,
-		pitch_gain: float = 0.10,
-		divergence_gain: float = 0.05,
-		divergence_setpoint: float = 0.15,
-		roll_limit: float = 0.15,
-		pitch_limit: float = 0.15,
-		thrust_min: float = 0.20,
-		thrust_max: float = 0.80,
-		require_target_for_descent: bool = True,
+		hover_thrust=0.45, # 0.45
+		yaw_setpoint=0.0,
+
+		roll_gain=0.05,
+		pitch_gain=0,
+
+		divergence_gain=0.03,
+		divergence_setpoint=0.15,
+
+		roll_limit=0.10,
+		pitch_limit=0.10,
+
+		thrust_min=0.35,
+		thrust_max=0.65,
+
+		require_target_for_descent=True,
 	):
 		self._hover_thrust = hover_thrust
 		self._yaw_setpoint = yaw_setpoint
