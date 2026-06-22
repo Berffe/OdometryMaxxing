@@ -13,6 +13,11 @@ This file summarizes the terminals needed to launch the current BEE_LAND simulat
 ## Terminal 1 — Launch PX4 SITL + Gazebo with `bee_x500`
 
 ```bash
+unset GZ_CONFIG_PATH
+unset GZ_VERSION
+export PATH=/usr/bin:/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/sbin:$PATH
+hash -r
+
 cd ~/PX4-Autopilot
 
 source build/px4_sitl_default/rootfs/gz_env.sh
@@ -88,8 +93,7 @@ This allows regular ROS 2 nodes, `rqt_image_view`, and `cv_bridge` to access the
 ```bash
 cd ~/PX4-Autopilot/BEE_LAND/controller
 
-source /opt/ros/humble/setup.bash
-source install/setup.bash  # only if using a built ROS workspace
+ros_bee # Defined in /.bashrc
 
 python3 bee_node.py
 ```

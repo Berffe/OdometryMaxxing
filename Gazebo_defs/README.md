@@ -7,6 +7,8 @@ Pour copier les fichiers de Windows à Linux (dans le terminal Linux!) :
 cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Gazebo_defs/* ~/PX4-Autopilot/BEE_LAND/
 ```
 
+cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Python_comm/*.py ~/PX4-Autopilot/BEE_LAND/controller/
+
 Le contraire, Linux à Windows (dans le terminal Windows!) :
 
 ```bash

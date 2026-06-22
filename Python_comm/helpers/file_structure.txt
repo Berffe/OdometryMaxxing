@@ -1,0 +1,7 @@
+bee_land/                      # your existing ROS 2 package's python module dir
+├── bee_node.py                 # the ROS node — owns subs/pubs/timers, no algorithm logic
+├── state.py                     # typed dataclasses: the contract between modules
+├── optical_flow.py              # OpticalFlowEstimator — pure python, no ROS
+├── target_acquisition.py        # TargetAcquisition  — pure python, no ROS
+├── control_law.py               # ControlLaw          — pure python, no ROS
+└── px4_interface.py             # all px4_msgs construction + arm/offboard handshake

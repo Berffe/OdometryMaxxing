@@ -1,4 +1,4 @@
-To help you install ROS and its dependencies :
+To help you install ROS and its dependencies specifically :
 
 # Enable UTF-8 locale (usually already set, but confirm)
 locale  # check for UTF-8
