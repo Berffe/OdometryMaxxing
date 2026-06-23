@@ -27,6 +27,22 @@ The detector avoids neural networks and uses:
 
 The detection box dimensions are returned in TargetEstimate so the
 optical-flow estimator can compute divergence only on the target ROI.
+TargetEstimate also carries area_fraction (detection area / frame area),
+so the controller can tell a normally-sized detection apart from one
+that fills most of the frame.
+
+A detection that covers most or all of the image is never hard-rejected:
+at the very end of a landing approach the target *is* the flower filling
+the camera's view, and that is the success condition, not an outlier.
+Large detections are only down-weighted relative to normally-sized ones
+(see _large_area_penalty), so a well-formed full-frame contour still
+wins when nothing better-shaped competes with it.
+
+A short temporal hold also bridges single-frame detection dropouts
+(motion blur, a shadow, a momentary mask gap): if no contour is found
+within `loss_grace_period_sec` of the last detection, the last known
+TargetEstimate is reused with its confidence decayed toward zero instead
+of immediately reporting found=False.
 
 Debug path:
 
@@ -41,6 +57,7 @@ starts the visual test.
 """
 
 from typing import Optional, Sequence, Tuple
+from dataclasses import replace
 
 import cv2
 import numpy as np
@@ -61,18 +78,21 @@ class TargetAcquisition:
 		min_area_px: float = 80.0,
 		max_area_fraction: float = 0.60,
 		absolute_max_area_fraction: float = 0.95,
+		min_large_area_penalty: float = 0.5,
 		blur_kernel_size: int = 5,
 		morph_kernel_size: int = 5,
 		min_saturation: int = 60,
 		min_value: int = 45,
 		canny_low: int = 60,
 		canny_high: int = 140,
+		loss_grace_period_sec: float = 0.15,
 	):
 		self._hsv_ranges = list(hsv_ranges) if hsv_ranges is not None else None
 
 		self._min_area_px = float(min_area_px)
 		self._max_area_fraction = float(max_area_fraction)
 		self._absolute_max_area_fraction = float(absolute_max_area_fraction)
+		self._min_large_area_penalty = float(min_large_area_penalty)
 
 		self._blur_kernel_size = self._make_odd(blur_kernel_size)
 		self._morph_kernel_size = self._make_odd(morph_kernel_size)
@@ -82,6 +102,13 @@ class TargetAcquisition:
 
 		self._canny_low = int(canny_low)
 		self._canny_high = int(canny_high)
+
+		# Temporal hold: lets a brief detection dropout reuse the last
+		# known-good TargetEstimate instead of immediately going to
+		# found=False. See _held_target_or_lost().
+		self._loss_grace_period_sec = float(loss_grace_period_sec)
+		self._last_found_target: Optional[TargetEstimate] = None
+		self._last_found_time: Optional[float] = None
 
 	def update(
 		self,
@@ -101,6 +128,7 @@ class TargetAcquisition:
 			confidence
 			detection_width
 			detection_height
+			area_fraction
 		"""
 		timestamp = self._resolve_timestamp(flow_result, timestamp)
 
@@ -114,10 +142,7 @@ class TargetAcquisition:
 		masks = self._build_masks(frame_bgr)
 		contour = self._select_best_contour(masks["clean_mask"], width, height)
 
-		if contour is None:
-			return TargetEstimate(timestamp=timestamp, found=False)
-
-		return self._target_from_contour(contour, width, height, timestamp)
+		return self._resolve_target(contour, width, height, timestamp)
 
 	def process_debug(
 		self,
@@ -161,10 +186,7 @@ class TargetAcquisition:
 		masks = self._build_masks(frame_bgr)
 		contour = self._select_best_contour(masks["clean_mask"], width, height)
 
-		if contour is None:
-			target = TargetEstimate(timestamp=timestamp, found=False)
-		else:
-			target = self._target_from_contour(contour, width, height, timestamp)
+		target = self._resolve_target(contour, width, height, timestamp)
 
 		return {
 			"frame": frame_bgr,
@@ -176,6 +198,63 @@ class TargetAcquisition:
 			"contour": contour,
 			"target": target,
 		}
+
+	def reset(self):
+		"""Clear temporal memory (the held last-known-good target)."""
+		self._last_found_target = None
+		self._last_found_time = None
+
+	def _resolve_target(
+		self,
+		contour,
+		width: int,
+		height: int,
+		timestamp: float,
+	) -> TargetEstimate:
+		"""
+		Turn a selected contour (or lack of one) into a TargetEstimate,
+		updating/consulting the temporal hold as needed.
+		"""
+		if contour is None:
+			return self._held_target_or_lost(timestamp)
+
+		target = self._target_from_contour(contour, width, height, timestamp)
+		self._last_found_target = target
+		self._last_found_time = timestamp
+
+		return target
+
+	def _held_target_or_lost(self, timestamp: float) -> TargetEstimate:
+		"""
+		Bridge brief detection dropouts instead of immediately reporting
+		the target as lost.
+
+		A single bad frame (motion blur, a shadow crossing the flower, a
+		momentary mask gap) should not flip `found` to False, especially
+		in the last seconds of the approach where the controller is
+		actively descending on the assumption a target is present. While
+		inside the grace period, the last known-good estimate is reused
+		with its timestamp updated and its confidence linearly decayed
+		toward zero, so downstream consumers (control law, diagnostics)
+		can tell the estimate is aging rather than freshly detected.
+		"""
+		if (
+			self._loss_grace_period_sec > 0.0
+			and self._last_found_target is not None
+			and self._last_found_time is not None
+		):
+			elapsed = timestamp - self._last_found_time
+
+			if 0.0 <= elapsed <= self._loss_grace_period_sec:
+				decay = 1.0 - (elapsed / self._loss_grace_period_sec)
+
+				return replace(
+					self._last_found_target,
+					timestamp=timestamp,
+					confidence=self._last_found_target.confidence * decay,
+				)
+
+		return TargetEstimate(timestamp=timestamp, found=False)
 
 	def _build_masks(self, frame_bgr) -> dict:
 		blurred = cv2.GaussianBlur(
@@ -264,10 +343,6 @@ class TargetAcquisition:
 
 			area_fraction = area / image_area
 
-			# Hard rejection only when the blob is almost the whole image.
-			if area_fraction > self._absolute_max_area_fraction:
-				continue
-
 			perimeter = cv2.arcLength(contour, closed=True)
 			if perimeter <= 1e-6:
 				continue
@@ -338,24 +413,33 @@ class TargetAcquisition:
 			confidence=float(confidence),
 			detection_width=float(detection_width),
 			detection_height=float(detection_height),
+			area_fraction=float(area_fraction),
 		)
 
 	def _large_area_penalty(self, area_fraction: float) -> float:
+		"""
+		Down-weight, but never reject, contours that cover a large
+		fraction of the frame.
+
+		At the very end of a landing approach the target (the flower) is
+		expected to fill most or all of the image — that is the success
+		condition, not an outlier to discard. The penalty ramps from 1.0
+		at `max_area_fraction` down to `min_large_area_penalty` at
+		`absolute_max_area_fraction`, then holds at that floor all the
+		way to full-frame coverage instead of continuing to fall to zero.
+		"""
 		if area_fraction <= self._max_area_fraction:
 			return 1.0
 
-		if self._absolute_max_area_fraction <= self._max_area_fraction:
-			return 0.4
-
-		ratio = (
-			(area_fraction - self._max_area_fraction)
-			/ (self._absolute_max_area_fraction - self._max_area_fraction)
+		span = max(
+			self._absolute_max_area_fraction - self._max_area_fraction,
+			1e-6,
 		)
 
+		ratio = (area_fraction - self._max_area_fraction) / span
 		ratio = max(0.0, min(1.0, ratio))
 
-		# Keep a nonzero score for close-range large targets.
-		return 1.0 - 0.6 * ratio
+		return 1.0 - (1.0 - self._min_large_area_penalty) * ratio
 
 	@staticmethod
 	def _estimate_confidence(contour, area_fraction: float) -> float:
@@ -396,6 +480,6 @@ if __name__ == "__main__":
 	try:
 		from ._target_acquisition_debug import test
 	except ImportError:
-		from Python_comm._target_acquisition_debug import test
+		from _target_acquisition_debug import test
 
 	test()

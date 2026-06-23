@@ -55,6 +55,12 @@ class TargetEstimate:
 	detection_width : float = 0.0 ; 
 	detection_height : float = 0.0
 	confidence: float = 0.0
+	# Detection area as a fraction of the full frame area, in [0, 1].
+	# Lets downstream consumers (control_law.py) tell a normally-sized
+	# detection apart from one that fills most/all of the frame, which is
+	# the expected case in the final seconds of a landing approach and
+	# should not be treated like an outlier.
+	area_fraction: float = 0.0
 
 
 @dataclass
@@ -69,3 +75,4 @@ class AttitudeSetpoint:
 	pitch: float = 0.0
 	yaw: float = 0.0
 	thrust: float = 0.0  # normalized collective thrust, [0, 1]
+	
