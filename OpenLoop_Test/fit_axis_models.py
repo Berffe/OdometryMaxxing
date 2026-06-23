@@ -83,6 +83,28 @@ AXIS_COLUMNS = {
 	"thrust": ("flow_divergence_1_s", "command_thrust", "flow_valid"),
 }
 
+# For roll/pitch, the more useful model is not offset-only but
+# [offset, image_velocity]. Prefer normalized image velocity, which has
+# the same coordinate convention as target_offset_x/y. Fall back to px/s
+# so older CSVs can still be inspected, but do not paste px/s gains into
+# a normalized controller without converting the units first.
+AXIS_STATE_COLUMNS = {
+	"roll": {
+		"state": "target_offset_x",
+		"velocity_preferred": "flow_mean_x_norm_s",
+		"velocity_fallback": "flow_mean_x_px_s",
+		"command": "command_roll_rad",
+		"valid": "target_found",
+	},
+	"pitch": {
+		"state": "target_offset_y",
+		"velocity_preferred": "flow_mean_y_norm_s",
+		"velocity_fallback": "flow_mean_y_px_s",
+		"command": "command_pitch_rad",
+		"valid": "target_found",
+	},
+}
+
 
 class AxisFit:
 	def __init__(
@@ -126,6 +148,127 @@ class AxisFit:
 		return (
 			f"AxisFit(a={self.a:.4f}, b={self.b:.4f} (t={t_str}), c={self.c:.5f}, "
 			f"R^2={self.r_squared:.3f}, n={self.n_samples})"
+		)
+
+
+class AxisStateFit:
+	"""
+	Discrete local model for roll/pitch:
+
+		[offset[k+1], flow[k+1]]^T = A [offset[k], flow[k]]^T + B u[k] + c
+
+	This is the model to use when the controller state is offset +
+	flow_mean. It keeps the old scalar fit available for comparison, but
+	roll/pitch control should generally be designed from this one.
+	"""
+
+	def __init__(
+		self,
+		A: np.ndarray,
+		B: np.ndarray,
+		c: np.ndarray,
+		r_squared: np.ndarray,
+		n_samples: int,
+		velocity_col: str,
+		b_stderr: Optional[np.ndarray] = None,
+	):
+		self.A = np.asarray(A, dtype=float).reshape(2, 2)
+		self.B = np.asarray(B, dtype=float).reshape(2)
+		self.c = np.asarray(c, dtype=float).reshape(2)
+		self.r_squared = np.asarray(r_squared, dtype=float).reshape(2)
+		self.n_samples = int(n_samples)
+		self.velocity_col = velocity_col
+		self.b_stderr = (
+			np.asarray(b_stderr, dtype=float).reshape(2)
+			if b_stderr is not None
+			else np.full(2, np.nan)
+		)
+
+	@property
+	def b_t_stat(self) -> np.ndarray:
+		out = np.full(2, np.nan)
+		mask = np.isfinite(self.b_stderr) & (self.b_stderr > 0.0)
+		out[mask] = self.B[mask] / self.b_stderr[mask]
+		return out
+
+	def __repr__(self) -> str:
+		t = self.b_t_stat
+		t0 = f"{t[0]:+.2f}" if np.isfinite(t[0]) else "n/a"
+		t1 = f"{t[1]:+.2f}" if np.isfinite(t[1]) else "n/a"
+		return (
+			"AxisStateFit(\n"
+			f"    x=[offset, {self.velocity_col}], n={self.n_samples}\n"
+			f"    A=[[{self.A[0,0]:+.4f}, {self.A[0,1]:+.4f}], "
+			f"[{self.A[1,0]:+.4f}, {self.A[1,1]:+.4f}]]\n"
+			f"    B=[{self.B[0]:+.5f}, {self.B[1]:+.5f}]  "
+			f"t=[{t0}, {t1}]\n"
+			f"    c=[{self.c[0]:+.5f}, {self.c[1]:+.5f}]  "
+			f"R^2=[{self.r_squared[0]:.3f}, {self.r_squared[1]:.3f}]\n"
+			")"
+		)
+
+
+class VisualMimoFit:
+	"""Instantaneous visual-response matrix:
+
+		[flow_x, flow_y]^T = G [roll, pitch]^T + c
+
+	Use this as a sign/coupling diagnostic before designing the controller.
+	Prefer actual roll/pitch from VehicleAttitude; fall back to command_roll/
+	command_pitch only for older logs.
+	"""
+
+	def __init__(
+		self,
+		G: np.ndarray,
+		c: np.ndarray,
+		r_squared: np.ndarray,
+		n_samples: int,
+		input_cols: Tuple[str, str],
+		flow_cols: Tuple[str, str],
+		g_stderr: Optional[np.ndarray] = None,
+		rank: int = 0,
+		condition_number: float = float("nan"),
+	):
+		self.G = np.asarray(G, dtype=float).reshape(2, 2)
+		self.c = np.asarray(c, dtype=float).reshape(2)
+		self.r_squared = np.asarray(r_squared, dtype=float).reshape(2)
+		self.n_samples = int(n_samples)
+		self.input_cols = input_cols
+		self.flow_cols = flow_cols
+		self.g_stderr = (
+			np.asarray(g_stderr, dtype=float).reshape(2, 2)
+			if g_stderr is not None
+			else np.full((2, 2), np.nan)
+		)
+		self.rank = int(rank)
+		self.condition_number = float(condition_number)
+
+	@property
+	def g_t_stat(self) -> np.ndarray:
+		out = np.full((2, 2), np.nan)
+		mask = np.isfinite(self.g_stderr) & (self.g_stderr > 0.0)
+		out[mask] = self.G[mask] / self.g_stderr[mask]
+		return out
+
+	def __repr__(self) -> str:
+		t = self.g_t_stat
+		def fmt(x):
+			return f"{x:+.2f}" if np.isfinite(x) else "n/a"
+
+		return (
+			"VisualMimoFit(\n"
+			f"    y=[{self.flow_cols[0]}, {self.flow_cols[1]}], "
+			f"u=[{self.input_cols[0]}, {self.input_cols[1]}], n={self.n_samples}\n"
+			f"    G=[[{self.G[0,0]:+.5f}, {self.G[0,1]:+.5f}], "
+			f"[{self.G[1,0]:+.5f}, {self.G[1,1]:+.5f}]]\n"
+			f"       rows are [flow_x, flow_y], cols are [roll, pitch]\n"
+			f"    t=[[{fmt(t[0,0])}, {fmt(t[0,1])}], "
+			f"[{fmt(t[1,0])}, {fmt(t[1,1])}]]\n"
+			f"    c=[{self.c[0]:+.5f}, {self.c[1]:+.5f}]  "
+			f"R^2=[{self.r_squared[0]:.3f}, {self.r_squared[1]:.3f}]\n"
+			f"    design_rank={self.rank}/3, condition_number={self.condition_number:.2e}\n"
+			")"
 		)
 
 
@@ -208,6 +351,328 @@ def build_pairs(
 		e_k1.append(e1)
 
 	return np.asarray(e_k), np.asarray(u_k), np.asarray(e_k1)
+
+
+def _has_nonempty_column(rows: List[Dict[str, str]], col: str) -> bool:
+	return bool(rows) and col in rows[0] and any(row.get(col, "") != "" for row in rows)
+
+
+
+
+def _column_has_finite_values(rows: List[Dict[str, str]], col: str) -> bool:
+	if not (bool(rows) and col in rows[0]):
+		return False
+	return any(_safe_float(row.get(col)) is not None for row in rows)
+
+
+def _column_has_variation(
+	rows: List[Dict[str, str]],
+	col: str,
+	min_std: float = 1e-5,
+) -> bool:
+	values = [
+		_safe_float(row.get(col))
+		for row in rows
+		if _safe_float(row.get(col)) is not None
+	]
+	if len(values) < 4:
+		return False
+	return float(np.std(values)) >= min_std
+
+
+def _velocity_column_for_axis(rows: List[Dict[str, str]], axis: str) -> Optional[str]:
+	columns = AXIS_STATE_COLUMNS[axis]
+	preferred = columns["velocity_preferred"]
+	fallback = columns["velocity_fallback"]
+
+	if _has_nonempty_column(rows, preferred):
+		return preferred
+	if _has_nonempty_column(rows, fallback):
+		return fallback
+	return None
+
+
+def build_state_pairs(
+	rows: List[Dict[str, str]],
+	axis: str,
+	dt_nominal: float,
+	dt_tolerance: float,
+	restrict_to_axis: Optional[str] = None,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[str]]:
+	"""
+	Build x[k], u[k], x[k+1] for x=[target offset, image velocity].
+
+	The velocity state uses flow_mean_*_norm_s when present. Older logs only
+	have px/s flow; those are accepted as a fallback for diagnostics, but the
+	printed model will explicitly say which column was used.
+	"""
+	if axis not in AXIS_STATE_COLUMNS:
+		raise ValueError(f"state-pair model is only defined for roll/pitch, not {axis!r}")
+
+	columns = AXIS_STATE_COLUMNS[axis]
+	state_col = columns["state"]
+	velocity_col = _velocity_column_for_axis(rows, axis)
+	command_col = columns["command"]
+	valid_col = columns["valid"]
+
+	if velocity_col is None:
+		return np.empty((0, 2)), np.empty(0), np.empty((0, 2)), None
+
+	x_k, u_k, x_k1 = [], [], []
+
+	for i in range(len(rows) - 1):
+		row_a, row_b = rows[i], rows[i + 1]
+
+		if restrict_to_axis is not None:
+			if row_a.get("calibration_axis") != restrict_to_axis:
+				continue
+			if row_b.get("calibration_axis") != restrict_to_axis:
+				continue
+
+		if row_a.get(valid_col, "0") != "1" or row_b.get(valid_col, "0") != "1":
+			continue
+
+		t_a = _safe_float(row_a.get("t_sec"))
+		t_b = _safe_float(row_b.get("t_sec"))
+
+		if t_a is None or t_b is None:
+			continue
+
+		dt = t_b - t_a
+
+		if dt <= 0.0:
+			continue
+		if abs(dt - dt_nominal) > dt_tolerance * dt_nominal:
+			continue
+
+		e0 = _safe_float(row_a.get(state_col))
+		v0 = _safe_float(row_a.get(velocity_col))
+		u0 = _safe_float(row_a.get(command_col))
+		e1 = _safe_float(row_b.get(state_col))
+		v1 = _safe_float(row_b.get(velocity_col))
+
+		if None in (e0, v0, u0, e1, v1):
+			continue
+
+		x_k.append((e0, v0))
+		u_k.append(u0)
+		x_k1.append((e1, v1))
+
+	return np.asarray(x_k), np.asarray(u_k), np.asarray(x_k1), velocity_col
+
+
+def fit_axis_state(
+	rows: List[Dict[str, str]],
+	axis: str,
+	dt_nominal: float,
+	dt_tolerance: float,
+) -> Optional[AxisStateFit]:
+	if axis not in AXIS_STATE_COLUMNS:
+		return None
+
+	has_axis_column = bool(rows) and "calibration_axis" in rows[0] and any(
+		row.get("calibration_axis") for row in rows
+	)
+
+	x_k, u_k, x_k1, velocity_col = build_state_pairs(
+		rows,
+		axis,
+		dt_nominal,
+		dt_tolerance,
+		restrict_to_axis=axis if has_axis_column else None,
+	)
+
+	if velocity_col is None or len(u_k) < 8:
+		return None
+
+	design = np.column_stack([x_k[:, 0], x_k[:, 1], u_k, np.ones_like(u_k)])
+	coeffs, _, _, _ = np.linalg.lstsq(design, x_k1, rcond=None)
+
+	# design @ coeffs predicts columns [offset[k+1], flow[k+1]].
+	A = np.array([
+		[coeffs[0, 0], coeffs[1, 0]],
+		[coeffs[0, 1], coeffs[1, 1]],
+	])
+	B = np.array([coeffs[2, 0], coeffs[2, 1]])
+	c = np.array([coeffs[3, 0], coeffs[3, 1]])
+
+	predicted = design @ coeffs
+	residual = x_k1 - predicted
+	r_squared = []
+	b_stderr = np.full(2, np.nan)
+	n = len(u_k)
+	p = design.shape[1]
+
+	for j in range(2):
+		ss_res = float(np.sum(residual[:, j] ** 2))
+		ss_tot = float(np.sum((x_k1[:, j] - np.mean(x_k1[:, j])) ** 2))
+		r_squared.append(1.0 - ss_res / ss_tot if ss_tot > 1e-12 else float("nan"))
+
+		if n > p:
+			sigma2 = ss_res / (n - p)
+			try:
+				xtx_inv = np.linalg.inv(design.T @ design)
+				b_stderr[j] = float(np.sqrt(sigma2 * xtx_inv[2, 2]))
+			except np.linalg.LinAlgError:
+				pass
+
+	return AxisStateFit(
+		A=A, B=B, c=c, r_squared=np.asarray(r_squared),
+		n_samples=n, velocity_col=velocity_col, b_stderr=b_stderr,
+	)
+
+
+def _flow_columns_for_mimo(rows: List[Dict[str, str]]) -> Optional[Tuple[str, str]]:
+	"""Prefer normalized flow columns; fall back to px/s for older CSVs."""
+	if _has_nonempty_column(rows, "flow_mean_x_norm_s") and _has_nonempty_column(rows, "flow_mean_y_norm_s"):
+		return "flow_mean_x_norm_s", "flow_mean_y_norm_s"
+	if _has_nonempty_column(rows, "flow_mean_x_px_s") and _has_nonempty_column(rows, "flow_mean_y_px_s"):
+		return "flow_mean_x_px_s", "flow_mean_y_px_s"
+	return None
+
+
+def _actual_attitude_is_usable(rows: List[Dict[str, str]]) -> bool:
+	"""
+	True only when the CSV contains real, varying actual attitude samples.
+
+	A previous failure mode produced vehicle_roll_rad/vehicle_pitch_rad columns
+	filled with zeros because the DiagnosticsWriter was fixed but no PX4 attitude
+	callback was actually received. Treat that as missing data and fall back to
+	commanded attitude, while printing a clear diagnostic.
+	"""
+	if not (
+		_has_nonempty_column(rows, "vehicle_roll_rad")
+		and _has_nonempty_column(rows, "vehicle_pitch_rad")
+	):
+		return False
+
+	# If the timestamp column exists, it must contain at least one finite sample.
+	if "vehicle_attitude_timestamp_sec" in rows[0]:
+		if not _column_has_finite_values(rows, "vehicle_attitude_timestamp_sec"):
+			return False
+
+	return (
+		_column_has_variation(rows, "vehicle_roll_rad")
+		or _column_has_variation(rows, "vehicle_pitch_rad")
+	)
+
+
+def _attitude_input_columns_for_mimo(rows: List[Dict[str, str]]) -> Tuple[str, str]:
+	"""Use actual attitude when logged and nonzero; otherwise fall back to commands."""
+	if _actual_attitude_is_usable(rows):
+		return "vehicle_roll_rad", "vehicle_pitch_rad"
+	return "command_roll_rad", "command_pitch_rad"
+
+
+def fit_visual_mimo(
+	rows: List[Dict[str, str]],
+	restrict_to_roll_pitch_axes: bool = True,
+) -> Optional[VisualMimoFit]:
+	"""
+	Fit the instantaneous visual response matrix:
+
+		[flow_x, flow_y]^T = G [roll, pitch]^T + c
+
+	This is mainly a sign/coupling diagnostic. It should be fitted on static-
+	platform calibration runs first, then reused as the first visual damping
+	model. If only roll or only pitch data is present, the design matrix will be
+	rank-deficient; the fitted column for the excited axis is still informative,
+	but the non-excited column and t-statistics are not trustworthy.
+	"""
+	flow_cols = _flow_columns_for_mimo(rows)
+	if flow_cols is None:
+		return None
+
+	input_cols = _attitude_input_columns_for_mimo(rows)
+	u_roll_col, u_pitch_col = input_cols
+	flow_x_col, flow_y_col = flow_cols
+
+	has_axis_column = bool(rows) and "calibration_axis" in rows[0] and any(
+		row.get("calibration_axis") for row in rows
+	)
+
+	U, Y = [], []
+	for row in rows:
+		if restrict_to_roll_pitch_axes and has_axis_column:
+			if row.get("calibration_axis") not in ("roll", "pitch"):
+				continue
+
+		if row.get("target_found", "0") != "1" or row.get("flow_valid", "0") != "1":
+			continue
+
+		u_roll = _safe_float(row.get(u_roll_col))
+		u_pitch = _safe_float(row.get(u_pitch_col))
+		flow_x = _safe_float(row.get(flow_x_col))
+		flow_y = _safe_float(row.get(flow_y_col))
+
+		if None in (u_roll, u_pitch, flow_x, flow_y):
+			continue
+
+		U.append((u_roll, u_pitch))
+		Y.append((flow_x, flow_y))
+
+	if len(U) < 8:
+		return None
+
+	U = np.asarray(U, dtype=float)
+	Y = np.asarray(Y, dtype=float)
+	design = np.column_stack([U[:, 0], U[:, 1], np.ones(len(U))])
+	coeffs, _, rank, singular_values = np.linalg.lstsq(design, Y, rcond=None)
+
+	# coeffs rows are [roll, pitch, bias], columns are [flow_x, flow_y].
+	G = np.array([
+		[coeffs[0, 0], coeffs[1, 0]],
+		[coeffs[0, 1], coeffs[1, 1]],
+	])
+	c = np.array([coeffs[2, 0], coeffs[2, 1]])
+
+	predicted = design @ coeffs
+	residual = Y - predicted
+	r_squared = []
+	g_stderr = np.full((2, 2), np.nan)
+	n = len(U)
+	p = design.shape[1]
+
+	condition_number = float("nan")
+	if len(singular_values) and np.min(singular_values) > 0.0:
+		condition_number = float(np.max(singular_values) / np.min(singular_values))
+
+	for j in range(2):
+		ss_res = float(np.sum(residual[:, j] ** 2))
+		ss_tot = float(np.sum((Y[:, j] - np.mean(Y[:, j])) ** 2))
+		r_squared.append(1.0 - ss_res / ss_tot if ss_tot > 1e-12 else float("nan"))
+
+		# Standard errors are meaningful only if roll, pitch, and bias are
+		# independently excited (rank 3). With roll-only data, rank is usually 2.
+		if n > p and rank == p:
+			sigma2 = ss_res / (n - p)
+			try:
+				xtx_inv = np.linalg.inv(design.T @ design)
+				# G rows are output [x,y], columns are input [roll,pitch].
+				g_stderr[j, 0] = float(np.sqrt(sigma2 * xtx_inv[0, 0]))
+				g_stderr[j, 1] = float(np.sqrt(sigma2 * xtx_inv[1, 1]))
+			except np.linalg.LinAlgError:
+				pass
+
+	return VisualMimoFit(
+		G=G,
+		c=c,
+		r_squared=np.asarray(r_squared),
+		n_samples=n,
+		input_cols=input_cols,
+		flow_cols=flow_cols,
+		g_stderr=g_stderr,
+		rank=rank,
+		condition_number=condition_number,
+	)
+
+
+def fit_visual_mimo_from_paths(csv_paths: List[str]) -> Optional[VisualMimoFit]:
+	"""Aggregate all supplied CSVs and fit one roll/pitch visual matrix."""
+	all_rows: List[Dict[str, str]] = []
+	for path in csv_paths:
+		all_rows.extend(read_csv_rows(path))
+	return fit_visual_mimo(all_rows, restrict_to_roll_pitch_axes=True)
 
 
 def fit_axis(
@@ -469,7 +934,29 @@ def analyze_file(
 
 	plot_area_fraction_over_time(rows, path, output_dir)
 
-	fits = {}
+	visual_mimo = fit_visual_mimo(rows, restrict_to_roll_pitch_axes=True)
+	if visual_mimo is None:
+		print("  visual MIMO flow fit: not enough roll/pitch flow+attitude samples")
+	else:
+		if visual_mimo.input_cols == ("command_roll_rad", "command_pitch_rad"):
+			print(
+				"  visual MIMO flow fit: using commanded attitude because actual "
+				"vehicle_roll_rad/vehicle_pitch_rad are absent, empty, or not varying in this CSV"
+			)
+		if visual_mimo.flow_cols[0].endswith("_px_s"):
+			print(
+				"  visual MIMO flow fit: using px/s flow fallback. Prefer new CSVs "
+				"with flow_mean_*_norm_s for controller gains."
+			)
+		if visual_mimo.rank < 3:
+			print(
+				f"  visual MIMO flow fit: WARNING rank={visual_mimo.rank}/3. "
+				"This usually means only roll or only pitch was excited, so the "
+				"unexcited column cannot be separated from the bias."
+			)
+		print(f"  visual MIMO flow fit {visual_mimo}")
+
+	fits = {"visual_mimo": visual_mimo}
 
 	for axis in ("roll", "pitch", "thrust"):
 		fit = fit_axis(rows, axis, dt_nominal, dt_tolerance)
@@ -477,19 +964,31 @@ def analyze_file(
 
 		if fit is None:
 			print(f"  {axis:6s}: not enough valid consecutive samples to fit")
-			continue
+		else:
+			flags = []
+			if fit.r_squared <= 0.5:
+				flags.append("low R^2, model may not fit this axis well")
+			if not fit.b_is_significant:
+				flags.append(
+					"b not significant (|t|<2) -- likely noise, not a real reading of "
+					"control effectiveness, even though R^2 looks fine"
+				)
 
-		flags = []
-		if fit.r_squared <= 0.5:
-			flags.append("low R^2, model may not fit this axis well")
-		if not fit.b_is_significant:
-			flags.append(
-				"b not significant (|t|<2) -- likely noise, not a real reading of "
-				"control effectiveness, even though R^2 looks fine"
-			)
+			flag_str = "  <- " + "; ".join(flags) if flags else ""
+			print(f"  {axis:6s}: scalar {fit}{flag_str}")
 
-		flag_str = "  <- " + "; ".join(flags) if flags else ""
-		print(f"  {axis:6s}: {fit}{flag_str}")
+		if axis in ("roll", "pitch"):
+			state_fit = fit_axis_state(rows, axis, dt_nominal, dt_tolerance)
+			fits[f"{axis}_state"] = state_fit
+			if state_fit is None:
+				print(f"          state [offset, flow_mean]: not enough samples or no flow column")
+			else:
+				if state_fit.velocity_col.endswith("_px_s"):
+					print(
+						"          WARNING: using px/s flow fallback. Prefer new CSVs with "
+						"flow_mean_*_norm_s before pasting gains into the controller."
+					)
+				print(f"          state {state_fit}")
 
 	return fits, stats
 
@@ -694,6 +1193,27 @@ def main():
 	if len(per_file_fits) > 1:
 		check_scaling_and_print_schedule(per_file_fits, args.area_fraction_ref)
 		plot_b_vs_area_fraction(per_file_fits, args.area_fraction_ref, args.output_dir)
+
+	aggregate_mimo = fit_visual_mimo_from_paths(csv_paths)
+	if aggregate_mimo is not None:
+		print("\n--- aggregate visual MIMO flow model over all supplied CSVs ---")
+		if aggregate_mimo.input_cols == ("command_roll_rad", "command_pitch_rad"):
+			print(
+				"  using commanded attitude because actual vehicle_roll_rad/"
+				"vehicle_pitch_rad are absent, empty, or not varying. Re-run calibration_node.py after "
+				"the attitude/odometry logging patch for the cleaner model."
+			)
+		if aggregate_mimo.rank < 3:
+			print(
+				f"  WARNING rank={aggregate_mimo.rank}/3. You probably need both a "
+				"roll CSV and a pitch CSV to identify the full 2x2 matrix."
+			)
+		print(aggregate_mimo)
+		print(
+			"  Controller sign convention hint: for a first visual damping test, "
+			"use the sign of this G matrix with state [offset_x, offset_y, "
+			"flow_x, flow_y], then tune gains conservatively on a static target."
+		)
 
 
 if __name__ == "__main__":

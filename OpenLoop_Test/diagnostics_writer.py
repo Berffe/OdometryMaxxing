@@ -143,9 +143,18 @@ class DiagnosticsWriter:
 			"flow_valid": self._safe_bool(getattr(flow, "valid", False)),
 			"flow_mean_x_px_s": self._safe_float(getattr(flow, "mean_flow_x", 0.0)),
 			"flow_mean_y_px_s": self._safe_float(getattr(flow, "mean_flow_y", 0.0)),
+			"flow_mean_x_norm_s": self._safe_float(getattr(flow, "mean_flow_x_norm", 0.0)),
+			"flow_mean_y_norm_s": self._safe_float(getattr(flow, "mean_flow_y_norm", 0.0)),
 			"flow_divergence_1_s": self._safe_float(
 				getattr(flow, "divergence", 0.0)
 			),
+			"flow_raw_divergence_1_s": self._safe_float(
+				getattr(flow, "raw_divergence", getattr(flow, "divergence", 0.0))
+			),
+			"flow_roi_x0": self._safe_int(getattr(flow, "roi_x0", -1)),
+			"flow_roi_y0": self._safe_int(getattr(flow, "roi_y0", -1)),
+			"flow_roi_x1": self._safe_int(getattr(flow, "roi_x1", -1)),
+			"flow_roi_y1": self._safe_int(getattr(flow, "roi_y1", -1)),
 
 			# --------------------------------------------------------
 			# Controller command
@@ -171,6 +180,15 @@ class DiagnosticsWriter:
 			"vehicle_vy_m_s": self._safe_float(getattr(vehicle_state, "vy", 0.0)),
 			"vehicle_vz_m_s": self._safe_float(getattr(vehicle_state, "vz", 0.0)),
 			"vehicle_yaw_rad": self._safe_float(getattr(vehicle_state, "yaw", 0.0)),
+			"vehicle_attitude_timestamp_sec": self._normalize_optional_timestamp(
+				getattr(vehicle_state, "attitude_timestamp", None)
+			),
+			"vehicle_roll_rad": self._safe_float(getattr(vehicle_state, "roll", 0.0)),
+			"vehicle_pitch_rad": self._safe_float(getattr(vehicle_state, "pitch", 0.0)),
+			"vehicle_attitude_yaw_rad": self._safe_float(
+				getattr(vehicle_state, "attitude_yaw", 0.0)
+			),
+			"vehicle_attitude_source": getattr(vehicle_state, "attitude_source", "") or "",
 
 			# --------------------------------------------------------
 			# Calibration-only metadata (empty outside calibration_node.py)
@@ -223,6 +241,13 @@ class DiagnosticsWriter:
 		return 1 if bool(value) else 0
 
 	@staticmethod
+	def _safe_int(value) -> int:
+		try:
+			return int(value)
+		except (TypeError, ValueError):
+			return -1
+
+	@staticmethod
 	def _fieldnames():
 		return [
 			# Time
@@ -244,7 +269,14 @@ class DiagnosticsWriter:
 			"flow_valid",
 			"flow_mean_x_px_s",
 			"flow_mean_y_px_s",
+			"flow_mean_x_norm_s",
+			"flow_mean_y_norm_s",
 			"flow_divergence_1_s",
+			"flow_raw_divergence_1_s",
+			"flow_roi_x0",
+			"flow_roi_y0",
+			"flow_roi_x1",
+			"flow_roi_y1",
 
 			# Controller command
 			"command_timestamp_sec",
@@ -262,6 +294,11 @@ class DiagnosticsWriter:
 			"vehicle_vy_m_s",
 			"vehicle_vz_m_s",
 			"vehicle_yaw_rad",
+			"vehicle_attitude_timestamp_sec",
+			"vehicle_roll_rad",
+			"vehicle_pitch_rad",
+			"vehicle_attitude_yaw_rad",
+			"vehicle_attitude_source",
 
 			# Calibration-only metadata
 			"calibration_axis",

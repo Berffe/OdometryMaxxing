@@ -101,9 +101,16 @@ def build_axis_step_train(
 	repeats: int = 3,
 ) -> List[Segment]:
 	"""
-	Build the segments for one axis' step train: alternating
-	+amplitude / neutral / -amplitude / neutral, held `hold_sec` each,
-	repeated `repeats` times, with the other two axes pinned at trim
+	Build the segments for one axis' step train. For roll/pitch, use a
+	braking pulse (+A for T, -A for 2T, +A for T, then neutral) instead
+	of the older +A/0/-A/0 sequence. The braking pulse is much better for
+	a double-integrator-like response because it approximately cancels the
+	lateral velocity created by the first pulse before the target leaves
+	the camera. For thrust, keep the older short +A/0/-A/0 sequence because
+	vertical position excursions are the limiting risk there.
+
+	All sequences are repeated `repeats` times, with the other two axes
+	pinned at trim
 	(roll=0, pitch=0, thrust=hover_thrust) throughout.
 
 	axis: "roll", "pitch", or "thrust".
@@ -130,18 +137,35 @@ def build_axis_step_train(
 	segments: List[Segment] = []
 
 	for _ in range(repeats):
-		for value in (amplitude, 0.0, -amplitude, 0.0):
-			roll, pitch, thrust = command(value)
-			segments.append((hold_sec, roll, pitch, thrust))
+		if axis in ("roll", "pitch"):
+			# Braking pulse for roughly double-integrator lateral dynamics:
+			# +A for T, -A for 2T, +A for T cancels ideal final velocity
+			# and displacement much better than +A/0/-A/0.
+			for duration, value in (
+				(hold_sec, amplitude),
+				(2.0 * hold_sec, -amplitude),
+				(hold_sec, amplitude),
+				(hold_sec, 0.0),
+			):
+				roll, pitch, thrust = command(value)
+				segments.append((duration, roll, pitch, thrust))
+		else:
+			for value in (amplitude, 0.0, -amplitude, 0.0):
+				roll, pitch, thrust = command(value)
+				segments.append((hold_sec, roll, pitch, thrust))
 
 	return segments
 
 
 class VerticalVelocityDamper:
 	"""
-	Stateful PI damper driving thrust to cancel vz:
+	Stateful PI damper driving thrust to cancel vertical velocity.
 
-		thrust = hover_thrust - kp*vz - ki*integral(vz dt), clamped.
+	PX4 local-position velocity uses NED convention: vz > 0 means the
+	vehicle is moving downward. Therefore a positive vz must increase
+	thrust, not decrease it:
+
+		thrust = hover_thrust + kp*vz + ki*integral(vz dt), clamped.
 
 	Why PI and not just P (which is what this replaced): a proportional-
 	only damper reaches an equilibrium against any *constant* disturbance
@@ -207,7 +231,9 @@ class VerticalVelocityDamper:
 
 		self._last_time = now
 
-		thrust = self._hover_thrust - self._kp * vz - self._ki * self._integral
+		# PX4 VehicleLocalPosition.vz is NED: positive means downward.
+		# If the vehicle is descending, increase thrust; if climbing, reduce it.
+		thrust = self._hover_thrust + self._kp * vz + self._ki * self._integral
 		return max(self._thrust_min, min(self._thrust_max, thrust))
 
 
@@ -305,13 +331,13 @@ def exceeds_safety_bounds(
 
 def build_calibration_sequence(
 	hover_thrust: float,
-	roll_amplitude: float = 0.08,
-	pitch_amplitude: float = 0.08,
-	thrust_amplitude: float = 0.05,
-	roll_hold_sec: float = 6.0,
-	pitch_hold_sec: float = 6.0,
-	thrust_hold_sec: float = 2.0,
-	repeats: int = 3,
+	roll_amplitude: float = 0.04,
+	pitch_amplitude: float = 0.04,
+	thrust_amplitude: float = 0.02,
+	roll_hold_sec: float = 1.0,
+	pitch_hold_sec: float = 1.0,
+	thrust_hold_sec: float = 1.0,
+	repeats: int = 8,
 	settle_sec: float = 2.0,
 	axes: Tuple[str, ...] = ("roll", "pitch", "thrust"),
 ) -> StepSequence:

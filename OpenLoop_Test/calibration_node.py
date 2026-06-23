@@ -1,94 +1,47 @@
 """
-Open-loop calibration node.
+Integrated takeoff + open-loop calibration node.
 
-This is a sibling to bee_node.py, not a replacement: same camera and
-PX4 plumbing, same vision pipeline, same diagnostics CSV — but
-ControlLaw is not used. Instead, a StepSequence (calibration_sequence.py)
-drives roll, pitch, and thrust through a known step train, one axis at
-a time, while the other axes are held at trim. That's what makes the
-resulting log usable for identifying control_law.py's per-axis discrete
-model (e[k+1] = a*e[k] + b*u[k]): the command has to be independent of
-the measured state for the regression to be valid, and it isn't, if the
-closed-loop controller is the thing producing it.
+This node replaces the previous two-process workflow:
 
-Two layers protect against vertical drift, for two different reasons:
+    MAVSDK takeoff.py  ->  ros2 calibration_node
 
-	1. Before the open-loop sequence starts, VerticalSettler (see
-	   calibration_sequence.py) damps out any residual vertical
-	   velocity. Commanding exactly HOVER_THRUST zeroes acceleration,
-	   not velocity — any vz left over from arming or mode-switching
-	   would otherwise persist through the whole test.
-	2. During roll/pitch testing (and the inter-axis settle gaps),
-	   thrust stays under the *same* continuous damping rather than
-	   trusting a bare HOVER_THRUST constant for the full run.
+with one launch process:
 
-Both layers now share one VerticalVelocityDamper instance with PI (not
-just P) control. Real data is why: a proportional-only damper computed
-exactly as designed (formula matched the logged thrust to floating-
-point precision) while vz still sat at a persistent nonzero mean in
-every phase, growing over the run's duration — that's not a tuning
-problem, proportional action structurally cannot cancel a constant
-disturbance, it can only reach an equilibrium against it. The integral
-term does what proportional action can't, and is shared continuously
-across the settle phase and roll/pitch testing on purpose, since
-whatever disturbance it's correcting for doesn't reset at phase
-boundaries either. Thrust testing itself stays genuinely open-loop
-throughout — that's the one phase where closed-loop feedback would
-re-create the cause/effect entanglement this whole node exists to
-avoid.
+    wait for local position/camera
+    -> perform normal PX4/MAVSDK action takeoff
+    -> pre-stream attitude setpoints
+    -> switch PX4 to attitude OFFBOARD and verify actual roll response
+    -> settle vertical velocity
+    -> run the open-loop calibration sequence
 
-Neither layer is a substitute for keeping HOVER_THRUST accurate — they
-bound the damage, they don't remove the need to update it (see below).
+The important point is that one node owns the whole sequence. PX4 first uses
+its normal action-takeoff path, then the same MAVSDK connection switches to
+attitude offboard and streams the calibration setpoints. This avoids the
+previous ROS VehicleAttitudeSetpoint handoff failure.
 
-A hard safety envelope is also checked every tick, in every phase: if
-|vz| or area_fraction exceeds ABORT_VZ_LIMIT / ABORT_AREA_FRACTION_MAX,
-the node halts at HOVER_THRUST permanently rather than trying to
-recover automatically — reposition in Gazebo and restart the node.
-Separately, during the test sequence itself (not the settle phase,
-which doesn't need vision), losing target/flow for LOST_TARGET_ABORT_SEC
-also aborts — there's no point running the rest of a step train against
-a target that isn't there, and silently finishing with zero usable
-samples for the current axis is worse than stopping early and saying so.
-
-How to use this:
-
-	1. In Gazebo, position the vehicle at the altitude/area_fraction
-	   operating point you want to identify (this node does not manage
-	   altitude — see the safety note below on why).
-	2. Run this node instead of bee_node.py. It will settle first (a few
-	   seconds, usually), then run the test sequence (TEST_SETTLE_SEC +
-	   one settle gap and step train per axis in TEST_AXES, each train
-	   being TEST_REPEATS * 4 * <that axis' hold_sec> seconds; printed
-	   at startup).
-	3. Stop the node once it logs that the sequence is finished, and
-	   feed the resulting CSV to fit_axis_models.py.
-	4. Reposition to the next operating point and repeat.
-
-Safety note: the thrust step train commands real deviations from
-hover_thrust, so the vehicle will actually climb/descend during that
-part of the sequence — make sure there's enough clearance below (and
-above) wherever you run it in Gazebo. Roll/pitch hold each step much
-longer than thrust does now (ROLL_TEST_HOLD_SEC/PITCH_TEST_HOLD_SEC —
-raised because position from a held tilt scales with hold_sec^2 for a
-roughly double-integrator response, a much bigger lever on signal
-strength than amplitude, which is already near ROLL_LIMIT_RAD/
-PITCH_LIMIT_RAD). The abort bounds above are the backstop if any of
-this still goes further than expected.
-
-Run:
-
-	ros2 run bee_control calibration_node
-
-or directly:
-
-	python -m bee_control.calibration_node
+Only the final open-loop calibration phase is written as identification data.
+Takeoff and settle phases are intentionally not logged to the fit CSV.
 """
 
+import asyncio
+import math
+import os
+import signal
+import subprocess
+import threading
 import time
 
 import cv2
 import rclpy
 from rclpy.node import Node
+
+try:
+	from mavsdk import System
+	from mavsdk.offboard import Attitude as MavsdkAttitude, OffboardError
+except ImportError:
+	System = None
+	MavsdkAttitude = None
+	OffboardError = Exception
 from rclpy.qos import (
 	QoSProfile,
 	QoSReliabilityPolicy,
@@ -97,7 +50,23 @@ from rclpy.qos import (
 )
 
 from sensor_msgs.msg import Image
-from px4_msgs.msg import VehicleLocalPosition
+from px4_msgs.msg import VehicleAttitude, VehicleLocalPosition
+
+try:
+	from px4_msgs.msg import VehicleOdometry
+except ImportError:
+	VehicleOdometry = None
+
+try:
+	from px4_msgs.msg import VehicleStatus
+except ImportError:
+	VehicleStatus = None
+
+try:
+	from px4_msgs.msg import VehicleCommandAck
+except ImportError:
+	VehicleCommandAck = None
+
 from cv_bridge import CvBridge, CvBridgeError
 
 from .state import VehicleState, AttitudeSetpoint, TargetEstimate
@@ -114,21 +83,125 @@ from .calibration_sequence import (
 
 
 HEARTBEAT_PERIOD_SEC = 0.1
-TEST_PERIOD_SEC = 0.5  # must match the dt control_law.py's local models assume
-ARM_AFTER_HEARTBEATS = 10
+MISSION_PERIOD_SEC = 0.1
+CALIBRATION_LOG_PERIOD_SEC = 0.5  # keep fit_axis_models.py --dt default at 0.5 s
+
+# Keep the terminal readable during long tests. Turn this on only when
+# debugging raw streams. Phase changes, aborts, takeoff/offboard milestones,
+# and calibration milestones are still always logged.
+VERBOSE_STREAM_LOGS = False
+
+# OpenCV windows are useful during vision debugging, but cv2/Qt can spam font
+# warnings in WSL. Keep it off by default for calibration runs.
 SHOW_CAMERA = True
+
+# Takeoff strategy. The previous pure attitude-thrust offboard takeoff failed
+# because PX4 did not confirm OFFBOARD+ARMED, so the node was commanding
+# thrust into a mode that was not actually accepting it. Use the same PX4
+# action-takeoff path that already worked in takeoff.py, but launch it from
+# this node and only switch to attitude-offboard after the vehicle is airborne.
+USE_MAVSDK_TAKEOFF = True
+
+# Use MAVSDK for the attitude-offboard handoff too. The previous ROS
+# VehicleAttitudeSetpoint handoff did take off, but the roll probe showed PX4
+# was not accepting the attitude setpoints. MAVSDK's offboard plugin switches
+# the mode and streams the same roll/pitch/thrust setpoints through the path
+# PX4 already accepted for takeoff.
+CONTROL_BACKEND = "mavsdk_offboard"  # "mavsdk_offboard" or "ros_attitude"
+# Matches takeoff.py's address exactly -- that script is the one confirmed
+# to actually connect and take off. "udpin://" vs "udp://" *should* be
+# equivalent in MAVSDK, but there's no reason to risk a difference here
+# when "udp://" is the form already known to work.
+MAVSDK_SYSTEM_ADDRESS = "udp://0.0.0.0:14540"
+MAVSDK_PORT_TO_FREE = 14540
+MAVSDK_OFFBOARD_PERIOD_SEC = 0.05
+MAVSDK_OFFBOARD_START_TIMEOUT_SEC = 5.0
+MAVSDK_HOLD_CURRENT_YAW = True
+EKF2_SETTLE_TIME = 5.0
+
+# Explicit timeouts for every "wait for X" step in the MAVSDK handshake.
+# Before this, none of connection/health/altitude-reached had any timeout
+# at all: if any single one of them never resolved (wrong system address,
+# SITL not up yet, a health flag that never goes true), the node would
+# sit in PHASE_MAVSDK_TAKEOFF silently forever -- no abort, no error, no
+# CSV rows. That produces exactly an empty diagnostics file with nothing
+# to explain why. Each step now fails loudly and specifically instead.
+MAVSDK_CONNECT_TIMEOUT_SEC = 15.0
+MAVSDK_HEALTH_TIMEOUT_SEC = 30.0
+MAVSDK_TAKEOFF_ALTITUDE_TIMEOUT_SEC = 30.0
+# Backstop covering the whole PHASE_MAVSDK_TAKEOFF mission phase, in case
+# something other than the three waits above hangs (e.g. arm()/takeoff()
+# themselves). Should rarely fire if the three timeouts above are doing
+# their job; it's there so NOTHING in this phase can hang forever.
+MAVSDK_TAKEOFF_PHASE_TIMEOUT_SEC = 90.0
+
+# Integrated takeoff. PX4 local position is NED, so climbing means z becomes
+# more negative. The target z is captured as z_start - TAKEOFF_ALTITUDE_M when
+# the climb phase begins.
+TAKEOFF_ALTITUDE_M = 3.0
+OFFBOARD_PRESTREAM_SEC = 2.0
+OFFBOARD_CONFIRM_TIMEOUT_SEC = 5.0
+TAKEOFF_ALTITUDE_TOL_M = 0.15
+TAKEOFF_VZ_TOL_M_S = 0.08
+TAKEOFF_STABLE_SEC = 1.5
+TAKEOFF_TIMEOUT_SEC = 30.0
+TAKEOFF_ALT_KP = 0.10
+TAKEOFF_VZ_KD = 0.10
+TAKEOFF_THRUST_MIN = 0.38
+TAKEOFF_THRUST_MAX = 0.62
+REQUIRE_CAMERA_BEFORE_ARM = True
+REQUIRE_ATTITUDE_BEFORE_CALIBRATION = True
+
+# After MAVSDK takeoff, verify that PX4 really accepted attitude-offboard
+# before starting calibration. This directly catches the previous failure mode:
+# command_roll changed, but vehicle_roll stayed essentially flat.
+OFFBOARD_PROBE_ROLL_RAD = 0.04
+OFFBOARD_PROBE_DURATION_SEC = 1.2
+OFFBOARD_PROBE_MIN_ROLL_RESPONSE_RAD = 0.010
+OFFBOARD_REQUEST_REPEAT_SEC = 1.0
+
+# PX4 bridge topic names differ slightly across versions. Subscribing to
+# both common attitude-topic names is harmless; whichever one exists will
+# feed on_vehicle_attitude().
+VEHICLE_ATTITUDE_TOPICS = (
+	"/fmu/out/vehicle_attitude",
+	"/fmu/out/vehicle_attitude_v1",
+)
+
+# Some PX4 DDS topic sets do not expose VehicleAttitude directly, but do
+# expose VehicleOdometry, which also carries q. Use it as an attitude
+# fallback so the diagnostics can still log actual roll/pitch.
+VEHICLE_ODOMETRY_TOPICS = (
+	"/fmu/out/vehicle_odometry",
+	"/fmu/out/vehicle_odometry_v1",
+)
+
+VEHICLE_STATUS_TOPICS = (
+	"/fmu/out/vehicle_status",
+	"/fmu/out/vehicle_status_v1",
+)
+
+VEHICLE_COMMAND_ACK_TOPICS = (
+	"/fmu/out/vehicle_command_ack",
+	"/fmu/out/vehicle_command_ack_v1",
+)
 
 # Vehicle trim. Keep this matched to ControlLaw's hover_thrust — the
 # thrust step train is defined as a deviation from it, and the settle
 # phase / continuous roll-pitch damping below both use it as the
-# baseline they damp around. THIS WAS LEFT AT THE OLD 0.45 DEFAULT FOR
-# SEVERAL ROUNDS OF CALIBRATION AFTER 0.4412 was identified — that
-# mismatch is exactly what produces a slow, continuous vz drift for the
-# entire run (not just a leftover-velocity blip at t=0): holding thrust
-# 0.009 above true hover commands a small constant upward acceleration
-# the whole time. Keep this in sync with whatever fit_axis_models.py's
-# thrust intercept most recently implied.
-HOVER_THRUST = 0.4412
+# baseline they damp around.
+#
+# NOTE: this is 0.56, not the ~0.44 identified earlier in the project.
+# That's expected, not a leftover mistake, IF this value was identified
+# specifically for the new CONTROL_BACKEND="mavsdk_offboard" path:
+# MAVSDK's offboard.set_attitude() thrust parameter is not guaranteed to
+# use the exact same normalization as the raw VehicleAttitudeSetpoint
+# thrust_body the ROS path sent, so a value calibrated for one path isn't
+# automatically right for the other. Confirm this is genuinely the
+# MAVSDK-path hover value (not a stale guess) before trusting it --
+# the empty CSV from the last run means this hasn't been validated in
+# a successful flight yet.
+HOVER_THRUST = 0.56
 
 # Step-train shape. Keep the roll/pitch amplitudes comfortably inside
 # ControlLaw's roll_limit/pitch_limit, and the thrust amplitude
@@ -137,9 +210,9 @@ HOVER_THRUST = 0.4412
 # Amplitude raised from 0.04 previously; with the real fitted b this
 # weak, ±0.04 rad wasn't exciting the system enough to reliably
 # separate b from noise.
-ROLL_TEST_AMPLITUDE_RAD = 0.08
-PITCH_TEST_AMPLITUDE_RAD = 0.08
-THRUST_TEST_AMPLITUDE = 0.05
+ROLL_TEST_AMPLITUDE_RAD = 0.04
+PITCH_TEST_AMPLITUDE_RAD = 0.04
+THRUST_TEST_AMPLITUDE = 0.02
 
 # Hold duration, per axis (not shared — see build_calibration_sequence's
 # docstring). Roll/pitch raised from 2.0s to 6.0s: for a roughly
@@ -150,13 +223,16 @@ THRUST_TEST_AMPLITUDE = 0.05
 # commands real altitude excursions, and lengthening it directly widens
 # the area_fraction range swept within one file (a separate problem;
 # see fit_axis_models.py's wide-range warning).
-ROLL_TEST_HOLD_SEC = 6.0
-PITCH_TEST_HOLD_SEC = 6.0
-THRUST_TEST_HOLD_SEC = 2.0
+ROLL_TEST_HOLD_SEC = 1.0
+PITCH_TEST_HOLD_SEC = 1.0
+THRUST_TEST_HOLD_SEC = 1.0
 
-TEST_REPEATS = 3
+TEST_REPEATS = 8
 TEST_SETTLE_SEC = 2.0
-TEST_AXES = ("roll", "pitch", "thrust")
+# Start with one axis per CSV. Change to ("pitch",) or ("thrust",) for
+# the next runs, or put all three axes back only after the one-axis runs
+# stay inside the camera field of view.
+TEST_AXES = ("roll",)
 
 # Defensive clamps applied to whatever the sequence produces, mirroring
 # ControlLaw's own limits, in case the amplitudes above are ever set
@@ -208,6 +284,18 @@ ABORT_AREA_FRACTION_MAX = 0.97
 # happened until fit_axis_models.py runs much later.
 LOST_TARGET_ABORT_SEC = 5.0
 
+PHASE_WAITING_FOR_STREAMS = "waiting_for_streams"
+PHASE_MAVSDK_TAKEOFF = "mavsdk_takeoff"
+PHASE_PRESTREAM = "prestream_offboard"
+PHASE_WAIT_OFFBOARD = "wait_offboard"
+PHASE_CLIMB = "climb"
+PHASE_OFFBOARD_PROBE = "offboard_probe"
+PHASE_ALTITUDE_SETTLE = "altitude_settle"
+PHASE_VZ_SETTLE = "vz_settle"
+PHASE_OPEN_LOOP = "open_loop_test"
+PHASE_FINISHED = "finished"
+PHASE_ABORTED = "aborted"
+
 
 class CalibrationNode(Node):
 	def __init__(self):
@@ -222,6 +310,10 @@ class CalibrationNode(Node):
 		self._last_image_log_time = 0.0
 		self._image_log_period_sec = 1.0
 
+		self._attitude_message_count = 0
+		self._last_attitude_status_log_time = 0.0
+		self._attitude_status_log_period_sec = 2.0
+
 		self._vehicle_state = VehicleState()
 
 		self._latest_flow = None
@@ -231,8 +323,31 @@ class CalibrationNode(Node):
 			roll=0.0, pitch=0.0, yaw=0.0, thrust=HOVER_THRUST
 		)
 
-		self._heartbeat_count = 0
-		self._offboard_engaged = False
+		self._mission_phase = PHASE_WAITING_FOR_STREAMS
+		self._phase_start_time = time.time()
+		self._offboard_request_time = None
+		self._takeoff_start_z = None
+		self._takeoff_target_z = None
+		self._takeoff_stable_since = None
+		self._last_calibration_log_time = None
+		self._have_local_position = False
+		self._vehicle_status_seen = False
+		self._nav_state = None
+		self._arming_state = None
+		self._last_command_ack = None
+		self._last_offboard_request_retry = None
+		self._mavsdk_thread = None
+		self._mavsdk_takeoff_started = False
+		self._mavsdk_takeoff_done = False
+		self._mavsdk_takeoff_error = None
+		self._mavsdk_offboard_start_requested = False
+		self._mavsdk_offboard_started = False
+		self._mavsdk_offboard_error = None
+		self._mavsdk_stop_requested = False
+		self._seen_ack_messages = set()
+		self._streams_ready_logged = False
+		self._probe_baseline_roll = None
+		self._probe_max_roll_delta = 0.0
 
 		self._test_start_time = None
 		self._sequence_finished_logged = False
@@ -307,6 +422,41 @@ class CalibrationNode(Node):
 			px4_qos,
 		)
 
+		for attitude_topic in VEHICLE_ATTITUDE_TOPICS:
+			self.create_subscription(
+				VehicleAttitude,
+				attitude_topic,
+				self.on_vehicle_attitude,
+				px4_qos,
+			)
+
+		if VehicleOdometry is not None:
+			for odometry_topic in VEHICLE_ODOMETRY_TOPICS:
+				self.create_subscription(
+					VehicleOdometry,
+					odometry_topic,
+					self.on_vehicle_odometry,
+					px4_qos,
+				)
+
+		if VehicleStatus is not None:
+			for status_topic in VEHICLE_STATUS_TOPICS:
+				self.create_subscription(
+					VehicleStatus,
+					status_topic,
+					self.on_vehicle_status,
+					px4_qos,
+				)
+
+		if VehicleCommandAck is not None:
+			for ack_topic in VEHICLE_COMMAND_ACK_TOPICS:
+				self.create_subscription(
+					VehicleCommandAck,
+					ack_topic,
+					self.on_vehicle_command_ack,
+					px4_qos,
+				)
+
 		self.create_subscription(
 			Image,
 			"/bee_x500/camera/image",
@@ -317,21 +467,22 @@ class CalibrationNode(Node):
 		self.px4 = PX4Interface(self, px4_qos)
 
 		self.create_timer(HEARTBEAT_PERIOD_SEC, self.on_heartbeat_timer)
-		self.create_timer(TEST_PERIOD_SEC, self.on_test_timer)
+		self.create_timer(MISSION_PERIOD_SEC, self.on_mission_timer)
 
 		if SHOW_CAMERA:
 			cv2.namedWindow("Bee Calibration - Camera", cv2.WINDOW_NORMAL)
 
 		self.get_logger().info("bee_calibration_node started.")
-		self.get_logger().info("Waiting for PX4 local position on /fmu/out/vehicle_local_position_v1")
-		self.get_logger().info("Waiting for camera images on /bee_x500/camera/image")
+		self.get_logger().info(
+			"Waiting for required streams: local_position, camera, and attitude/odometry."
+		)
 
 	def on_camera(self, msg: Image):
 		self._image_count += 1
 
 		now = time.time()
 
-		if now - self._last_image_log_time >= self._image_log_period_sec:
+		if VERBOSE_STREAM_LOGS and now - self._last_image_log_time >= self._image_log_period_sec:
 			self._last_image_log_time = now
 
 			self.get_logger().info(
@@ -345,8 +496,11 @@ class CalibrationNode(Node):
 			self.get_logger().error(f"cv_bridge conversion failed: {exc}")
 			return
 
+		# Keep the camera orientation used by the rest of the vision pipeline
+		# independent of whether the debug window is enabled.
+		frame = cv2.rotate(src, cv2.ROTATE_180)
+
 		if SHOW_CAMERA:
-			frame = cv2.rotate(src, cv2.ROTATE_180)
 			cv2.imshow("Bee Calibration - Camera", frame)
 			cv2.waitKey(1)
 
@@ -363,8 +517,9 @@ class CalibrationNode(Node):
 
 	def on_local_position(self, msg: VehicleLocalPosition):
 		now = time.time()
+		self._have_local_position = True
 
-		if now - self._last_position_log_time >= self._position_log_period_sec:
+		if VERBOSE_STREAM_LOGS and now - self._last_position_log_time >= self._position_log_period_sec:
 			self._last_position_log_time = now
 
 			self.get_logger().info(
@@ -372,6 +527,9 @@ class CalibrationNode(Node):
 				f"x={msg.x:.2f} m, y={msg.y:.2f} m, z={msg.z:.2f} m"
 			)
 
+		# Preserve the latest attitude fields, which arrive on a separate PX4
+		# topic. The CSV then contains both local-position state and actual
+		# roll/pitch/yaw at the most recent attitude callback.
 		self._vehicle_state = VehicleState(
 			timestamp=now,
 			x=msg.x,
@@ -381,11 +539,86 @@ class CalibrationNode(Node):
 			vy=msg.vy,
 			vz=msg.vz,
 			yaw=msg.heading,
+			attitude_timestamp=self._vehicle_state.attitude_timestamp,
+			roll=self._vehicle_state.roll,
+			pitch=self._vehicle_state.pitch,
+			attitude_yaw=self._vehicle_state.attitude_yaw,
+			attitude_source=self._vehicle_state.attitude_source,
 		)
 
-	def on_heartbeat_timer(self):
-		self.px4.publish_heartbeat()
+	def on_vehicle_attitude(self, msg: VehicleAttitude):
+		self._update_attitude_from_quaternion(msg.q, source="vehicle_attitude")
 
+	def on_vehicle_odometry(self, msg):
+		# VehicleOdometry.q uses the same PX4 quaternion convention [w, x, y, z].
+		self._update_attitude_from_quaternion(msg.q, source="vehicle_odometry")
+
+	def _update_attitude_from_quaternion(self, q, source: str):
+		now = time.time()
+
+		try:
+			roll, pitch, yaw = self._quaternion_to_euler(q)
+		except Exception as exc:
+			self.get_logger().warning(f"Ignoring bad attitude quaternion from {source}: {exc}")
+			return
+
+		if not all(math.isfinite(v) for v in (roll, pitch, yaw)):
+			self.get_logger().warning(f"Ignoring non-finite attitude quaternion from {source}: {q}")
+			return
+
+		self._vehicle_state.attitude_timestamp = now
+		self._vehicle_state.roll = roll
+		self._vehicle_state.pitch = pitch
+		self._vehicle_state.attitude_yaw = yaw
+		self._vehicle_state.attitude_source = source
+		self._attitude_message_count += 1
+
+		if VERBOSE_STREAM_LOGS and now - self._last_attitude_status_log_time >= self._attitude_status_log_period_sec:
+			self._last_attitude_status_log_time = now
+			self.get_logger().info(
+				f"actual attitude from {source}: "
+				f"roll={roll:+.3f}, pitch={pitch:+.3f}, yaw={yaw:+.3f}"
+			)
+
+	def on_vehicle_status(self, msg):
+		self._vehicle_status_seen = True
+		self._nav_state = getattr(msg, "nav_state", None)
+		self._arming_state = getattr(msg, "arming_state", None)
+
+	def on_vehicle_command_ack(self, msg):
+		command = getattr(msg, "command", None)
+		result = getattr(msg, "result", None)
+		self._last_command_ack = (command, result, time.time())
+
+		# MAVSDK repeatedly requests PX4 messages during telemetry setup and PX4
+		# answers those request-message commands with acks. They are not useful
+		# for calibration and made the terminal unreadable.
+		if not VERBOSE_STREAM_LOGS:
+			quiet_mavsdk_request_commands = {511, 512, 520}
+			if command in quiet_mavsdk_request_commands:
+				return
+			# Avoid repeating identical accepted acks forever.
+			key = (command, result)
+			if key in self._seen_ack_messages:
+				return
+			self._seen_ack_messages.add(key)
+
+		log_fn = self.get_logger().info if result == 0 else self.get_logger().warning
+		log_fn(f"PX4 command ack: command={command}, result={result}")
+
+	def on_heartbeat_timer(self):
+		# When CONTROL_BACKEND is mavsdk_offboard, MAVSDK owns the attitude
+		# offboard stream. Keep the ROS publisher path available only as an
+		# explicit fallback/debug backend.
+		if CONTROL_BACKEND != "ros_attitude":
+			return
+
+		# Do not stream attitude-offboard while the MAVSDK action takeoff owns PX4.
+		# Start streaming only in the explicit offboard handoff/prestream phases.
+		if not self._should_stream_offboard():
+			return
+
+		self.px4.publish_heartbeat()
 		self.px4.publish_attitude_setpoint(
 			self._latest_setpoint.roll,
 			self._latest_setpoint.pitch,
@@ -393,78 +626,217 @@ class CalibrationNode(Node):
 			self._latest_setpoint.thrust,
 		)
 
-		self._heartbeat_count += 1
+	def on_mission_timer(self):
+		now = time.time()
 
-		if not self._offboard_engaged and self._heartbeat_count == ARM_AFTER_HEARTBEATS:
-			self.px4.arm()
-			self.px4.engage_offboard_mode()
-			self._offboard_engaged = True
-
-	def on_test_timer(self):
-		if self._latest_flow is None or self._latest_frame is None:
+		if self._mission_phase == PHASE_ABORTED:
+			self._hold_trim()
 			return
 
-		now = time.time()
-		vz = self._vehicle_state.vz
-		area_fraction = float(getattr(self._latest_target, "area_fraction", 0.0))
+		if self._mission_phase == PHASE_WAITING_FOR_STREAMS:
+			self._hold_trim()
+			if self._ready_to_start_prestream():
+				if USE_MAVSDK_TAKEOFF:
+					self._enter_phase(PHASE_MAVSDK_TAKEOFF)
+				else:
+					self._enter_phase(PHASE_PRESTREAM)
+			return
 
-		# --- Safety envelope: checked every tick, every phase, first. ---
-		if self._aborted or exceeds_safety_bounds(
-			vz, area_fraction, ABORT_VZ_LIMIT, ABORT_AREA_FRACTION_MAX
-		):
-			if not self._aborted:
-				self._aborted = True
-				self.get_logger().error(
-					f"ABORTING calibration: vz={vz:.3f} m/s, area_fraction={area_fraction:.3f} "
-					f"exceeded safety bounds (limits: |vz|<{ABORT_VZ_LIMIT}, "
-					f"area_fraction<{ABORT_AREA_FRACTION_MAX}). Holding HOVER_THRUST. "
-					f"Reposition in Gazebo and restart this node to try again."
+		if self._mission_phase == PHASE_MAVSDK_TAKEOFF:
+			self._hold_trim()
+			self._ensure_mavsdk_takeoff_started()
+			if self._mavsdk_takeoff_error is not None:
+				self._abort(f"MAVSDK takeoff failed: {self._mavsdk_takeoff_error}")
+				return
+			if now - self._phase_start_time >= MAVSDK_TAKEOFF_PHASE_TIMEOUT_SEC:
+				self._abort(
+					f"MAVSDK takeoff phase exceeded {MAVSDK_TAKEOFF_PHASE_TIMEOUT_SEC:.0f}s "
+					f"without completing or reporting an error. This previously produced an "
+					f"empty diagnostics CSV with no explanation -- if you see this, one of the "
+					f"per-step MAVSDK timeouts didn't catch whatever's actually stuck."
 				)
+				return
+			if self._mavsdk_takeoff_done:
+				self.get_logger().info("MAVSDK takeoff complete. Starting attitude-offboard prestream.")
+				self._enter_phase(PHASE_PRESTREAM)
+			return
 
+		if self._mission_phase == PHASE_PRESTREAM:
+			self._hold_trim()
+			if now - self._phase_start_time >= OFFBOARD_PRESTREAM_SEC:
+				self._request_offboard_and_arm(now, reason="initial handoff")
+				self._enter_phase(PHASE_WAIT_OFFBOARD)
+			return
+
+		if self._mission_phase == PHASE_WAIT_OFFBOARD:
+			self._hold_trim()
+			if self._mavsdk_offboard_error is not None:
+				self._abort(f"MAVSDK offboard start failed: {self._mavsdk_offboard_error}")
+				return
+			if (
+				self._last_offboard_request_retry is None
+				or now - self._last_offboard_request_retry >= OFFBOARD_REQUEST_REPEAT_SEC
+			):
+				self._request_offboard_and_arm(now, reason="retry")
+
+			if self._offboard_and_armed():
+				self.get_logger().info("PX4 reports OFFBOARD+ARMED. Verifying actual attitude response.")
+				self._start_offboard_probe()
+				return
+
+			if self._offboard_confirm_timed_out(now):
+				if CONTROL_BACKEND == "mavsdk_offboard":
+					self._abort(
+						"MAVSDK offboard did not start before timeout. Check MAVSDK offboard "
+						"errors above and verify no other process owns the MAVLink port."
+					)
+					return
+				if self._vehicle_status_seen:
+					self._abort(
+						"PX4 vehicle_status was received but did not become OFFBOARD+ARMED "
+						f"(nav_state={self._nav_state}, arming_state={self._arming_state})"
+					)
+					return
+				self.get_logger().warning(
+					"No PX4 vehicle_status received. Continuing to a small attitude-response "
+					"probe; calibration will abort if actual roll does not move."
+				)
+				self._start_offboard_probe()
+			return
+
+		if self._mission_phase == PHASE_OFFBOARD_PROBE:
 			self._latest_setpoint = AttitudeSetpoint(
 				timestamp=self._latest_target.timestamp,
-				roll=0.0, pitch=0.0, yaw=0.0, thrust=HOVER_THRUST,
+				roll=OFFBOARD_PROBE_ROLL_RAD,
+				pitch=0.0,
+				yaw=0.0,
+				thrust=HOVER_THRUST,
 			)
-			return  # not logged -- an abort-hold sample is not test data
-
-		# --- Phase 1: settle residual vertical velocity before starting. ---
-		# Commanding exactly HOVER_THRUST zeroes acceleration, not velocity
-		# — any vz left over from arming/mode-switching would otherwise
-		# persist through the whole open-loop sequence. See
-		# VerticalSettler in calibration_sequence.py.
-		if not self._settler.is_settled:
-			if not self._settle_logged:
-				self._settle_logged = True
+			if self._probe_baseline_roll is not None:
+				delta = abs(self._vehicle_state.roll - self._probe_baseline_roll)
+				self._probe_max_roll_delta = max(self._probe_max_roll_delta, delta)
+			if now - self._phase_start_time >= OFFBOARD_PROBE_DURATION_SEC:
+				if self._probe_max_roll_delta < OFFBOARD_PROBE_MIN_ROLL_RESPONSE_RAD:
+					self._abort(
+						"attitude-offboard probe failed: commanded "
+						f"roll={OFFBOARD_PROBE_ROLL_RAD:.3f} rad, but actual roll changed only "
+						f"{self._probe_max_roll_delta:.4f} rad. PX4 is not accepting "
+						"VehicleAttitudeSetpoint commands."
+					)
+					return
 				self.get_logger().info(
-					f"Settling residual vertical velocity (vz={vz:.3f} m/s) "
-					f"before starting the test sequence..."
+					f"Attitude-offboard probe passed: actual roll changed "
+					f"{self._probe_max_roll_delta:.4f} rad."
 				)
+				if USE_MAVSDK_TAKEOFF:
+					self._enter_phase(PHASE_ALTITUDE_SETTLE)
+				else:
+					self._takeoff_start_z = self._vehicle_state.z
+					self._takeoff_target_z = self._takeoff_start_z - TAKEOFF_ALTITUDE_M
+					self._takeoff_stable_since = None
+					self._enter_phase(PHASE_CLIMB)
+					self.get_logger().info(
+						f"Takeoff target: start_z={self._takeoff_start_z:.3f} m, "
+						f"target_z={self._takeoff_target_z:.3f} m "
+						f"({TAKEOFF_ALTITUDE_M:.2f} m above start, NED z)."
+					)
+			return
 
+		if self._mission_phase == PHASE_CLIMB:
+			self._latest_setpoint = AttitudeSetpoint(
+				timestamp=self._latest_target.timestamp,
+				roll=0.0,
+				pitch=0.0,
+				yaw=0.0,
+				thrust=self._takeoff_thrust(),
+			)
+
+			if now - self._phase_start_time > TAKEOFF_TIMEOUT_SEC:
+				self._abort(
+					f"takeoff timeout after {TAKEOFF_TIMEOUT_SEC:.1f}s; "
+					f"z={self._vehicle_state.z:.3f}, target_z={self._takeoff_target_z:.3f}"
+				)
+				return
+
+			if self._at_takeoff_altitude():
+				if self._takeoff_stable_since is None:
+					self._takeoff_stable_since = now
+				elif now - self._takeoff_stable_since >= TAKEOFF_STABLE_SEC:
+					self.get_logger().info("Takeoff altitude reached and stable. Settling before calibration.")
+					self._enter_phase(PHASE_ALTITUDE_SETTLE)
+			else:
+				self._takeoff_stable_since = None
+			return
+
+		if self._mission_phase == PHASE_ALTITUDE_SETTLE:
+			self._latest_setpoint = AttitudeSetpoint(
+				timestamp=self._latest_target.timestamp,
+				roll=0.0,
+				pitch=0.0,
+				yaw=0.0,
+				thrust=self._takeoff_thrust(),
+			)
+			if now - self._phase_start_time >= TEST_SETTLE_SEC:
+				self._damper.reset()
+				self._enter_phase(PHASE_VZ_SETTLE)
+			return
+
+		if self._mission_phase == PHASE_VZ_SETTLE:
+			if REQUIRE_ATTITUDE_BEFORE_CALIBRATION and self._vehicle_state.attitude_timestamp <= 0.0:
+				self._hold_trim()
+				self._log_waiting_for_attitude(now)
+				return
+
+			vz = self._vehicle_state.vz
 			thrust = self._settler.step(now, vz)
 			self._latest_setpoint = AttitudeSetpoint(
 				timestamp=self._latest_target.timestamp,
-				roll=0.0, pitch=0.0, yaw=0.0, thrust=thrust,
+				roll=0.0,
+				pitch=0.0,
+				yaw=0.0,
+				thrust=thrust,
 			)
 
 			if self._settler.is_settled:
 				if self._settler.timed_out:
 					self.get_logger().warning(
-						f"Settle phase timed out after {SETTLE_TIMEOUT_SEC}s (vz={vz:.3f} m/s); "
-						f"starting the test sequence anyway. If this happens often, increase "
-						f"SETTLE_TIMEOUT_SEC or DAMPER_KP/DAMPER_KI."
+						f"Vertical-velocity settle timed out after {SETTLE_TIMEOUT_SEC}s "
+						f"(vz={vz:.3f} m/s); starting calibration anyway."
 					)
 				else:
 					self.get_logger().info(
-						f"Settled (|vz|<{SETTLE_VZ_THRESHOLD} m/s for {SETTLE_MIN_DURATION_SEC}s). "
-						f"Starting test sequence."
+						f"Vertical velocity settled (|vz|<{SETTLE_VZ_THRESHOLD} m/s)."
 					)
+				self._enter_phase(PHASE_OPEN_LOOP)
+				self._test_start_time = now
+				self._last_calibration_log_time = None
+				self.get_logger().info("Open-loop calibration sequence started.")
+			return
 
-			return  # settle-phase samples are closed-loop -- never logged as test data
+		if self._mission_phase == PHASE_OPEN_LOOP:
+			self._run_open_loop_calibration(now)
+			return
 
-		# --- Phase 2: the actual open-loop test sequence. ---
-		if self._test_start_time is None:
-			self._test_start_time = now
-			self.get_logger().info("Test sequence started.")
+		if self._mission_phase == PHASE_FINISHED:
+			self._hold_trim()
+			return
+
+	def _run_open_loop_calibration(self, now: float):
+		if self._latest_flow is None or self._latest_frame is None:
+			self._hold_trim()
+			return
+
+		vz = self._vehicle_state.vz
+		area_fraction = float(getattr(self._latest_target, "area_fraction", 0.0))
+
+		if self._aborted or exceeds_safety_bounds(
+			vz, area_fraction, ABORT_VZ_LIMIT, ABORT_AREA_FRACTION_MAX
+		):
+			self._abort(
+				f"safety bound exceeded during calibration: vz={vz:.3f} m/s, "
+				f"area_fraction={area_fraction:.3f}"
+			)
+			return
 
 		target_ok = bool(self._latest_target.found)
 		flow_ok = bool(self._latest_flow.valid)
@@ -473,35 +845,19 @@ class CalibrationNode(Node):
 			if self._lost_since is None:
 				self._lost_since = now
 			elif now - self._lost_since >= LOST_TARGET_ABORT_SEC:
-				self._aborted = True
-				self.get_logger().error(
-					f"ABORTING calibration: target/flow lost for >= {LOST_TARGET_ABORT_SEC}s "
-					f"during the test sequence (target_found={target_ok}, flow_valid={flow_ok}). "
-					f"No more useful data will be collected this way -- holding HOVER_THRUST. "
-					f"Reposition in Gazebo and restart this node to try again."
-				)
-				self._latest_setpoint = AttitudeSetpoint(
-					timestamp=self._latest_target.timestamp,
-					roll=0.0, pitch=0.0, yaw=0.0, thrust=HOVER_THRUST,
+				self._abort(
+					f"target/flow lost for >= {LOST_TARGET_ABORT_SEC}s during calibration "
+					f"(target_found={target_ok}, flow_valid={flow_ok})"
 				)
 				return
 		else:
 			self._lost_since = None
 
 		elapsed = now - self._test_start_time
-
 		roll, pitch, thrust = self.sequence.command_at(elapsed)
 		current_axis = self.sequence.axis_at(elapsed)
 
 		if current_axis != "thrust":
-			# Roll/pitch (and the inter-axis settle gaps) don't want to
-			# rely on HOVER_THRUST being exactly right for the whole
-			# duration of the run -- actively damp vz instead, continuing
-			# the SAME damper (and its accumulated integral) the settle
-			# phase was using. Thrust itself must stay genuinely
-			# open-loop here: that's the one axis where closed-loop
-			# feedback would re-create the same cause/effect entanglement
-			# this whole node exists to avoid.
 			thrust = self._damper.step(now, vz)
 
 		roll = self._clamp(roll, -ROLL_LIMIT_RAD, ROLL_LIMIT_RAD)
@@ -516,21 +872,325 @@ class CalibrationNode(Node):
 			thrust=thrust,
 		)
 
-		self.diagnostics.write(
-			wall_timestamp=time.time(),
-			target=self._latest_target,
-			flow=self._latest_flow,
-			setpoint=self._latest_setpoint,
-			vehicle_state=self._vehicle_state,
-			calibration_axis=current_axis,
+		should_log = (
+			self._last_calibration_log_time is None
+			or now - self._last_calibration_log_time >= CALIBRATION_LOG_PERIOD_SEC
 		)
+		if should_log:
+			self._last_calibration_log_time = now
+			self.diagnostics.write(
+				wall_timestamp=time.time(),
+				target=self._latest_target,
+				flow=self._latest_flow,
+				setpoint=self._latest_setpoint,
+				vehicle_state=self._vehicle_state,
+				calibration_axis=current_axis,
+			)
 
 		if self.sequence.is_finished(elapsed) and not self._sequence_finished_logged:
 			self._sequence_finished_logged = True
+			self._enter_phase(PHASE_FINISHED)
 			self.get_logger().info(
 				"Test sequence finished; holding at trim. "
 				"Stop the node and run fit_axis_models.py on the CSV above."
 			)
+
+	def _should_stream_offboard(self) -> bool:
+		return self._mission_phase in (
+			PHASE_PRESTREAM,
+			PHASE_WAIT_OFFBOARD,
+			PHASE_CLIMB,
+			PHASE_OFFBOARD_PROBE,
+			PHASE_ALTITUDE_SETTLE,
+			PHASE_VZ_SETTLE,
+			PHASE_OPEN_LOOP,
+			PHASE_FINISHED,
+			PHASE_ABORTED,
+		)
+
+	def _request_offboard_and_arm(self, now: float, reason: str):
+		if CONTROL_BACKEND == "mavsdk_offboard":
+			if not self._mavsdk_offboard_start_requested:
+				self.get_logger().info(
+					f"Requesting MAVSDK attitude offboard start ({reason})."
+				)
+			self._mavsdk_offboard_start_requested = True
+		else:
+			self.get_logger().info(f"Requesting PX4 OFFBOARD mode and arming ({reason}).")
+			self.px4.engage_offboard_mode()
+			self.px4.arm()
+
+		if self._offboard_request_time is None:
+			self._offboard_request_time = now
+		self._last_offboard_request_retry = now
+
+	def _start_offboard_probe(self):
+		if REQUIRE_ATTITUDE_BEFORE_CALIBRATION and self._vehicle_state.attitude_timestamp <= 0.0:
+			self._abort("cannot verify attitude offboard because no actual attitude has been received")
+			return
+		self._probe_baseline_roll = self._vehicle_state.roll
+		self._probe_max_roll_delta = 0.0
+		self._enter_phase(PHASE_OFFBOARD_PROBE)
+
+	def _ensure_mavsdk_takeoff_started(self):
+		if self._mavsdk_takeoff_started:
+			return
+		if System is None or MavsdkAttitude is None:
+			self._mavsdk_takeoff_error = "mavsdk/offboard is not installed in this Python environment"
+			return
+		self._mavsdk_takeoff_started = True
+		self.get_logger().info(
+			f"Starting MAVSDK takeoff to {TAKEOFF_ALTITUDE_M:.2f} m from inside calibration node."
+		)
+		self._mavsdk_thread = threading.Thread(
+			target=self._run_mavsdk_worker_thread,
+			name="mavsdk_takeoff_and_offboard",
+			daemon=True,
+		)
+		self._mavsdk_thread.start()
+
+	@staticmethod
+	async def _wait_for_condition(async_iterable, condition, timeout: float, label: str):
+		"""
+		Consume async_iterable until condition(item) is True, or raise a
+		clear, labeled TimeoutError after `timeout` seconds. Every
+		"async for ... : break" wait in the MAVSDK handshake used to have
+		no timeout at all -- one stuck step (wrong system address, SITL
+		not up yet, a health flag that never goes true) meant the node
+		sat in PHASE_MAVSDK_TAKEOFF forever, with no error and an empty
+		diagnostics CSV as the only symptom. This is what replaced that.
+		"""
+		async def _inner():
+			async for item in async_iterable:
+				if condition(item):
+					return item
+
+		try:
+			return await asyncio.wait_for(_inner(), timeout=timeout)
+		except asyncio.TimeoutError:
+			raise TimeoutError(f"timed out after {timeout:.0f}s waiting for {label}")
+
+	def _run_mavsdk_worker_thread(self):
+		try:
+			asyncio.run(self._mavsdk_worker_async())
+		except Exception as exc:
+			# If takeoff was not complete yet, report this as a takeoff error;
+			# otherwise report it as an offboard-stream error.
+			if not self._mavsdk_takeoff_done:
+				self._mavsdk_takeoff_error = repr(exc)
+			else:
+				self._mavsdk_offboard_error = repr(exc)
+
+	async def _mavsdk_worker_async(self):
+		self._free_mavsdk_port(MAVSDK_PORT_TO_FREE)
+		drone = System()
+		await drone.connect(system_address=MAVSDK_SYSTEM_ADDRESS)
+
+		self.get_logger().info("MAVSDK: waiting for drone connection...")
+		await self._wait_for_condition(
+			drone.core.connection_state(),
+			lambda state: state.is_connected,
+			MAVSDK_CONNECT_TIMEOUT_SEC,
+			"MAVSDK connection",
+		)
+		self.get_logger().info("MAVSDK: connected.")
+
+		self.get_logger().info("MAVSDK: waiting for global/home/local position estimates...")
+		await self._wait_for_condition(
+			drone.telemetry.health(),
+			lambda health: (
+				health.is_global_position_ok
+				and health.is_home_position_ok
+				and health.is_local_position_ok
+			),
+			MAVSDK_HEALTH_TIMEOUT_SEC,
+			"global/home/local position health",
+		)
+		self.get_logger().info("MAVSDK: all position estimates OK.")
+
+		await asyncio.sleep(EKF2_SETTLE_TIME)
+
+		home_position = await self._wait_for_condition(
+			drone.telemetry.position(),
+			lambda position: True,
+			MAVSDK_CONNECT_TIMEOUT_SEC,
+			"an initial position reading",
+		)
+		home_baro_offset = home_position.relative_altitude_m
+		self.get_logger().info(f"MAVSDK: home altitude offset {home_baro_offset:.2f} m.")
+
+		self.get_logger().info(f"MAVSDK: setting MIS_TAKEOFF_ALT={TAKEOFF_ALTITUDE_M:.2f} m.")
+		await drone.param.set_param_float("MIS_TAKEOFF_ALT", float(TAKEOFF_ALTITUDE_M))
+		await asyncio.sleep(0.5)
+
+		self.get_logger().info("MAVSDK: arming.")
+		await drone.action.arm()
+		self.get_logger().info("MAVSDK: takeoff command.")
+		await drone.action.takeoff()
+
+		await self._wait_for_condition(
+			drone.telemetry.position(),
+			lambda position: (position.relative_altitude_m - home_baro_offset) >= TAKEOFF_ALTITUDE_M - 0.20,
+			MAVSDK_TAKEOFF_ALTITUDE_TIMEOUT_SEC,
+			"takeoff altitude reached",
+		)
+		self.get_logger().info("MAVSDK: reached takeoff altitude; hovering.")
+
+		self._mavsdk_takeoff_done = True
+		self.get_logger().info("MAVSDK: takeoff complete; waiting for attitude-offboard request.")
+
+		while not self._mavsdk_offboard_start_requested and not self._mavsdk_stop_requested:
+			await asyncio.sleep(0.05)
+
+		if self._mavsdk_stop_requested:
+			return
+
+		# MAVSDK requires at least one setpoint before offboard.start(). Send a
+		# short trim stream first, then start offboard, then keep streaming the
+		# node's current calibration setpoint.
+		for _ in range(10):
+			await self._send_mavsdk_attitude_setpoint(drone)
+			await asyncio.sleep(MAVSDK_OFFBOARD_PERIOD_SEC)
+
+		try:
+			await drone.offboard.start()
+		except OffboardError as exc:
+			self._mavsdk_offboard_error = repr(exc)
+			return
+
+		self._mavsdk_offboard_started = True
+		self.get_logger().info("MAVSDK: attitude offboard started.")
+
+		while not self._mavsdk_stop_requested:
+			await self._send_mavsdk_attitude_setpoint(drone)
+			await asyncio.sleep(MAVSDK_OFFBOARD_PERIOD_SEC)
+
+	async def _send_mavsdk_attitude_setpoint(self, drone):
+		sp = self._latest_setpoint
+		yaw_rad = sp.yaw
+		if MAVSDK_HOLD_CURRENT_YAW and self._vehicle_state.attitude_timestamp > 0.0:
+			yaw_rad = self._vehicle_state.attitude_yaw
+
+		await drone.offboard.set_attitude(
+			MavsdkAttitude(
+				math.degrees(sp.roll),
+				math.degrees(sp.pitch),
+				math.degrees(yaw_rad),
+				self._clamp(sp.thrust, 0.0, 1.0),
+			)
+		)
+
+	@staticmethod
+	def _free_mavsdk_port(port: int):
+		try:
+			result = subprocess.run(
+				["lsof", "-t", f"-i:UDP:{port}"],
+				capture_output=True,
+				text=True,
+				check=False,
+			)
+		except FileNotFoundError:
+			return
+
+		for pid in result.stdout.strip().split():
+			try:
+				os.kill(int(pid), signal.SIGKILL)
+			except ProcessLookupError:
+				pass
+
+
+	def _ready_to_start_prestream(self) -> bool:
+		if not self._have_local_position:
+			return False
+		if REQUIRE_CAMERA_BEFORE_ARM and self._latest_frame is None:
+			return False
+		if not self._streams_ready_logged:
+			self._streams_ready_logged = True
+			self.get_logger().info("Required streams are available; starting mission sequence.")
+		return True
+
+	def _takeoff_thrust(self) -> float:
+		if self._takeoff_target_z is None:
+			return HOVER_THRUST
+
+		# PX4 local position is NED. If current z is above target_z numerically
+		# (less negative / lower altitude), error is positive and thrust should rise.
+		z_error = self._vehicle_state.z - self._takeoff_target_z
+		vz = self._vehicle_state.vz  # NED: positive means descending -> add thrust.
+		thrust = HOVER_THRUST + TAKEOFF_ALT_KP * z_error + TAKEOFF_VZ_KD * vz
+		return self._clamp(thrust, TAKEOFF_THRUST_MIN, TAKEOFF_THRUST_MAX)
+
+	def _at_takeoff_altitude(self) -> bool:
+		if self._takeoff_target_z is None:
+			return False
+		z_error = self._vehicle_state.z - self._takeoff_target_z
+		return abs(z_error) <= TAKEOFF_ALTITUDE_TOL_M and abs(self._vehicle_state.vz) <= TAKEOFF_VZ_TOL_M_S
+
+	def _offboard_and_armed(self) -> bool:
+		if CONTROL_BACKEND == "mavsdk_offboard":
+			return self._mavsdk_offboard_started
+
+		if VehicleStatus is None or not self._vehicle_status_seen:
+			return False
+
+		offboard_value = getattr(VehicleStatus, "NAVIGATION_STATE_OFFBOARD", 14)
+		armed_value = getattr(VehicleStatus, "ARMING_STATE_ARMED", 2)
+		return self._nav_state == offboard_value and self._arming_state == armed_value
+
+	def _offboard_confirm_timed_out(self, now: float) -> bool:
+		return (
+			self._offboard_request_time is not None
+			and now - self._offboard_request_time >= OFFBOARD_CONFIRM_TIMEOUT_SEC
+		)
+
+	def _hold_trim(self):
+		self._latest_setpoint = AttitudeSetpoint(
+			timestamp=getattr(self._latest_target, "timestamp", 0.0),
+			roll=0.0,
+			pitch=0.0,
+			yaw=0.0,
+			thrust=HOVER_THRUST,
+		)
+
+	def _enter_phase(self, phase: str):
+		if phase != self._mission_phase:
+			self.get_logger().info(f"Mission phase: {self._mission_phase} -> {phase}")
+		self._mission_phase = phase
+		self._phase_start_time = time.time()
+
+	def _abort(self, reason: str):
+		if not self._aborted:
+			self._aborted = True
+			self.get_logger().error(f"ABORTING calibration mission: {reason}. Holding HOVER_THRUST.")
+		self._enter_phase(PHASE_ABORTED)
+		self._hold_trim()
+
+	def _log_waiting_for_attitude(self, now: float):
+		if VERBOSE_STREAM_LOGS and now - self._last_attitude_status_log_time >= self._attitude_status_log_period_sec:
+			self._last_attitude_status_log_time = now
+			self.get_logger().warning(
+				"Waiting for actual attitude before calibration. Check that "
+				"/fmu/out/vehicle_attitude or /fmu/out/vehicle_odometry is bridged."
+			)
+
+	@staticmethod
+	def _quaternion_to_euler(q):
+		"""Return roll, pitch, yaw [rad] from PX4 VehicleAttitude.q = [w, x, y, z]."""
+		qw, qx, qy, qz = [float(v) for v in q]
+
+		sinr_cosp = 2.0 * (qw * qx + qy * qz)
+		cosr_cosp = 1.0 - 2.0 * (qx * qx + qy * qy)
+		roll = math.atan2(sinr_cosp, cosr_cosp)
+
+		sinp = 2.0 * (qw * qy - qz * qx)
+		sinp = max(-1.0, min(1.0, sinp))
+		pitch = math.asin(sinp)
+
+		siny_cosp = 2.0 * (qw * qz + qx * qy)
+		cosy_cosp = 1.0 - 2.0 * (qy * qy + qz * qz)
+		yaw = math.atan2(siny_cosp, cosy_cosp)
+
+		return roll, pitch, yaw
 
 	@staticmethod
 	def _clamp(value: float, lower: float, upper: float) -> float:
@@ -547,6 +1207,7 @@ def main(args=None):
 	except KeyboardInterrupt:
 		pass
 	finally:
+		node._mavsdk_stop_requested = True
 		node.diagnostics.close()
 		node.destroy_node()
 

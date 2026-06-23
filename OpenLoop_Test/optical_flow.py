@@ -181,6 +181,12 @@ class OpticalFlowEstimator:
 		mean_flow_x = float(np.mean(flow_px_s[:, :, 0]))
 		mean_flow_y = float(np.mean(flow_px_s[:, :, 1]))
 
+		# Same mean flow, but in the normalized image-coordinate system
+		# used by TargetEstimate.offset_x/offset_y. This is the preferred
+		# velocity-like state for roll/pitch control and identification.
+		mean_flow_x_norm = mean_flow_x / max(0.5 * image_width, 1.0)
+		mean_flow_y_norm = mean_flow_y / max(0.5 * image_height, 1.0)
+
 		divergence_field = self._estimate_divergence_field(
 			flow_px_s=flow_px_s,
 			image_width=image_width,
@@ -195,7 +201,14 @@ class OpticalFlowEstimator:
 			valid=True,
 			mean_flow_x=mean_flow_x,
 			mean_flow_y=mean_flow_y,
+			mean_flow_x_norm=float(mean_flow_x_norm),
+			mean_flow_y_norm=float(mean_flow_y_norm),
 			divergence=float(filtered_divergence),
+			raw_divergence=float(raw_divergence),
+			roi_x0=int(x0),
+			roi_y0=int(y0),
+			roi_x1=int(x1),
+			roi_y1=int(y1),
 		)
 
 		self._save_debug(

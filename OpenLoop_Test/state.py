@@ -4,8 +4,8 @@ modules (optical_flow.py, target_acquisition.py, control_law.py,
 px4_interface.py).
 
 Keeping these as plain dataclasses (no ROS message types) means every
-module downstream of bee_node.py can be imported and unit-tested
-without rclpy being initialized.
+module downstream of bee_node.py can be imported and unit-tested without
+rclpy being initialized.
 """
 
 from dataclasses import dataclass
@@ -13,8 +13,14 @@ from dataclasses import dataclass
 
 @dataclass
 class VehicleState:
-	"""Latest PX4 local-position estimate, as last received by on_local_position()."""
+	"""Latest PX4 state estimates used only for diagnostics/identification.
 
+	Position and velocity come from VehicleLocalPosition. roll/pitch and
+	attitude_yaw come from VehicleAttitude or VehicleOdometry when one of those topics is available.
+	PX4 local position uses NED convention, so vz > 0 means descending.
+	"""
+
+	# Local-position timestamp, normalized by DiagnosticsWriter when logged.
 	timestamp: float = 0.0
 	x: float = 0.0
 	y: float = 0.0
@@ -24,24 +30,45 @@ class VehicleState:
 	vz: float = 0.0
 	yaw: float = 0.0  # VehicleLocalPosition.heading, radians
 
+	# Attitude timestamp and Euler angles from VehicleAttitude.q.
+	attitude_timestamp: float = 0.0
+	roll: float = 0.0
+	pitch: float = 0.0
+	attitude_yaw: float = 0.0
+	attitude_source: str = ""  # "vehicle_attitude" or "vehicle_odometry"
+
 
 @dataclass
 class FlowResult:
 	"""
 	Output of OpticalFlowEstimator.update().
 
-	flow_field is left untyped (None for now) since its shape depends on
-	the algorithm you pick later (e.g. a dense HxWx2 numpy array for
-	Farneback, or just a handful of scalars for a sparse/divergence-based
-	estimator). mean_flow is a convenience summary most controllers will
-	want regardless of the underlying algorithm.
+	mean_flow_x/mean_flow_y are kept in px/s for easy camera debugging.
+	mean_flow_x_norm/mean_flow_y_norm are the same image velocity in
+	normalized image coordinates per second, matching TargetEstimate's
+	offset_x/offset_y convention in [-1, 1]. Use the normalized values for
+	control and identification whenever possible.
+
+	divergence is the filtered scalar used by the controller; raw_divergence
+	is logged separately for identification because filtering adds phase lag.
+
+	The ROI fields record where the optical-flow calculation was performed.
+	They are useful when a bad fit is actually caused by a changing or
+	clipped target box rather than by dynamics.
 	"""
 
 	timestamp: float = 0.0
 	valid: bool = False
 	mean_flow_x: float = 0.0
 	mean_flow_y: float = 0.0
+	mean_flow_x_norm: float = 0.0
+	mean_flow_y_norm: float = 0.0
 	divergence: float = 0.0
+	raw_divergence: float = 0.0
+	roi_x0: int = -1
+	roi_y0: int = -1
+	roi_x1: int = -1
+	roi_y1: int = -1
 
 
 @dataclass
@@ -52,8 +79,8 @@ class TargetEstimate:
 	found: bool = False
 	offset_x: float = 0.0
 	offset_y: float = 0.0
-	detection_width : float = 0.0 ; 
-	detection_height : float = 0.0
+	detection_width: float = 0.0
+	detection_height: float = 0.0
 	confidence: float = 0.0
 	# Detection area as a fraction of the full frame area, in [0, 1].
 	# Lets downstream consumers (control_law.py) tell a normally-sized
@@ -75,4 +102,3 @@ class AttitudeSetpoint:
 	pitch: float = 0.0
 	yaw: float = 0.0
 	thrust: float = 0.0  # normalized collective thrust, [0, 1]
-	
