@@ -35,6 +35,7 @@ from before a given column was added.
 
 import argparse
 import os
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -562,8 +563,16 @@ def main():
 	)
 
 	parser.add_argument(
-		"csv_path",
-		help="Path to diagnostics CSV file.",
+		"csv_paths",
+		nargs="+",
+		action=type("FolderAction", (argparse.Action,), {
+			"__call__": lambda self, p, ns, vals, opt=None: setattr(
+				ns,
+				self.dest,
+				sum([[os.path.join(v, f) for f in os.listdir(v) if f.endswith(".csv")] if os.path.isdir(v) else [v] for v in vals], [])
+			)
+		}),
+		help="one or more calibration CSV files or folders containing them"
 	)
 
 	parser.add_argument(
@@ -634,76 +643,81 @@ def main():
 		else []
 	)
 
-	df = read_log(args.csv_path)
-	t = get_time(df)
+	for csv_p in args.csv_paths :
+		df = read_log(csv_p)
+		t = get_time(df)
+		home = Path(args.output_dir)
+		output = Path(csv_p)
+		output_complete = home / csv_p
+		ensure_output_dir(output_complete)
 
-	print(f"Loaded: {args.csv_path}")
-	print(f"Rows: {len(df)}")
-	print(f"Time span: {np.nanmin(t):.3f} s to {np.nanmax(t):.3f} s")
-	print(f"Output directory: {args.output_dir}")
+		print(f"Loaded: {csv_p}")
+		print(f"Rows: {len(df)}")
+		print(f"Time span: {np.nanmin(t):.3f} s to {np.nanmax(t):.3f} s")
+		print(f"Output directory: {output_complete}")
 
-	plot_detection_boxes_fov(
-		df=df,
-		t=t,
-		image_width=args.image_width,
-		image_height=args.image_height,
-		output_dir=args.output_dir,
-		max_boxes=args.max_boxes,
-	)
+		plot_detection_boxes_fov(
+			df=df,
+			t=t,
+			image_width=args.image_width,
+			image_height=args.image_height,
+			output_dir=output_complete,
+			max_boxes=args.max_boxes,
+		)
 
-	plot_target_position_offsets(
-		df=df,
-		t=t,
-		output_dir=args.output_dir,
-	)
+		plot_target_position_offsets(
+			df=df,
+			t=t,
+			output_dir=output_complete,
+		)
 
-	plot_target_quality(
-		df=df,
-		t=t,
-		output_dir=args.output_dir,
-		schedule_points=schedule_points,
-		max_area_fraction=args.max_area_fraction,
-		absolute_max_area_fraction=args.absolute_max_area_fraction,
-	)
+		plot_target_quality(
+			df=df,
+			t=t,
+			output_dir=output_complete,
+			schedule_points=schedule_points,
+			max_area_fraction=args.max_area_fraction,
+			absolute_max_area_fraction=args.absolute_max_area_fraction,
+		)
 
-	plot_vehicle_position(
-		df=df,
-		t=t,
-		output_dir=args.output_dir,
-	)
+		plot_vehicle_position(
+			df=df,
+			t=t,
+			output_dir=output_complete,
+		)
 
-	plot_vehicle_dynamics(
-		df=df,
-		t=t,
-		output_dir=args.output_dir,
-	)
+		plot_vehicle_dynamics(
+			df=df,
+			t=t,
+			output_dir=output_complete,
+		)
 
-	plot_divergence(
-		df=df,
-		t=t,
-		output_dir=args.output_dir,
-		divergence_setpoint=args.divergence_setpoint,
-	)
+		plot_divergence(
+			df=df,
+			t=t,
+			output_dir=output_complete,
+			divergence_setpoint=args.divergence_setpoint,
+		)
 
-	plot_flow_velocity(
-		df=df,
-		t=t,
-		output_dir=args.output_dir,
-	)
+		plot_flow_velocity(
+			df=df,
+			t=t,
+			output_dir=output_complete,
+		)
 
-	plot_commands(
-		df=df,
-		t=t,
-		output_dir=args.output_dir,
-	)
+		plot_commands(
+			df=df,
+			t=t,
+			output_dir=output_complete,
+		)
 
-	plot_pipeline_latency(
-		df=df,
-		t=t,
-		output_dir=args.output_dir,
-	)
+		plot_pipeline_latency(
+			df=df,
+			t=t,
+			output_dir=output_complete,
+		)
 
-	print("Done.")
+		print("Done.")
 
 
 if __name__ == "__main__":

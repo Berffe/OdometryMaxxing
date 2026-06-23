@@ -79,12 +79,25 @@ class DiagnosticsWriter:
 		flow: Optional[FlowResult],
 		setpoint: Optional[AttitudeSetpoint],
 		vehicle_state: Optional[VehicleState],
+		calibration_axis: Optional[str] = None,
 	):
 		"""
 		Write one diagnostics row.
 
 		This should be called after the control law computes the latest
 		setpoint, usually once per control timer tick.
+
+		calibration_axis: only meaningful for calibration_node.py — which
+		axis ("roll"/"pitch"/"thrust"/"settle") the step sequence was
+		exercising for this row. None (the default, and what bee_node.py
+		always passes implicitly by omitting it) writes an empty field.
+		fit_axis_models.py uses this to fit each axis only from its own
+		matching rows — without it, a row logged while e.g. roll is the
+		one genuinely open-loop axis under test, but thrust is being
+		actively damped against drift (see calibration_node.py), would
+		look to the thrust fit like an open-loop sample when it's
+		actually closed-loop, re-introducing the exact cause/effect
+		entanglement this whole logging setup exists to avoid.
 		"""
 		if wall_timestamp is None:
 			wall_timestamp = time.time()
@@ -158,6 +171,11 @@ class DiagnosticsWriter:
 			"vehicle_vy_m_s": self._safe_float(getattr(vehicle_state, "vy", 0.0)),
 			"vehicle_vz_m_s": self._safe_float(getattr(vehicle_state, "vz", 0.0)),
 			"vehicle_yaw_rad": self._safe_float(getattr(vehicle_state, "yaw", 0.0)),
+
+			# --------------------------------------------------------
+			# Calibration-only metadata (empty outside calibration_node.py)
+			# --------------------------------------------------------
+			"calibration_axis": calibration_axis if calibration_axis else "",
 		}
 
 		self._writer.writerow(row)
@@ -244,4 +262,7 @@ class DiagnosticsWriter:
 			"vehicle_vy_m_s",
 			"vehicle_vz_m_s",
 			"vehicle_yaw_rad",
+
+			# Calibration-only metadata
+			"calibration_axis",
 		]

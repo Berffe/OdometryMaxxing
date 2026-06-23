@@ -91,11 +91,12 @@ This allows regular ROS 2 nodes, `rqt_image_view`, and `cv_bridge` to access the
 ## Terminal 4 — Run the BEE_LAND ROS Node
 
 ```bash
-cd ~/PX4-Autopilot/BEE_LAND/controller
+cd ~/PX4-Autopilot/BEE_LAND
 
 ros_bee # Defined in /.bashrc
 
 python3 -m controller.bee_node
+python3 -m openloop.calibration_node
 
 ```
 
