@@ -95,7 +95,8 @@ cd ~/PX4-Autopilot/BEE_LAND/controller
 
 ros_bee # Defined in /.bashrc
 
-python3 bee_node.py
+python3 -m controller.bee_node
+
 ```
 
 This node currently:

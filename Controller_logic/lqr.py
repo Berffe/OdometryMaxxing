@@ -30,46 +30,83 @@ def solve_discrete_lqr(
 	B,
 	Q,
 	R,
-	iterations: int = 200,
-	tol: float = 1e-10,
+	iterations: int = 20000,
+	tol: float = 1e-12,
 ) -> np.ndarray:
 	"""
-	Solve the discrete-time algebraic Riccati equation by fixed-point
-	iteration and return the corresponding LQR gain K (u = -K x).
+	Solve the discrete-time algebraic Riccati equation and return the
+	corresponding LQR gain K (u = -K x).
 
 	A, B, Q, R may be plain numbers/nested lists or numpy arrays; they
 	are coerced to 2D arrays internally, so a scalar 1-state/1-input axis
 	can simply pass e.g. A=[[1.0]], B=[[b]], Q=[[q]], R=[[r]].
 
-	This converges to the steady-state solution for any stabilizable,
-	detectable (A, B, Q, R) — in particular, any scalar system with
-	B != 0 — well within `iterations`, since the Riccati recursion is a
-	contraction for such systems.
+	Uses scipy.linalg.solve_discrete_are when scipy is importable — it's
+	the robust, standard approach (Schur-based, no iteration count to
+	tune) and this function is only ever called a handful of times at
+	ControlLaw construction, not per control tick, so the dependency
+	costs nothing at runtime. Falls back to fixed-point Riccati iteration
+	if scipy isn't available.
+
+	The fallback is NOT just "more iterations and hope": a system with
+	a near or above 1 (open-loop marginal/unstable, exactly what real
+	calibration data can produce — see fit_axis_models.py) combined
+	with a small b needs the Riccati iterate P to grow to a large value
+	before the control term meaningfully bites, and naive iteration can
+	need many thousands of steps to get there. Returning a gain before
+	that happens silently hands back an unstabilizing K with no warning.
+	So the fallback explicitly checks the resulting closed-loop
+	eigenvalues and raises rather than returning a gain it hasn't
+	verified is actually stabilizing.
 	"""
 	A = np.atleast_2d(np.asarray(A, dtype=float))
 	B = np.atleast_2d(np.asarray(B, dtype=float))
 	Q = np.atleast_2d(np.asarray(Q, dtype=float))
 	R = np.atleast_2d(np.asarray(R, dtype=float))
 
+	try:
+		from scipy.linalg import solve_discrete_are
+
+		P = solve_discrete_are(A, B, Q, R)
+		return _gain_from_p(A, B, R, P)
+	except ImportError:
+		pass
+
 	P = Q.copy()
+	converged = False
 
 	for _ in range(iterations):
-		bt_p = B.T @ P
-		s = R + bt_p @ B
-		k = np.linalg.solve(s, bt_p @ A)
+		k = _gain_from_p(A, B, R, P)
 		p_next = Q + A.T @ P @ A - A.T @ P @ B @ k
 
 		if np.max(np.abs(p_next - P)) < tol:
 			P = p_next
+			converged = True
 			break
 
 		P = p_next
 
+	K = _gain_from_p(A, B, R, P)
+	closed_loop_eigvals = np.linalg.eigvals(A - B @ K)
+
+	if not converged or np.any(np.abs(closed_loop_eigvals) >= 1.0 - 1e-9):
+		raise RuntimeError(
+			"solve_discrete_lqr: the pure-numpy fallback did not reach a "
+			f"verified stabilizing solution after {iterations} iterations "
+			f"(closed-loop eigenvalues: {closed_loop_eigvals}, "
+			f"converged={converged}). This combination of A/B/Q/R is likely "
+			"close to the stability boundary with weak control authority — "
+			"install scipy for a robust solve (pip install scipy), or pass "
+			"a larger `iterations`."
+		)
+
+	return K
+
+
+def _gain_from_p(A: np.ndarray, B: np.ndarray, R: np.ndarray, P: np.ndarray) -> np.ndarray:
 	bt_p = B.T @ P
 	s = R + bt_p @ B
-	k = np.linalg.solve(s, bt_p @ A)
-
-	return k
+	return np.linalg.solve(s, bt_p @ A)
 
 
 class ScheduledLQR:

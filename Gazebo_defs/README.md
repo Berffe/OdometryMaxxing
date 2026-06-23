@@ -9,7 +9,9 @@ cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Gazebo_defs/* ~/PX4-
 
 cp -r ~/PX4-Autopilot/BEE_LAND/logs /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Flight_Analysis/ 
 
-cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Controller/bee_node.py ~/PX4-Autopilot/BEE_LAND/controller/
+cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Gazebo_defs/worlds/* ~/PX4-Autopilot/BEE_LAND/worlds/
+
+cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Controller_logic/*.py ~/PX4-Autopilot/BEE_LAND/controller/
 ```
 
 Le contraire, Linux à Windows (dans le terminal Windows!) :
@@ -33,6 +35,8 @@ Ainsi, la synchronisation se fait par :
 
 ```bash
 ln -s ~/PX4-Autopilot/BEE_LAND/worlds/bee_platform.sdf  ~/PX4-Autopilot/Tools/simulation/gz/worlds/bee_platform.sdf
+
+ln -s ~/PX4-Autopilot/BEE_LAND/worlds/materials  ~/PX4-Autopilot/Tools/simulation/gz/worlds/
 
 ln -s ~/PX4-Autopilot/BEE_LAND/plugins/oscillating_platform_controller \
       ~/PX4-Autopilot/src/modules/simulation/gz_plugins/oscillating_platform_controller

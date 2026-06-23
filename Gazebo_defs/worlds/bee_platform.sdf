@@ -37,20 +37,31 @@
 	<link name="ground_link">
 		<collision name="collision">
 		<geometry>
-			<box>
-			<size>20 20 0.02</size>
-			</box>
+			<plane>
+			<normal>0 0 1</normal>
+			<size>2000 2000</size>
+			</plane>
 		</geometry>
 		</collision>
 		<visual name="visual">
 		<geometry>
-			<box>
-			<size>20 20 0.02</size>
-			</box>
+			<plane>
+			<normal>0 0 1</normal>
+			<size>2000 2000</size>
+			</plane>
 		</geometry>
 		<material>
-			<ambient>0.35 0.45 0.35 1</ambient>
-			<diffuse>0.35 0.45 0.35 1</diffuse>
+			<ambient>0.5 0.5 0.5 1</ambient>
+			<diffuse>0.5 0.5 0.5 1</diffuse>
+			<specular>0.1 0.1 0.1 1</specular>
+			<pbr>
+			<metal>
+				<albedo_map>materials/textures/ground_grey.png</albedo_map>
+				<normal_map>materials/textures/ground_grey_normal.png</normal_map>
+				<metalness>0.0</metalness>
+				<roughness>0.85</roughness>
+			</metal>
+			</pbr>
 		</material>
 		</visual>
 	</link>
@@ -71,6 +82,15 @@
 		<material>
 		<ambient>0.95 0.70 0.15 1</ambient>
 		<diffuse>0.95 0.70 0.15 1</diffuse>
+		<specular>0.2 0.2 0.2 1</specular>
+		<pbr>
+			<metal>
+			<albedo_map>materials/textures/flower_top.png</albedo_map>
+			<normal_map>materials/textures/flower_top_normal.png</normal_map>
+			<metalness>0.0</metalness>
+			<roughness>0.55</roughness>
+			</metal>
+		</pbr>
 		</material>
 	</visual>
 
