@@ -193,8 +193,8 @@ def _motion_parameters(step: int, mode: str):
 	"""
 	if mode == "translate":
 		scale = 1.0
-		dx = 70.0 * np.sin(0.035 * step)
-		dy = 45.0 * np.cos(0.030 * step)
+		dx = 70.0 * np.sin(0.35 * step)
+		dy = 45.0 * np.cos(0.30 * step)
 
 	elif mode == "zoom":
 		scale = 1.0 + 0.25 * np.sin(0.09 * step)
@@ -202,7 +202,7 @@ def _motion_parameters(step: int, mode: str):
 		dy = 0.0
 
 	else:
-		scale = 1.0 + 0.18 * np.sin(0.030 * step)
+		scale = 1.0 + 0.5 * np.sin(0.05 * step)
 		dx = 45.0 * np.sin(0.025 * step)
 		dy = 30.0 * np.cos(0.020 * step)
 

@@ -148,7 +148,7 @@ def _draw_detection_debug(frame_bgr, target, contour=None):
 			debug_img,
 			(image_cx, image_cy),
 			(target_cx, target_cy),
-			(0, 0, 255),
+			(255, 255, 0),
 			2,
 			tipLength=0.15,
 		)

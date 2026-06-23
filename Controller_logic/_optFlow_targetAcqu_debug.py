@@ -38,6 +38,9 @@ try:
 		_draw_flow_arrows,
 		_flow_to_color,
 		_divergence_to_heatmap,
+		_make_base_scene,
+		_draw_textured_flower_target,
+		_make_synthetic_frame,
 	)
 
 except ImportError:
@@ -56,6 +59,9 @@ except ImportError:
 		_draw_flow_arrows,
 		_flow_to_color,
 		_divergence_to_heatmap,
+		_make_base_scene,
+		_draw_textured_flower_target,
+		_make_synthetic_frame,
 	)
 
 
@@ -300,13 +306,12 @@ def test():
 
 		target_radius = 190 if close_range_mode else None
 
-		frame = _make_dummy_frame(
-			width=width,
-			height=height,
+		base_scene = _make_base_scene(width, height)
+
+		frame = _make_synthetic_frame(
+			base_scene=base_scene,
 			step=step,
-			with_target=with_target,
-			with_distractors=with_distractors,
-			target_radius=target_radius,
+			mode="combined",
 		)
 
 		# ------------------------------------------------------------

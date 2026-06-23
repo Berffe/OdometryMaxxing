@@ -387,7 +387,18 @@ def plot_b_vs_area_fraction(
 
 def main():
 	parser = argparse.ArgumentParser(description=__doc__)
-	parser.add_argument("csv_paths", nargs="+", help="one or more calibration CSV files")
+	parser.add_argument(
+		"csv_paths",
+		nargs="+",
+		action=type("FolderAction", (argparse.Action,), {
+			"__call__": lambda self, p, ns, vals, opt=None: setattr(
+				ns,
+				self.dest,
+				sum([[os.path.join(v, f) for f in os.listdir(v) if f.endswith(".csv")] if os.path.isdir(v) else [v] for v in vals], [])
+			)
+		}),
+		help="one or more calibration CSV files or folders containing them"
+	)
 	parser.add_argument("--dt", type=float, default=0.5, help="nominal control period (s)")
 	parser.add_argument(
 		"--dt-tolerance", type=float, default=0.2,
