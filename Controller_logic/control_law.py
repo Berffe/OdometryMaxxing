@@ -84,8 +84,13 @@ except ImportError:
 class ControlLaw:
 	def __init__(
 		self,
-		hover_thrust=0.47,
+		hover_thrust=0.4412,
 		yaw_setpoint=0.0,
+		# 0.0 here means "hold altitude" (true hover), not "descend at a
+		# controlled rate" — divergence's natural value at hover is 0,
+		# so this setpoint is a deliberate choice, not the project's
+		# landing setpoint. Set back to e.g. 0.15 once you're satisfied
+		# with hover behavior and want to resume descent testing.
 		divergence_setpoint=0.0,
 
 		roll_limit=0.10,
@@ -99,21 +104,27 @@ class ControlLaw:
 		# Local 1-state model + LQR cost weights, one set per axis. See
 		# the module docstring for what `a`, `b_ref`, and
 		# area_fraction_ref mean. state_cost/control_cost are the
-		# diagonal LQR weights (Q, R) for that axis' single state/input.
+		# diagonal LQR weights (Q, R) for that axis' single state/input —
+		# these are choices you make about how much to penalize error vs
+		# effort, NOT fitted plant parameters. In particular, the
+		# intercept `c` that fit_axis_models.py prints alongside a/b has
+		# no slot here at all (see the project notes on what to do with
+		# it instead); solve_discrete_lqr will now refuse a negative
+		# state_cost specifically because of this mix-up.
 		roll_a=1.0057,
 		roll_b_ref=-0.0177,
-		roll_state_cost=0.00442,
+		roll_state_cost=1.0,
 		roll_control_cost=0.2,
 
 		pitch_a=0.9975,
 		pitch_b_ref=-0.0265,
-		pitch_state_cost=-0.00509,
+		pitch_state_cost=1.0,
 		pitch_control_cost=0.2,
 
 		thrust_a=0.9314,
 		thrust_b_ref=-0.0403,
-		thrust_state_cost=0.01778,
-		thrust_control_cost =0.2,
+		thrust_state_cost=1.0,
+		thrust_control_cost=0.2,
 
 		# Operating points (in area_fraction) at which the LQR gain is
 		# actually solved; gain_at() interpolates between these at

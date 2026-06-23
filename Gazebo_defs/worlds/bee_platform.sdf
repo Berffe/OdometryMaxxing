@@ -72,12 +72,29 @@
 	<static>true</static>
 
 	<link name="platform_link">
-	<visual name="visual">
+	<visual name="visual_body">
 		<geometry>
 		<cylinder>
 			<radius>1.0</radius>
 			<length>0.2</length>
 		</cylinder>
+		</geometry>
+		<material>
+		<ambient>0.55 0.35 0.18 1</ambient>
+		<diffuse>0.55 0.35 0.18 1</diffuse>
+		<specular>0.2 0.2 0.2 1</specular>
+		</material>
+	</visual>
+
+	<visual name="visual_top">
+		<!-- Slightly above the cylinder's top face (z=+length/2=0.1) to
+		     avoid z-fighting with visual_body's cap. -->
+		<pose>0 0 0.1005 0 0 0</pose>
+		<geometry>
+		<mesh>
+			<uri>materials/meshes/flower_disc.obj</uri>
+			<scale>1.0 1.0 1.0</scale>
+		</mesh>
 		</geometry>
 		<material>
 		<ambient>0.95 0.70 0.15 1</ambient>

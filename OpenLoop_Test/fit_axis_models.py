@@ -19,15 +19,28 @@ scaling and print a ready-to-use schedule:
 
 	python fit_axis_models.py logs/calib_far.csv logs/calib_mid.csv logs/calib_near.csv
 
-This script does not import rclpy, numpy aside — it only reads the CSV
-that diagnostics_writer.py already produces.
+Plots (written to --output-dir, default fit_axis_output):
+
+	- <csv_stem>_area_fraction.png   one per file: area_fraction over
+	  time, to visually confirm it stayed roughly constant during that
+	  run (the whole per-file fit assumes one fixed operating point —
+	  this is the check that the assumption actually held).
+	- b_vs_area_fraction.png         only when 2+ files are given: the
+	  fitted b for each axis against area_fraction, with the assumed
+	  sqrt(area_fraction) curve overlaid, so the scaling check from the
+	  printed table is also something you can actually look at.
+
+This script needs matplotlib/numpy for the analysis and plots, but not
+rclpy — it only reads the CSV that diagnostics_writer.py already produces.
 """
 
 import argparse
 import csv
 import math
+import os
 from typing import Dict, List, Optional, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 
 
@@ -167,8 +180,66 @@ def row_is_found(row: Dict[str, str]) -> bool:
 	return row.get("target_found", "0") == "1"
 
 
+def ensure_output_dir(output_dir: str):
+	os.makedirs(output_dir, exist_ok=True)
+
+
+def save_current_figure(output_dir: str, filename: str):
+	path = os.path.join(output_dir, filename)
+	plt.tight_layout()
+	plt.savefig(path, dpi=160)
+	plt.close()
+	print(f"  Saved: {path}")
+
+
+def plot_area_fraction_over_time(rows: List[Dict[str, str]], csv_path: str, output_dir: str):
+	"""
+	area_fraction vs t_sec for one file. The per-file fit treats the
+	whole file as a single operating point — this is the plot that
+	tells you whether that was actually true, or whether area_fraction
+	drifted (most likely during the thrust step train, which does
+	command real altitude changes — see calibration_node.py's safety note).
+	"""
+	if rows and "target_area_fraction" not in rows[0]:
+		print("  area_fraction plot: column not present in this CSV (older log format)")
+		return
+
+	t, area_fraction = [], []
+
+	for row in rows:
+		if not row_is_found(row):
+			continue
+
+		t_value = _safe_float(row.get("t_sec"))
+		af_value = _safe_float(row.get("target_area_fraction"))
+
+		if t_value is None or af_value is None:
+			continue
+
+		t.append(t_value)
+		area_fraction.append(af_value)
+
+	if len(t) < 2:
+		print("  area_fraction plot: not enough valid rows to plot")
+		return
+
+	plt.figure(figsize=(9, 4))
+	plt.title(f"area_fraction over time — {os.path.basename(csv_path)}")
+	plt.plot(t, area_fraction, marker=".", linewidth=1.2)
+	plt.axhline(float(np.mean(area_fraction)), linestyle="--", linewidth=1, color="gray",
+				label=f"mean = {np.mean(area_fraction):.3f}")
+	plt.xlabel("time [s]")
+	plt.ylabel("area_fraction [-]")
+	plt.ylim(-0.05, 1.05)
+	plt.grid(True)
+	plt.legend()
+
+	stem = os.path.splitext(os.path.basename(csv_path))[0]
+	save_current_figure(output_dir, f"{stem}_area_fraction.png")
+
+
 def analyze_file(
-	path: str, dt_nominal: float, dt_tolerance: float
+	path: str, dt_nominal: float, dt_tolerance: float, output_dir: str
 ) -> Tuple[Dict[str, Optional[AxisFit]], Optional[Tuple[float, float, float]]]:
 	rows = read_csv_rows(path)
 
@@ -185,6 +256,8 @@ def analyze_file(
 		else:
 			print("  area_fraction: no valid (found) rows in this file")
 
+	plot_area_fraction_over_time(rows, path, output_dir)
+
 	fits = {}
 
 	for axis in ("roll", "pitch", "thrust"):
@@ -200,6 +273,26 @@ def analyze_file(
 	return fits, stats
 
 
+def collect_axis_points(
+	per_file_fits: List[Tuple[str, Dict[str, Optional[AxisFit]], Optional[Tuple[float, float, float]]]],
+	axis: str,
+) -> List[Tuple[float, float, float]]:
+	"""Sorted (mean_area_fraction, a, b) for every file with a valid fit+stats on this axis."""
+	points = []
+
+	for path, fits, stats in per_file_fits:
+		fit = fits.get(axis)
+
+		if fit is None or stats is None:
+			continue
+
+		_, mean_area_fraction, _ = stats
+		points.append((mean_area_fraction, fit.a, fit.b))
+
+	points.sort(key=lambda p: p[0])
+	return points
+
+
 def check_scaling_and_print_schedule(
 	per_file_fits: List[Tuple[str, Dict[str, Optional[AxisFit]], Optional[Tuple[float, float, float]]]],
 	area_fraction_ref: Optional[float],
@@ -207,18 +300,11 @@ def check_scaling_and_print_schedule(
 	print("\n--- across operating points ---")
 
 	for axis in ("roll", "pitch", "thrust"):
-		points = []
-		for path, fits, stats in per_file_fits:
-			fit = fits.get(axis)
-			if fit is None or stats is None:
-				continue
-			_, mean_area_fraction, _ = stats
-			points.append((mean_area_fraction, fit.a, fit.b))
+		points = collect_axis_points(per_file_fits, axis)
 
 		if len(points) < 2:
 			continue
 
-		points.sort(key=lambda p: p[0])
 		ref = area_fraction_ref if area_fraction_ref is not None else points[0][0]
 
 		print(f"\n{axis}:")
@@ -248,6 +334,57 @@ def check_scaling_and_print_schedule(
 			print(f"    ({area_fraction:.3f}, [[{a:.4f}]], [[{b:.4f}]], [[state_cost]], [[control_cost]]),")
 
 
+def plot_b_vs_area_fraction(
+	per_file_fits: List[Tuple[str, Dict[str, Optional[AxisFit]], Optional[Tuple[float, float, float]]]],
+	area_fraction_ref: Optional[float],
+	output_dir: str,
+):
+	"""
+	Fitted b against area_fraction per axis, with the assumed
+	b_ref * sqrt(area_fraction / area_fraction_ref) curve overlaid using
+	the same b_ref candidate printed by check_scaling_and_print_schedule
+	— the visual version of that table, so a poor sqrt fit is something
+	you can see, not just read off a spread percentage.
+	"""
+	axes_with_points = [
+		(axis, collect_axis_points(per_file_fits, axis)) for axis in ("roll", "pitch", "thrust")
+	]
+	axes_with_points = [(axis, points) for axis, points in axes_with_points if len(points) >= 2]
+
+	if not axes_with_points:
+		print("\nSkipping b_vs_area_fraction plot. Need 2+ files with a valid fit on at least one axis.")
+		return
+
+	fig, axes = plt.subplots(len(axes_with_points), 1, figsize=(8, 3.4 * len(axes_with_points)))
+
+	if len(axes_with_points) == 1:
+		axes = [axes]
+
+	for ax, (axis, points) in zip(axes, axes_with_points):
+		area_fractions = np.array([p[0] for p in points])
+		b_values = np.array([p[2] for p in points])
+
+		ref = area_fraction_ref if area_fraction_ref is not None else area_fractions[0]
+		ratios = b_values / np.sqrt(np.maximum(area_fractions, 1e-9) / max(ref, 1e-9))
+		b_ref_candidate = float(np.mean(ratios))
+
+		curve_x = np.linspace(min(area_fractions.min(), ref) * 0.9, area_fractions.max() * 1.05, 200)
+		curve_y = b_ref_candidate * np.sqrt(np.maximum(curve_x, 1e-9) / max(ref, 1e-9))
+
+		ax.plot(curve_x, curve_y, linestyle="--", color="gray",
+				label=f"b_ref * sqrt(s/{ref:.3f})  (b_ref={b_ref_candidate:.4f})")
+		ax.scatter(area_fractions, b_values, color="tab:blue", zorder=3, label="fitted b per file")
+
+		ax.set_title(axis)
+		ax.set_xlabel("area_fraction [-]")
+		ax.set_ylabel("b")
+		ax.axhline(0.0, linestyle=":", linewidth=0.8, color="black")
+		ax.grid(True)
+		ax.legend(loc="best")
+
+	save_current_figure(output_dir, "b_vs_area_fraction.png")
+
+
 def main():
 	parser = argparse.ArgumentParser(description=__doc__)
 	parser.add_argument("csv_paths", nargs="+", help="one or more calibration CSV files")
@@ -260,15 +397,22 @@ def main():
 		"--area-fraction-ref", type=float, default=None,
 		help="reference area_fraction for the sqrt-scaling check (default: smallest observed)",
 	)
+	parser.add_argument(
+		"--output-dir", default="fit_axis_output",
+		help="directory where plots are saved. Default: fit_axis_output.",
+	)
 	args = parser.parse_args()
+
+	ensure_output_dir(args.output_dir)
 
 	per_file_fits = []
 	for path in args.csv_paths:
-		fits, stats = analyze_file(path, args.dt, args.dt_tolerance)
+		fits, stats = analyze_file(path, args.dt, args.dt_tolerance, args.output_dir)
 		per_file_fits.append((path, fits, stats))
 
 	if len(per_file_fits) > 1:
 		check_scaling_and_print_schedule(per_file_fits, args.area_fraction_ref)
+		plot_b_vs_area_fraction(per_file_fits, args.area_fraction_ref, args.output_dir)
 
 
 if __name__ == "__main__":

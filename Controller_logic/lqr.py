@@ -64,6 +64,8 @@ def solve_discrete_lqr(
 	Q = np.atleast_2d(np.asarray(Q, dtype=float))
 	R = np.atleast_2d(np.asarray(R, dtype=float))
 
+	_validate_cost_weights(Q, R)
+
 	try:
 		from scipy.linalg import solve_discrete_are
 
@@ -107,6 +109,40 @@ def _gain_from_p(A: np.ndarray, B: np.ndarray, R: np.ndarray, P: np.ndarray) -> 
 	bt_p = B.T @ P
 	s = R + bt_p @ B
 	return np.linalg.solve(s, bt_p @ A)
+
+
+def _validate_cost_weights(Q: np.ndarray, R: np.ndarray):
+	"""
+	Q must be positive semi-definite (state error is never allowed to
+	reduce cost) and R strictly positive definite (control effort must
+	have a real, invertible cost). This exists because of a real
+	mistake: it's easy to accidentally pass a fitted model parameter
+	(e.g. the intercept `c` from fit_axis_models.py) into a Q/R slot
+	instead of an actual cost weight — the numbers look perfectly
+	reasonable (small, finite) and the solver won't crash on them, it
+	just quietly returns a gain that barely reacts to anything, or
+	(if Q ends up negative) one that doesn't even correspond to a
+	well-posed minimization problem. Catch that here instead.
+	"""
+	q_eigs = np.linalg.eigvalsh((Q + Q.T) / 2.0)
+	r_eigs = np.linalg.eigvalsh((R + R.T) / 2.0)
+
+	if np.any(q_eigs < -1e-9):
+		raise ValueError(
+			f"solve_discrete_lqr: Q must be positive semi-definite, got "
+			f"eigenvalues {q_eigs}. If this Q came from a constructor "
+			f"argument named *_state_cost, double check you passed a real "
+			f"cost weight (e.g. 1.0) and not a fitted model parameter "
+			f"like the intercept `c` from fit_axis_models.py — that's a "
+			f"property of the plant, not something you choose, and it has "
+			f"no slot in this 1-state model."
+		)
+
+	if np.any(r_eigs <= 1e-12):
+		raise ValueError(
+			f"solve_discrete_lqr: R must be strictly positive definite, "
+			f"got eigenvalues {r_eigs}. Check the *_control_cost argument."
+		)
 
 
 class ScheduledLQR:
