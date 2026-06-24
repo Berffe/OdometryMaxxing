@@ -3,14 +3,18 @@ Analyse bee landing diagnostics CSV.
 
 Usage:
 
-	python analyse_log.py logs/bee_diagnostics_XXXXXXXX.csv
+	# One CSV -> write all plots directly into results/test9
+	python analyse_log.py logs/bee_diagnostics_XXXXXXXX.csv results/test9
+
+	# Whole folder -> write one subfolder per CSV: results/test1, results/test2, ...
+	python analyse_log.py logs
 
 Optional:
 
 	python analyse_log.py logs/bee_diagnostics_XXXXXXXX.csv \
 		--image-width 640 \
 		--image-height 480 \
-		--output-dir analysis_output \
+		--output-dir results/test9 \
 		--divergence-setpoint 0.15 \
 		--area-fraction-schedule 0.05,0.30,0.60,0.80,0.95,1.0 \
 		--max-area-fraction 0.60 \
@@ -415,6 +419,9 @@ def plot_divergence(df: pd.DataFrame, t: np.ndarray, output_dir: str, divergence
 	optional_columns = [
 		("box_divergence_1_s", "box divergence"),
 		("box_divergence_filtered_1_s", "box divergence filtered"),
+		# Current diagnostics_writer.py uses this name; keep the older variant too
+		# so old logs remain readable.
+		("flow_raw_divergence_1_s", "raw flow divergence"),
 		("flow_divergence_raw_1_s", "raw flow divergence"),
 	]
 
@@ -558,22 +565,103 @@ def plot_pipeline_latency(df: pd.DataFrame, t: np.ndarray, output_dir: str):
 	save_current_figure(output_dir, "pipeline_latency.png")
 
 
+def _looks_like_csv_path(path_like: str) -> bool:
+	return Path(path_like).suffix.lower() == ".csv"
+
+
+def _path_contains_csv(path_like: str) -> bool:
+	path = Path(path_like)
+	return path.is_dir() and any(child.suffix.lower() == ".csv" for child in path.iterdir())
+
+
+def _split_inputs_and_output_dir(raw_paths, output_dir_arg: str, default_output_dir: str):
+	"""
+	Accept both styles:
+
+		python analyse_log.py logs/file.csv results/test9
+		python analyse_log.py logs --output-dir results
+
+	If --output-dir was not explicitly changed and the last positional argument
+	looks like an output folder rather than a CSV/folder input, use it as the
+	output directory. This keeps the command line short while preserving
+	--output-dir for unambiguous multi-input calls.
+	"""
+	paths = [str(path) for path in raw_paths]
+	output_dir = output_dir_arg
+
+	# Detect: analyse_log.py <input.csv or input_folder> <output_folder>
+	if output_dir_arg == default_output_dir and len(paths) >= 2:
+		last = paths[-1]
+		last_path = Path(last)
+
+		last_is_input = (
+			_looks_like_csv_path(last)
+			or _path_contains_csv(last)
+		)
+
+		if not last_is_input:
+			output_dir = last
+			paths = paths[:-1]
+
+	if not paths:
+		raise ValueError("No CSV file or log folder was provided.")
+
+	return paths, output_dir
+
+
+def collect_csv_paths(inputs):
+	"""Return sorted CSV paths from one or more files/folders."""
+	csv_paths = []
+
+	for item in inputs:
+		path = Path(item)
+
+		if path.is_dir():
+			csv_paths.extend(sorted(path.glob("*.csv")))
+		elif path.is_file() and path.suffix.lower() == ".csv":
+			csv_paths.append(path)
+		else:
+			raise FileNotFoundError(
+				f"Input is neither a CSV file nor a folder containing CSV logs: {item}"
+			)
+
+	if not csv_paths:
+		raise FileNotFoundError("No CSV files found in the provided input(s).")
+
+	return csv_paths
+
+
+def output_dir_for_csv(csv_path: Path, output_root: Path, total_csv_count: int, index: int, explicit_positional_output: bool):
+	"""
+	Single CSV + explicit output folder:
+		results/test9/<plots>.png
+
+	Folder or multiple CSVs:
+		results/test1/<plots>.png
+		results/test2/<plots>.png
+	"""
+	if total_csv_count == 1 and explicit_positional_output:
+		return output_root
+
+	if total_csv_count == 1 and output_root.name.lower().startswith("test"):
+		return output_root
+
+	return output_root / f"test{index}"
+
+
 def main():
 	parser = argparse.ArgumentParser(
 		description="Analyse bee landing diagnostics CSV."
 	)
 
 	parser.add_argument(
-		"csv_paths",
+		"paths",
 		nargs="+",
-		action=type("FolderAction", (argparse.Action,), {
-			"__call__": lambda self, p, ns, vals, opt=None: setattr(
-				ns,
-				self.dest,
-				sum([[os.path.join(v, f) for f in os.listdir(v) if f.endswith(".csv")] if os.path.isdir(v) else [v] for v in vals], [])
-			)
-		}),
-		help="one or more calibration CSV files or folders containing them"
+		help=(
+			"CSV file(s), folder(s) containing CSV logs, and optionally an output "
+			"folder as the final positional argument. Examples: "
+			"analyse_log.py logs/file.csv results/test9 ; analyse_log.py logs"
+		),
 	)
 
 	parser.add_argument(
@@ -590,10 +678,11 @@ def main():
 		help="Camera image height in pixels. Default: 480.",
 	)
 
+	default_output_dir = "results"
 	parser.add_argument(
 		"--output-dir",
-		default="analysis_output",
-		help="Directory where plots will be saved. Default: analysis_output.",
+		default=default_output_dir,
+		help="Directory where plots will be saved. Default: results.",
 	)
 
 	parser.add_argument(
@@ -636,7 +725,24 @@ def main():
 
 	args = parser.parse_args()
 
-	ensure_output_dir(args.output_dir)
+	# True for commands such as:
+	#   py analyse_log.py logs/bee_diagnostics.csv results/test9
+	positional_output_requested = (
+		args.output_dir == default_output_dir
+		and len(args.paths) >= 2
+		and not _looks_like_csv_path(args.paths[-1])
+		and not _path_contains_csv(args.paths[-1])
+	)
+
+	input_paths, output_dir = _split_inputs_and_output_dir(
+		raw_paths=args.paths,
+		output_dir_arg=args.output_dir,
+		default_output_dir=default_output_dir,
+	)
+
+	csv_paths = collect_csv_paths(input_paths)
+	output_root = Path(output_dir)
+	ensure_output_dir(output_root)
 
 	schedule_points = (
 		[float(value) for value in args.area_fraction_schedule.split(",") if value.strip() != ""]
@@ -644,12 +750,16 @@ def main():
 		else []
 	)
 
-	for csv_p in args.csv_paths :
+	for index, csv_p in enumerate(csv_paths, start=1):
 		df = read_log(csv_p)
 		t = get_time(df)
-		home = Path(args.output_dir)
-		output = Path(csv_p)
-		output_complete = home / csv_p
+		output_complete = output_dir_for_csv(
+			csv_path=csv_p,
+			output_root=output_root,
+			total_csv_count=len(csv_paths),
+			index=index,
+			explicit_positional_output=positional_output_requested,
+		)
 		ensure_output_dir(output_complete)
 
 		print(f"Loaded: {csv_p}")

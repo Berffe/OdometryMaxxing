@@ -1,63 +1,41 @@
 """
-Small, ROS-free discrete-time LQR building blocks, shared by control_law.py.
+Discrete-time LQR building blocks (ROS-free), shared by control_law.py.
 
-solve_discrete_lqr(A, B, Q, R) solves the infinite-horizon discrete-time
-LQR problem for
+Plant:        x[k+1] = A x[k] + B u[k]
+Cost:         J = sum_k ( x[k]^T Q x[k] + u[k]^T R u[k] )
+DARE:         P = A^T P A - A^T P B (R + B^T P B)^-1 B^T P A + Q
+Optimal gain: K = (R + B^T P B)^-1 B^T P A,   with   u[k] = -K x[k]
+Closed loop:  x[k+1] = (A - B K) x[k],  stable iff all |eig(A - B K)| < 1
 
-	x_{k+1} = A x_k + B u_k
+ScheduledLQR carries a small bank of local linear models indexed by a scalar
+scheduling variable (here area_fraction) and blends their pre-solved gains by
+linear interpolation (the standard LPV / gain-scheduling pattern).
 
-minimizing sum_k (x_k^T Q x_k + u_k^T R u_k), and returns the gain K such
-that u_k = -K x_k is optimal. It works for any state/input dimension —
-a 1-state/1-input axis (today) or a multi-state axis (e.g. once you add
-an optical-flow-derived velocity state for damping) use the same code
-path, A/B/Q/R just become bigger matrices.
-
-ScheduledLQR wraps a handful of (operating_point, A, B, Q, R) tuples,
-solves each once at construction time, and linearly interpolates between
-the two nearest gains at runtime. This is the standard gain-scheduling
-("LPV") pattern: rather than one linearization valid only locally, you
-carry a small bank of local linear models spanning the operating range
-and blend between them using a scheduling variable (here, area_fraction).
+It also supports an element-wise gain_scale s, applied as K_eff = s (.) K. This
+is the manual-tuning hook used by control_law.py: the LQR gives the baseline
+gain shape, and s lets each gain component (e.g. the damping term) be trimmed
+experimentally without re-deriving Q/R. baseline_gain_at() returns the
+un-scaled optimal gain so the starting point can still be inspected/logged.
 """
 
-from typing import Iterable, Sequence, Tuple
+from typing import Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 
 
-def solve_discrete_lqr(
-	A,
-	B,
-	Q,
-	R,
-	iterations: int = 20000,
-	tol: float = 1e-12,
-) -> np.ndarray:
+def solve_discrete_lqr(A, B, Q, R, iterations: int = 20000, tol: float = 1e-12) -> np.ndarray:
 	"""
-	Solve the discrete-time algebraic Riccati equation and return the
-	corresponding LQR gain K (u = -K x).
+	Return the LQR gain K (u = -K x) for x[k+1] = A x[k] + B u[k].
 
-	A, B, Q, R may be plain numbers/nested lists or numpy arrays; they
-	are coerced to 2D arrays internally, so a scalar 1-state/1-input axis
-	can simply pass e.g. A=[[1.0]], B=[[b]], Q=[[q]], R=[[r]].
+	A/B/Q/R may be scalars, nested lists, or arrays; they are coerced to 2D, so
+	a 1-state/1-input axis can pass A=[[a]], B=[[b]], Q=[[q]], R=[[r]].
 
-	Uses scipy.linalg.solve_discrete_are when scipy is importable — it's
-	the robust, standard approach (Schur-based, no iteration count to
-	tune) and this function is only ever called a handful of times at
-	ControlLaw construction, not per control tick, so the dependency
-	costs nothing at runtime. Falls back to fixed-point Riccati iteration
-	if scipy isn't available.
-
-	The fallback is NOT just "more iterations and hope": a system with
-	a near or above 1 (open-loop marginal/unstable, exactly what real
-	calibration data can produce — see fit_axis_models.py) combined
-	with a small b needs the Riccati iterate P to grow to a large value
-	before the control term meaningfully bites, and naive iteration can
-	need many thousands of steps to get there. Returning a gain before
-	that happens silently hands back an unstabilizing K with no warning.
-	So the fallback explicitly checks the resulting closed-loop
-	eigenvalues and raises rather than returning a gain it hasn't
-	verified is actually stabilizing.
+	Uses scipy.linalg.solve_discrete_are (Schur-based, robust) when available;
+	this runs only a handful of times at construction, never per control tick.
+	Falls back to fixed-point Riccati iteration otherwise. The fallback verifies
+	the closed-loop eigenvalues and raises rather than silently returning a
+	non-stabilizing K -- a model with |eig(A)| near/above 1 and small B can need
+	P to grow for many thousands of steps before the control term bites.
 	"""
 	A = np.atleast_2d(np.asarray(A, dtype=float))
 	B = np.atleast_2d(np.asarray(B, dtype=float))
@@ -76,122 +54,98 @@ def solve_discrete_lqr(
 
 	P = Q.copy()
 	converged = False
-
 	for _ in range(iterations):
-		k = _gain_from_p(A, B, R, P)
-		p_next = Q + A.T @ P @ A - A.T @ P @ B @ k
-
+		K = _gain_from_p(A, B, R, P)
+		p_next = Q + A.T @ P @ A - A.T @ P @ B @ K
 		if np.max(np.abs(p_next - P)) < tol:
 			P = p_next
 			converged = True
 			break
-
 		P = p_next
 
 	K = _gain_from_p(A, B, R, P)
-	closed_loop_eigvals = np.linalg.eigvals(A - B @ K)
-
-	if not converged or np.any(np.abs(closed_loop_eigvals) >= 1.0 - 1e-9):
+	eigvals = np.linalg.eigvals(A - B @ K)
+	if not converged or np.any(np.abs(eigvals) >= 1.0 - 1e-9):
 		raise RuntimeError(
-			"solve_discrete_lqr: the pure-numpy fallback did not reach a "
-			f"verified stabilizing solution after {iterations} iterations "
-			f"(closed-loop eigenvalues: {closed_loop_eigvals}, "
-			f"converged={converged}). This combination of A/B/Q/R is likely "
-			"close to the stability boundary with weak control authority — "
-			"install scipy for a robust solve (pip install scipy), or pass "
-			"a larger `iterations`."
+			"solve_discrete_lqr: pure-numpy fallback did not reach a verified "
+			f"stabilizing solution in {iterations} iterations (closed-loop "
+			f"eigenvalues {eigvals}, converged={converged}). Likely near the "
+			"stability boundary with weak control authority -- install scipy "
+			"(pip install scipy) or raise `iterations`."
 		)
-
 	return K
 
 
 def _gain_from_p(A: np.ndarray, B: np.ndarray, R: np.ndarray, P: np.ndarray) -> np.ndarray:
+	"""K = (R + B^T P B)^-1 B^T P A."""
 	bt_p = B.T @ P
-	s = R + bt_p @ B
-	return np.linalg.solve(s, bt_p @ A)
+	return np.linalg.solve(R + bt_p @ B, bt_p @ A)
 
 
 def _validate_cost_weights(Q: np.ndarray, R: np.ndarray):
 	"""
-	Q must be positive semi-definite (state error is never allowed to
-	reduce cost) and R strictly positive definite (control effort must
-	have a real, invertible cost). This exists because of a real
-	mistake: it's easy to accidentally pass a fitted model parameter
-	(e.g. the intercept `c` from fit_axis_models.py) into a Q/R slot
-	instead of an actual cost weight — the numbers look perfectly
-	reasonable (small, finite) and the solver won't crash on them, it
-	just quietly returns a gain that barely reacts to anything, or
-	(if Q ends up negative) one that doesn't even correspond to a
-	well-posed minimization problem. Catch that here instead.
+	Q must be PSD and R strictly PD, else the minimization is ill-posed. Guards
+	the easy mistake of passing a fitted plant parameter into a Q/R slot: the
+	number looks reasonable, the solver does not crash, it just returns a gain
+	that barely reacts (or, for negative Q, solves the wrong problem).
 	"""
 	q_eigs = np.linalg.eigvalsh((Q + Q.T) / 2.0)
 	r_eigs = np.linalg.eigvalsh((R + R.T) / 2.0)
-
 	if np.any(q_eigs < -1e-9):
-		raise ValueError(
-			f"solve_discrete_lqr: Q must be positive semi-definite, got "
-			f"eigenvalues {q_eigs}. If this Q came from a constructor "
-			f"argument named *_state_cost, double check you passed a real "
-			f"cost weight (e.g. 1.0) and not a fitted model parameter "
-			f"like the intercept `c` from fit_axis_models.py — that's a "
-			f"property of the plant, not something you choose, and it has "
-			f"no slot in this 1-state model."
-		)
-
+		raise ValueError(f"Q must be positive semi-definite, got eigenvalues {q_eigs}.")
 	if np.any(r_eigs <= 1e-12):
-		raise ValueError(
-			f"solve_discrete_lqr: R must be strictly positive definite, "
-			f"got eigenvalues {r_eigs}. Check the *_control_cost argument."
-		)
+		raise ValueError(f"R must be strictly positive definite, got eigenvalues {r_eigs}.")
 
 
 class ScheduledLQR:
 	"""
-	A bank of discrete-time LQR gains, one per operating point along a
-	scalar scheduling variable, blended by linear interpolation.
+	Bank of LQR gains along a scalar scheduling variable, blended by linear
+	interpolation. Each entry is (scheduling_value, A, B, Q, R). Values outside
+	the provided range are clamped to the nearest end (no extrapolation).
 
-	Each schedule entry is (scheduling_value, A, B, Q, R). The gain for
-	an arbitrary scheduling_value is obtained by linearly interpolating
-	between the two nearest entries; values outside the provided range
-	are clamped to the nearest end rather than extrapolated.
+	gain_scale (optional) is an element-wise multiplier applied to every gain:
+	K_eff = gain_scale (.) K. Use it to trim individual gain components (e.g.
+	scale up the damping/velocity term) on top of the optimal baseline.
 	"""
 
 	def __init__(
 		self,
 		schedule: Iterable[Tuple[float, object, object, object, object]],
+		gain_scale: Optional[object] = None,
 	):
 		points = sorted(schedule, key=lambda item: item[0])
-
 		if not points:
 			raise ValueError("ScheduledLQR needs at least one schedule point")
 
-		self._schedule_values = [float(point[0]) for point in points]
-		self._gains = [
-			solve_discrete_lqr(point[1], point[2], point[3], point[4])
-			for point in points
-		]
+		self._values = [float(p[0]) for p in points]
+		self._baseline_gains = [solve_discrete_lqr(p[1], p[2], p[3], p[4]) for p in points]
 
-	def gain_at(self, scheduling_value: float) -> np.ndarray:
-		"""Return the interpolated gain matrix K for scheduling_value."""
-		values = self._schedule_values
-		gains = self._gains
+		self._gain_scale = None if gain_scale is None else np.atleast_2d(np.asarray(gain_scale, float))
+		self._gains = [self._apply_scale(K) for K in self._baseline_gains]
 
-		if scheduling_value <= values[0]:
+	def _apply_scale(self, K: np.ndarray) -> np.ndarray:
+		return K if self._gain_scale is None else self._gain_scale * K
+
+	def _interpolate(self, gains, scheduling_value: float) -> np.ndarray:
+		v = self._values
+		if scheduling_value <= v[0]:
 			return gains[0]
-
-		if scheduling_value >= values[-1]:
+		if scheduling_value >= v[-1]:
 			return gains[-1]
-
-		for i in range(len(values) - 1):
-			low, high = values[i], values[i + 1]
-
-			if low <= scheduling_value <= high:
-				span = max(high - low, 1e-9)
-				t = (scheduling_value - low) / span
-
+		for i in range(len(v) - 1):
+			lo, hi = v[i], v[i + 1]
+			if lo <= scheduling_value <= hi:
+				t = (scheduling_value - lo) / max(hi - lo, 1e-9)
 				return (1.0 - t) * gains[i] + t * gains[i + 1]
-
 		return gains[-1]
 
+	def gain_at(self, scheduling_value: float) -> np.ndarray:
+		"""Interpolated gain K_eff (= baseline (.) gain_scale) for scheduling_value."""
+		return self._interpolate(self._gains, scheduling_value)
+
+	def baseline_gain_at(self, scheduling_value: float) -> np.ndarray:
+		"""Interpolated optimal gain before gain_scale -- the LQR starting point."""
+		return self._interpolate(self._baseline_gains, scheduling_value)
+
 	def schedule_values(self) -> Sequence[float]:
-		return tuple(self._schedule_values)
+		return tuple(self._values)

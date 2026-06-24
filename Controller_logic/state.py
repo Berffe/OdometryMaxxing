@@ -1,8 +1,6 @@
 """
-Shared data containers passed between bee_node.py and the algorithm modules.
-
-These classes intentionally stay ROS-free so the vision and control code can be
-imported and unit-tested without rclpy.
+Shared, ROS-free data containers passed between bee_node.py and the algorithm
+modules, so the vision/control code can be imported and tested without rclpy.
 """
 
 from dataclasses import dataclass
@@ -10,10 +8,10 @@ from dataclasses import dataclass
 
 @dataclass
 class VehicleState:
-	"""Latest PX4 local-position estimate used for diagnostics and handoff checks.
+	"""PX4 local-position estimate (NED), for diagnostics/handoff only.
 
-	PX4 local position is NED: z becomes more negative when climbing, and
-	vz > 0 means descending.
+	NED sign convention: z grows more negative when climbing, vz > 0 = descending.
+	Not used by the control law after visual handoff.
 	"""
 
 	timestamp: float = 0.0
@@ -23,31 +21,39 @@ class VehicleState:
 	vx: float = 0.0
 	vy: float = 0.0
 	vz: float = 0.0
-	yaw: float = 0.0  # VehicleLocalPosition.heading, radians
+	yaw: float = 0.0  # VehicleLocalPosition.heading [rad]
 
 
 @dataclass
 class FlowResult:
 	"""Output of OpticalFlowEstimator.update().
 
-	mean_flow_x/mean_flow_y are in px/s and are useful for camera debugging.
-	mean_flow_x_norm/mean_flow_y_norm are normalized image velocities in the
-	same coordinate convention as TargetEstimate.offset_x/y. The closed-loop
-	controller uses the normalized values because the identified roll/pitch
-	models were fitted with state = [offset, normalized_flow].
+	Control inputs (used by control_law.py):
+	    mean_flow_x_norm / mean_flow_y_norm : normalized image velocity [1/s], in
+	        the same convention as TargetEstimate.offset_x/y. Closed-loop control
+	        uses these because the identified models have state [offset, flow_norm].
+	    divergence : filtered divergence [1/s], used by the thrust loop.
 
-	divergence is filtered; raw_divergence is logged separately because filtering
-	adds phase lag and can be useful for identification/debugging.
+	Debug / log-only:
+	    mean_flow_x / mean_flow_y : same velocity in px/s, kept for camera
+	        debugging and logging. Relation: *_norm = *_px_s / (0.5 * image_dim),
+	        so the normalized field is the px/s field rescaled (recoverable).
+	    raw_divergence : unfiltered divergence; logged separately because the
+	        filter adds phase lag that matters for identification.
+	    roi_* : ROI the flow was computed in (target box), x1/y1 exclusive.
 	"""
 
 	timestamp: float = 0.0
 	valid: bool = False
-	mean_flow_x: float = 0.0
-	mean_flow_y: float = 0.0
+
 	mean_flow_x_norm: float = 0.0
 	mean_flow_y_norm: float = 0.0
 	divergence: float = 0.0
+
+	mean_flow_x: float = 0.0
+	mean_flow_y: float = 0.0
 	raw_divergence: float = 0.0
+
 	roi_x0: int = -1
 	roi_y0: int = -1
 	roi_x1: int = -1
@@ -56,7 +62,12 @@ class FlowResult:
 
 @dataclass
 class TargetEstimate:
-	"""Output of TargetAcquisition.update() — what the controller should track."""
+	"""Output of TargetAcquisition.update() -- what the controller tracks.
+
+	offset_x/y : centroid offset from image center, normalized to [-1, 1].
+	area_fraction : detection area / frame area, in [0, 1]; the scheduling
+	    variable for the identified visual models.
+	"""
 
 	timestamp: float = 0.0
 	found: bool = False
@@ -65,14 +76,12 @@ class TargetEstimate:
 	detection_width: float = 0.0
 	detection_height: float = 0.0
 	confidence: float = 0.0
-	# Detection area as a fraction of the full frame area, in [0, 1]. Used as
-	# the gain-scheduling variable for the identified visual models.
 	area_fraction: float = 0.0
 
 
 @dataclass
 class AttitudeSetpoint:
-	"""Desired attitude/thrust command consumed by the MAVSDK/PX4 backend."""
+	"""Desired attitude/thrust consumed by the MAVSDK/PX4 backend."""
 
 	timestamp: float = 0.0
 	roll: float = 0.0

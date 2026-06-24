@@ -1,36 +1,31 @@
 """
-Closed-loop visual controller built from the latest open-loop calibration.
+Closed-loop visual controller: scheduled LQR baseline + manual experimental trim.
 
-Project constraint for this version:
-    PX4 local position / velocity is NOT used by the control law.
-    Vehicle state may be logged by bee_node.py for diagnostics, and MAVSDK/PX4
-    may be used for the initial automatic takeoff/handoff, but once the visual
-    controller is active the commands below are computed only from:
+Constraint: once the visual controller is active, commands use ONLY visual data
+(target offset, normalized optical flow, divergence, area_fraction). No PX4
+position/velocity enters the control law.
 
-        target offset_x / offset_y
-        normalized optical flow mean_flow_x_norm / mean_flow_y_norm
-        optical-flow divergence
-        target area_fraction for gain scheduling
+Per lateral axis (roll <- x, pitch <- y), the identified open-loop model is
+    x[k+1] = A(af) x[k] + B(af) u[k],     x = [offset, flow_norm]^T
+with A, B scheduled on area_fraction (af). solve_discrete_lqr gives the optimal
+baseline gain K_lqr = [k_p, k_d]; the command is
+    u = sign * ( -(K x) ),   K = [s_p*k_p, s_d*k_d]
+where (s_p, s_d) are MANUAL per-component scales. The LQR fixes the gain shape;
+the scales are turned by hand to tune behavior, since the identified models are
+local and optimistic about loop/sensor lag at the 2 Hz control rate.
 
-Inputs used by this controller:
-    roll axis:   x_roll  = [target_offset_x, flow_mean_x_norm_s]
-    pitch axis:  x_pitch = [target_offset_y, flow_mean_y_norm_s]
-    thrust axis: divergence - divergence_setpoint, plus a visual-only integral
-                 of the same divergence error.
+Damping note: in the open-loop fit the optimal k_d is ~30x smaller than k_p, so
+the flow (velocity) term barely acts. *_damp_scale exists to deliberately raise
+it. If the loop still oscillates after raising damping, relax *_slew_rate /
+command_filter_alpha: a tight slew rate rate-limits the damping command itself
+and reintroduces the lag the damping was meant to remove.
 
-This v15 tuning keeps the successful sign convention from v14 but backs away
-from the first unstable oscillatory run:
+Thrust uses the scalar divergence model d[k+1] = a d[k] + b (thrust - hover),
+with LQR feedback on the divergence error plus a visual-only integral term.
 
-    - roll/pitch still use the calibrated 2-state scheduled LQR models;
-    - the pitch loop has substantially higher control cost and a lower command
-      limit, because the 20260624_183401 run spent most of its time saturated;
-    - commands are passed through a purely internal visual setpoint shaper
-      (soft saturation + slew-rate limiting). This uses only previous commanded
-      setpoints, not PX4 state, and prevents bang-bang excitation of the slow
-      image dynamics.
-
-All schedules are raw area_fraction schedules, not sqrt(area_fraction) scaling,
-because the reconstructed data showed the sqrt law was a poor fit.
+Commands are passed through a purely internal shaper (soft saturation ->
+first-order filter -> slew limit -> clamp). This uses only previous commands,
+never PX4 state, and removes bang-bang excitation of the slow image dynamics.
 """
 
 import math
@@ -44,9 +39,8 @@ except ImportError:
     from state import AttitudeSetpoint, FlowResult, TargetEstimate
 
 
-# Raw scheduled models from the reconstructed calibration results.
-# Each roll/pitch entry is (area_fraction, A, B) for
-# [offset[k+1], flow[k+1]]^T = A [offset[k], flow[k]]^T + B u[k].
+# Open-loop scheduled models from the reconstructed calibration.
+# Entry: (area_fraction, A, B) for [offset[k+1], flow[k+1]]^T = A x + B u.
 ROLL_STATE_MODELS = (
     (0.066, [[0.7508, 0.3322], [-0.5140, 0.0995]], [[-0.28352], [-0.91928]]),
     (0.133, [[0.6785, 0.2522], [-0.7866, 0.0246]], [[-0.40704], [-1.06228]]),
@@ -61,8 +55,7 @@ PITCH_STATE_MODELS = (
     (0.511, [[0.8375, 0.2004], [-0.3098, -0.1282]], [[-0.62260], [-1.56707]]),
 )
 
-# Scalar divergence model around hover thrust:
-# d[k+1] = a d[k] + b (thrust[k] - HOVER_THRUST).
+# Scalar divergence model: d[k+1] = a d[k] + b (thrust[k] - hover).
 THRUST_DIVERGENCE_MODELS = (
     (0.066, [[0.9856]], [[-0.0818]]),
     (0.133, [[0.9302]], [[-0.1294]]),
@@ -76,51 +69,59 @@ class ControlLaw:
         self,
         hover_thrust: float = 0.73,
         yaw_setpoint: float = 0.0,
-        # 0.0 means visual hover. Increase slowly later, for example
-        # 0.02 -> 0.04 -> 0.06, only after the centering loop is stable.
-        divergence_setpoint: float = 0.0,
-        # v14 got the signs right, but the 20260624_183401 run was clearly
-        # underdamped. Keep roll authority slightly higher because x stayed
-        # near zero; reduce pitch authority because y spent ~60% of the run at
-        # saturation and developed a growing low-frequency oscillation.
+        divergence_setpoint: float = 0.0,  # 0 = visual hover; raise slowly to descend.
+
+        # --- Baseline LQR cost (gain SHAPE). Larger R -> smaller gains; the
+        #     second Q entry weights the flow/velocity state -> damping. ---
+        roll_q=((1.0, 0.0), (0.0, 0.25)),
+        roll_r=((2.0,),),
+        pitch_q=((1.0, 0.0), (0.0, 0.25)),
+        pitch_r=((2.0,),),
+        thrust_q=((1.0,),),
+        thrust_r=((0.9,),),
+
+        # --- Manual gain trim (the experimental surface). ---
+        # prop_scale multiplies the LQR proportional gain k_p.
+        # Damping is set ONE of two ways, per axis:
+        #   damp_ratio is not None -> k_d = damp_ratio * k_p  (RECOMMENDED).
+        #     Guarantees damping is non-zero and same-signed as k_p at every
+        #     area_fraction. Needed because the open-loop flow row is noisy and
+        #     the LQR k_d it produces passes through zero / flips sign across the
+        #     schedule (notably ~0 at af=0.133, the descent dead-zone).
+        #   damp_ratio is None -> k_d = damp_scale * (LQR k_d)  (legacy).
+        roll_prop_scale: float = 1.0,
+        roll_damp_scale: float = 1.5,
+        roll_damp_ratio=None,           # roll already stable on LQR damping; leave as-is.
+        pitch_prop_scale: float = 0.5,
+        pitch_damp_scale: float = 5.0,
+        pitch_damp_ratio: float = 5.0,  # fills the af=0.133 damping dead-zone.
+        thrust_gain_scale: float = 1.0,
+
+        # --- Command limits [rad] / normalized thrust. ---
         roll_limit: float = 0.035,
-        pitch_limit: float = 0.025,
-        # Purely visual thrust controller. Leave authority available, but slow
-        # the command changes below so divergence noise does not inject a fast
-        # thrust chatter.
+        pitch_limit: float = 0.030,
         thrust_min: float = 0.64,
         thrust_max: float = 0.82,
-        require_target_for_descent: bool = True,
-        # Sign convention confirmed by closed-loop tests after v14.
-        roll_output_sign: float = -1.0,
-        pitch_output_sign: float = -1.0,
-        # Visual thrust loop. Positive divergence means the target expands in
-        # the image, so thrust must increase. This remains purely visual: no
-        # vehicle_z or vehicle_vz enters the control law.
+
+        # --- Command shaping. Slew rates relaxed vs the first run so the
+        #     damping command is not itself rate-limited away. ---
+        roll_slew_rate_rad_s: float = 0.050,
+        pitch_slew_rate_rad_s: float = 0.040,
+        thrust_slew_rate_per_s: float = 0.050,
+        command_filter_alpha: float = 0.60,
+
+        # --- Visual thrust loop. Positive divergence = target expanding =
+        #     approach -> increase thrust. Stays purely visual. ---
         enable_divergence_control: bool = True,
+        require_target_for_descent: bool = True,
         max_visual_thrust_delta_from_hover: float = 0.09,
         divergence_integral_gain: float = 0.035,
         divergence_integral_limit: float = 1.2,
         raw_divergence_weight: float = 0.10,
-        # Conservative roll/pitch LQR costs. Larger R -> smaller attitude.
-        # Pitch gets a much larger R than v14: the latest run showed pitch
-        # saturation, not lack of sign/authority, was the dominant instability.
-        roll_q=((1.0, 0.0), (0.0, 0.20)),
-        roll_r=((1.8,),),
-        pitch_q=((1.0, 0.0), (0.0, 0.20)),
-        pitch_r=((8.0,),),
-        # Less aggressive than v14, compensated by the visual integral. The
-        # goal is a stable hover test before attempting descent.
-        thrust_q=((1.0,),),
-        thrust_r=((0.9,),),
-        # Purely internal command shaping. This is not feedback from PX4 state;
-        # it only limits how abruptly the visual controller may change its own
-        # setpoint. It removes bang-bang behavior when the LQR output hits a
-        # saturation limit.
-        roll_slew_rate_rad_s: float = 0.020,
-        pitch_slew_rate_rad_s: float = 0.012,
-        thrust_slew_rate_per_s: float = 0.050,
-        command_filter_alpha: float = 0.55,
+
+        # Sign convention confirmed by closed-loop tests.
+        roll_output_sign: float = -1.0,
+        pitch_output_sign: float = -1.0,
     ):
         self._hover_thrust = float(hover_thrust)
         self._yaw_setpoint = float(yaw_setpoint)
@@ -130,26 +131,43 @@ class ControlLaw:
         self._pitch_limit = abs(float(pitch_limit))
         self._thrust_min = float(thrust_min)
         self._thrust_max = float(thrust_max)
-        self._require_target_for_descent = bool(require_target_for_descent)
 
         self._roll_output_sign = 1.0 if roll_output_sign >= 0.0 else -1.0
         self._pitch_output_sign = 1.0 if pitch_output_sign >= 0.0 else -1.0
 
-        self._enable_divergence_control = bool(enable_divergence_control)
-        self._max_visual_thrust_delta_from_hover = abs(float(max_visual_thrust_delta_from_hover))
-        self._divergence_integral_gain = float(divergence_integral_gain)
-        self._divergence_integral_limit = abs(float(divergence_integral_limit))
-        self._raw_divergence_weight = self._clamp(raw_divergence_weight, 0.0, 1.0)
-        self._divergence_integral = 0.0
+        # Damp-ratio mode: don't pre-scale the (unreliable) LQR k_d; k_d is
+        # synthesized from k_p in compute(). Otherwise pre-scale k_d by damp_scale.
+        self._roll_damp_ratio = None if roll_damp_ratio is None else float(roll_damp_ratio)
+        self._pitch_damp_ratio = None if pitch_damp_ratio is None else float(pitch_damp_ratio)
+        roll_kd_scale = 1.0 if self._roll_damp_ratio is not None else roll_damp_scale
+        pitch_kd_scale = 1.0 if self._pitch_damp_ratio is not None else pitch_damp_scale
 
-        self._roll_lqr = self._build_schedule(ROLL_STATE_MODELS, roll_q, roll_r)
-        self._pitch_lqr = self._build_schedule(PITCH_STATE_MODELS, pitch_q, pitch_r)
-        self._thrust_lqr = self._build_schedule(THRUST_DIVERGENCE_MODELS, thrust_q, thrust_r)
+        # Scheduled gains: LQR baseline times the manual [prop, damp] scale.
+        self._roll_lqr = ScheduledLQR(
+            self._schedule(ROLL_STATE_MODELS, roll_q, roll_r),
+            gain_scale=[[roll_prop_scale, roll_kd_scale]],
+        )
+        self._pitch_lqr = ScheduledLQR(
+            self._schedule(PITCH_STATE_MODELS, pitch_q, pitch_r),
+            gain_scale=[[pitch_prop_scale, pitch_kd_scale]],
+        )
+        self._thrust_lqr = ScheduledLQR(
+            self._schedule(THRUST_DIVERGENCE_MODELS, thrust_q, thrust_r),
+            gain_scale=[[thrust_gain_scale]],
+        )
 
         self._roll_slew_rate_rad_s = abs(float(roll_slew_rate_rad_s))
         self._pitch_slew_rate_rad_s = abs(float(pitch_slew_rate_rad_s))
         self._thrust_slew_rate_per_s = abs(float(thrust_slew_rate_per_s))
         self._command_filter_alpha = self._clamp(command_filter_alpha, 0.0, 1.0)
+
+        self._enable_divergence_control = bool(enable_divergence_control)
+        self._require_target_for_descent = bool(require_target_for_descent)
+        self._max_visual_thrust_delta = abs(float(max_visual_thrust_delta_from_hover))
+        self._divergence_integral_gain = float(divergence_integral_gain)
+        self._divergence_integral_limit = abs(float(divergence_integral_limit))
+        self._raw_divergence_weight = self._clamp(raw_divergence_weight, 0.0, 1.0)
+        self._divergence_integral = 0.0
 
         self._previous_roll_cmd = 0.0
         self._previous_pitch_cmd = 0.0
@@ -172,133 +190,126 @@ class ControlLaw:
         self._has_previous_command = False
 
     def compute(self, target: TargetEstimate, flow: FlowResult, dt: float) -> AttitudeSetpoint:
-        """Return desired roll/pitch/yaw/thrust using visual data only."""
+        """Desired roll/pitch/yaw/thrust from visual data only."""
         dt = max(1e-3, float(dt))
 
         roll_cmd = 0.0
         pitch_cmd = 0.0
         visual_thrust_delta = 0.0
-        yaw_cmd = self._yaw_setpoint
 
         area_fraction = self._safe_area_fraction(target)
         flow_valid = flow is not None and bool(getattr(flow, "valid", False))
         target_found = target is not None and bool(getattr(target, "found", False))
 
+        # --- Lateral axes: u = sign * ( -(k_p*offset + k_d*flow) ). ---
         if target_found:
             flow_x = float(getattr(flow, "mean_flow_x_norm", 0.0)) if flow_valid else 0.0
             flow_y = float(getattr(flow, "mean_flow_y_norm", 0.0)) if flow_valid else 0.0
 
-            roll_state = np.array([[float(target.offset_x)], [flow_x]])
-            pitch_state = np.array([[float(target.offset_y)], [flow_y]])
+            roll_u = self._axis_command(
+                self._roll_lqr.gain_at(area_fraction), float(target.offset_x), flow_x,
+                self._roll_damp_ratio,
+            )
+            pitch_u = self._axis_command(
+                self._pitch_lqr.gain_at(area_fraction), float(target.offset_y), flow_y,
+                self._pitch_damp_ratio,
+            )
 
-            roll_raw = float(-(self._roll_lqr.gain_at(area_fraction) @ roll_state)[0, 0])
-            pitch_raw = float(-(self._pitch_lqr.gain_at(area_fraction) @ pitch_state)[0, 0])
+            # Smooth saturation toward the limit (not a hard clip).
+            roll_cmd = self._soft_limit(self._roll_output_sign * roll_u, self._roll_limit)
+            pitch_cmd = self._soft_limit(self._pitch_output_sign * pitch_u, self._pitch_limit)
 
-            roll_cmd = self._roll_output_sign * roll_raw
-            pitch_cmd = self._pitch_output_sign * pitch_raw
-
-            # Soft saturation rather than a hard bang-bang clamp. The command is
-            # still bounded by roll_limit/pitch_limit, but approaches the bound
-            # smoothly when the target is far from center.
-            roll_cmd = self._soft_limit(roll_cmd, self._roll_limit)
-            pitch_cmd = self._soft_limit(pitch_cmd, self._pitch_limit)
-
+        # --- Thrust axis: feedback on divergence error + visual integral. ---
         can_use_divergence = self._enable_divergence_control and flow_valid
         if self._require_target_for_descent:
             can_use_divergence = can_use_divergence and target_found
 
         if can_use_divergence:
-            divergence = self._divergence_for_control(flow)
-            divergence_error = divergence - self._divergence_setpoint
+            error = self._divergence_for_control(flow) - self._divergence_setpoint
 
-            # Visual-only integral action: positive divergence means the target
-            # expands in the image, i.e. approach/descent. It should therefore
-            # increase thrust. This closes steady visual bias without using PX4
-            # z/vz.
-            self._divergence_integral += divergence_error * dt
             self._divergence_integral = self._clamp(
-                self._divergence_integral,
+                self._divergence_integral + error * dt,
                 -self._divergence_integral_limit,
                 self._divergence_integral_limit,
             )
 
-            thrust_state = np.array([[divergence_error]])
+            thrust_state = np.array([[error]])
             lqr_delta = float(-(self._thrust_lqr.gain_at(area_fraction) @ thrust_state)[0, 0])
             integral_delta = self._divergence_integral_gain * self._divergence_integral
-            visual_thrust_delta = lqr_delta + integral_delta
             visual_thrust_delta = self._soft_limit(
-                visual_thrust_delta,
-                self._max_visual_thrust_delta_from_hover,
+                lqr_delta + integral_delta, self._max_visual_thrust_delta
             )
         else:
-            # No visual measurement -> no visual integral accumulation. Decay
-            # rather than hard-reset to avoid one dropped frame causing a
-            # discontinuity, while still forgetting stale visual information.
+            # No visual measurement: decay (don't hard-reset) so one dropped
+            # frame is not a discontinuity, while stale info is forgotten.
             self._divergence_integral *= 0.90
 
-        thrust_cmd = self._hover_thrust + visual_thrust_delta
-        thrust_cmd = self._clamp(thrust_cmd, self._thrust_min, self._thrust_max)
-
-        roll_cmd, pitch_cmd, thrust_cmd = self._shape_commands(
-            roll_cmd, pitch_cmd, thrust_cmd, dt
+        thrust_cmd = self._clamp(
+            self._hover_thrust + visual_thrust_delta, self._thrust_min, self._thrust_max
         )
+
+        roll_cmd, pitch_cmd, thrust_cmd = self._shape_commands(roll_cmd, pitch_cmd, thrust_cmd, dt)
 
         return AttitudeSetpoint(
             timestamp=getattr(target, "timestamp", 0.0),
             roll=roll_cmd,
             pitch=pitch_cmd,
-            yaw=yaw_cmd,
+            yaw=self._yaw_setpoint,
             thrust=thrust_cmd,
         )
 
     def _shape_commands(self, roll: float, pitch: float, thrust: float, dt: float):
+        """
+        filter:  c_f = (1-a) c_prev + a c       (first-order low-pass)
+        slew:    c_s = c_prev + clip(c_f - c_prev, +-rate*dt)
+        clamp:   to the axis limits.
+        """
         if not self._has_previous_command:
             self._previous_roll_cmd = 0.0
             self._previous_pitch_cmd = 0.0
             self._previous_thrust_cmd = self._hover_thrust
             self._has_previous_command = True
 
-        alpha = self._command_filter_alpha
+        a = self._command_filter_alpha
+        roll_f = (1.0 - a) * self._previous_roll_cmd + a * roll
+        pitch_f = (1.0 - a) * self._previous_pitch_cmd + a * pitch
+        thrust_f = (1.0 - a) * self._previous_thrust_cmd + a * thrust
 
-        roll_filtered = (1.0 - alpha) * self._previous_roll_cmd + alpha * roll
-        pitch_filtered = (1.0 - alpha) * self._previous_pitch_cmd + alpha * pitch
-        thrust_filtered = (1.0 - alpha) * self._previous_thrust_cmd + alpha * thrust
+        roll_s = self._slew_limit(self._previous_roll_cmd, roll_f, self._roll_slew_rate_rad_s * dt)
+        pitch_s = self._slew_limit(self._previous_pitch_cmd, pitch_f, self._pitch_slew_rate_rad_s * dt)
+        thrust_s = self._slew_limit(self._previous_thrust_cmd, thrust_f, self._thrust_slew_rate_per_s * dt)
 
-        roll_limited = self._slew_limit(
-            self._previous_roll_cmd,
-            roll_filtered,
-            self._roll_slew_rate_rad_s * dt,
-        )
-        pitch_limited = self._slew_limit(
-            self._previous_pitch_cmd,
-            pitch_filtered,
-            self._pitch_slew_rate_rad_s * dt,
-        )
-        thrust_limited = self._slew_limit(
-            self._previous_thrust_cmd,
-            thrust_filtered,
-            self._thrust_slew_rate_per_s * dt,
-        )
+        roll_s = self._clamp(roll_s, -self._roll_limit, self._roll_limit)
+        pitch_s = self._clamp(pitch_s, -self._pitch_limit, self._pitch_limit)
+        thrust_s = self._clamp(thrust_s, self._thrust_min, self._thrust_max)
 
-        roll_limited = self._clamp(roll_limited, -self._roll_limit, self._roll_limit)
-        pitch_limited = self._clamp(pitch_limited, -self._pitch_limit, self._pitch_limit)
-        thrust_limited = self._clamp(thrust_limited, self._thrust_min, self._thrust_max)
-
-        self._previous_roll_cmd = roll_limited
-        self._previous_pitch_cmd = pitch_limited
-        self._previous_thrust_cmd = thrust_limited
-
-        return roll_limited, pitch_limited, thrust_limited
+        self._previous_roll_cmd = roll_s
+        self._previous_pitch_cmd = pitch_s
+        self._previous_thrust_cmd = thrust_s
+        return roll_s, pitch_s, thrust_s
 
     def _divergence_for_control(self, flow: FlowResult) -> float:
-        filtered = self._safe_float(getattr(flow, "divergence", 0.0), default=0.0)
+        """Blend filtered and raw divergence: (1-w) d_filt + w d_raw."""
+        filtered = self._safe_float(getattr(flow, "divergence", 0.0))
         raw = self._safe_float(getattr(flow, "raw_divergence", filtered), default=filtered)
         w = self._raw_divergence_weight
         return (1.0 - w) * filtered + w * raw
 
     @staticmethod
-    def _build_schedule(models, q, r) -> ScheduledLQR:
-        return ScheduledLQR((area, A, B, q, r) for area, A, B in models)
+    def _schedule(models, q, r):
+        """Expand (af, A, B) models into ScheduledLQR (af, A, B, Q, R) tuples."""
+        return ((af, A, B, q, r) for af, A, B in models)
+
+    @staticmethod
+    def _axis_command(gain: np.ndarray, offset: float, flow: float, damp_ratio) -> float:
+        """
+        Lateral feedback u = -(k_p*offset + k_d*flow).
+        k_p = gain[0,0]. k_d = damp_ratio*k_p if damp_ratio is set (consistent
+        sign across the schedule), else the scheduled gain[0,1].
+        """
+        k_p = float(gain[0, 0])
+        k_d = damp_ratio * k_p if damp_ratio is not None else float(gain[0, 1])
+        return -(k_p * offset + k_d * flow)
 
     @staticmethod
     def _safe_area_fraction(target: TargetEstimate) -> float:
@@ -311,10 +322,9 @@ class ControlLaw:
 
     @staticmethod
     def _soft_limit(value: float, limit: float) -> float:
+        """L * tanh(v / L): smooth, bounded by +-L, ~linear near 0."""
         limit = abs(float(limit))
-        if limit <= 1e-12:
-            return 0.0
-        return limit * math.tanh(float(value) / limit)
+        return 0.0 if limit <= 1e-12 else limit * math.tanh(float(value) / limit)
 
     @staticmethod
     def _slew_limit(previous: float, desired: float, max_step: float) -> float:
