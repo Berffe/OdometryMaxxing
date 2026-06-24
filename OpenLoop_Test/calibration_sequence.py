@@ -101,16 +101,9 @@ def build_axis_step_train(
 	repeats: int = 3,
 ) -> List[Segment]:
 	"""
-	Build the segments for one axis' step train. For roll/pitch, use a
-	braking pulse (+A for T, -A for 2T, +A for T, then neutral) instead
-	of the older +A/0/-A/0 sequence. The braking pulse is much better for
-	a double-integrator-like response because it approximately cancels the
-	lateral velocity created by the first pulse before the target leaves
-	the camera. For thrust, keep the older short +A/0/-A/0 sequence because
-	vertical position excursions are the limiting risk there.
-
-	All sequences are repeated `repeats` times, with the other two axes
-	pinned at trim
+	Build the segments for one axis' step train: alternating
+	+amplitude / neutral / -amplitude / neutral, held `hold_sec` each,
+	repeated `repeats` times, with the other two axes pinned at trim
 	(roll=0, pitch=0, thrust=hover_thrust) throughout.
 
 	axis: "roll", "pitch", or "thrust".
@@ -137,59 +130,64 @@ def build_axis_step_train(
 	segments: List[Segment] = []
 
 	for _ in range(repeats):
-		if axis in ("roll", "pitch"):
-			# Braking pulse for roughly double-integrator lateral dynamics:
-			# +A for T, -A for 2T, +A for T cancels ideal final velocity
-			# and displacement much better than +A/0/-A/0.
-			for duration, value in (
-				(hold_sec, amplitude),
-				(2.0 * hold_sec, -amplitude),
-				(hold_sec, amplitude),
-				(hold_sec, 0.0),
-			):
-				roll, pitch, thrust = command(value)
-				segments.append((duration, roll, pitch, thrust))
-		else:
-			for value in (amplitude, 0.0, -amplitude, 0.0):
-				roll, pitch, thrust = command(value)
-				segments.append((hold_sec, roll, pitch, thrust))
+		for value in (amplitude, 0.0, -amplitude, 0.0):
+			roll, pitch, thrust = command(value)
+			segments.append((hold_sec, roll, pitch, thrust))
 
 	return segments
 
 
 class VerticalVelocityDamper:
 	"""
-	Stateful PI damper driving thrust to cancel vertical velocity.
+	Stateful PID-ish damper driving thrust to cancel vz and pull back
+	toward a reference altitude:
 
-	PX4 local-position velocity uses NED convention: vz > 0 means the
-	vehicle is moving downward. Therefore a positive vz must increase
-	thrust, not decrease it:
+		thrust = hover_thrust + kp*vz + ki*integral(vz dt)
+		                      + kz*(z - z_target) + kiz*integral((z - z_target) dt),
+		clamped.
 
-		thrust = hover_thrust + kp*vz + ki*integral(vz dt), clamped.
+	PX4 local-position velocity and position both use NED convention:
+	vz > 0 means descending, z increasing means lower altitude. So a
+	positive vz (descending) must INCREASE thrust, and being below the
+	target altitude (z > z_target) must also increase thrust — all
+	terms are added, not subtracted. Getting a sign backwards doesn't
+	just under-correct, it's active positive feedback: descending
+	reduces thrust further, which accelerates the descent further. A
+	wrong sign here looks exactly like "almost free-falling" the instant
+	offboard engages, because that's what it is.
 
-	Why PI and not just P (which is what this replaced): a proportional-
-	only damper reaches an equilibrium against any *constant* disturbance
-	rather than driving vz to zero — it doesn't almost-work, it
-	structurally can't fully cancel a steady bias, no matter how small.
-	This isn't hypothetical: real calibration data showed the P-only
-	version computing exactly as designed (formula match to floating-
-	point precision) while vz still sat at a persistent, nonzero mean in
-	every phase (settle, roll, pitch), growing over the course of the
-	run. Whatever that bias's source — hover_thrust not being exactly
-	exact, an EKF2 quirk, anything else constant or slowly varying —
-	integral action is the standard fix: it accumulates exactly the
-	correction needed to cancel a steady disturbance over time, which
-	proportional action alone cannot do.
+	Why PI and not just P, for vz: a proportional-only damper reaches an
+	equilibrium against any *constant* disturbance rather than driving
+	vz to zero — it doesn't almost-work, it structurally can't fully
+	cancel a steady bias, no matter how small. Real calibration data
+	showed exactly that: a P-only formula computing correctly while vz
+	still sat at a persistent nonzero mean throughout.
 
-	The integral is clamped (`integral_limit`) to bound windup: without
-	that, a sustained large vz (e.g. during the settle phase's initial
-	transient) could otherwise accumulate a correction so large it
-	overshoots once the real disturbance is gone.
+	Why kiz, on top of kz, for altitude: the exact same limitation shows
+	up one level up. kz alone is P-only on position, so it ALSO reaches
+	an equilibrium against a constant hover_thrust error instead of
+	closing it — a real 45+ second settle attempt measured this
+	directly: kz=0.10 left a steady ~1.18m altitude error (a settle
+	timeout, correctly, rather than a false "settled"), which implies
+	kz was stuck fighting a ~0.118 thrust gap it could never fully
+	close on its own. kiz integrates the altitude error over time the
+	same way ki integrates the velocity error, and is what actually
+	drives that steady-state error toward zero rather than just
+	bounding it. kiz=0.0 (the default) reproduces the kz-only behavior.
 
-	One instance is meant to be shared continuously across the settle
-	phase and the roll/pitch test phases (see calibration_node.py) — the
-	integral term is exactly the part that benefits from not being reset
-	at each phase boundary, since the disturbance it's correcting for
+	Both integral_limit and integral_z_limit need to be sized to the
+	kind of disturbance you actually expect to correct, not just "some
+	bound to prevent windup." A limit so tight that ki*integral_limit
+	(or kiz*integral_z_limit) is tiny compared to a plausible
+	hover_thrust error means that integral term can NEVER close that
+	error, no matter how long it has — it isn't a slower correction,
+	it's a structurally incomplete one.
+
+	One instance is meant to be shared continuously from the moment
+	offboard thrust commands start being sent through the open-loop
+	roll/pitch test phases (see calibration_node.py) — both integral
+	terms are exactly the part that benefits from not being reset at
+	each phase boundary, since the disturbance they're correcting for
 	doesn't reset either.
 	"""
 
@@ -198,29 +196,63 @@ class VerticalVelocityDamper:
 		hover_thrust: float,
 		kp: float = 0.08,
 		ki: float = 0.02,
+		kz: float = 0.0,
+		kiz: float = 0.0,
 		thrust_min: float = 0.35,
 		thrust_max: float = 0.65,
 		integral_limit: float = 0.05,
+		integral_z_limit: float = 10.0,
 	):
 		self._hover_thrust = hover_thrust
 		self._kp = kp
 		self._ki = ki
+		self._kz = kz
+		self._kiz = kiz
 		self._thrust_min = thrust_min
 		self._thrust_max = thrust_max
 		self._integral_limit = abs(integral_limit)
+		self._integral_z_limit = abs(integral_z_limit)
 
 		self._integral = 0.0
+		self._integral_z = 0.0
 		self._last_time: Optional[float] = None
+		self._target_z: Optional[float] = None
 
 	def reset(self):
 		self._integral = 0.0
+		self._integral_z = 0.0
 		self._last_time = None
+
+	def set_altitude_target(self, z_target: Optional[float]):
+		"""
+		Set (or clear, with None) the altitude this damper actively pulls
+		back toward. Typically captured once, right after takeoff
+		reaches its intended altitude, and kept for the rest of the
+		pre-test handoff -- see calibration_node.py. Resets the altitude
+		integral too: it's only meaningful relative to a specific target,
+		so a new target should not inherit whatever the old one
+		accumulated.
+		"""
+		self._target_z = z_target
+		self._integral_z = 0.0
 
 	@property
 	def integral(self) -> float:
 		return self._integral
 
-	def step(self, now: float, vz: float) -> float:
+	@property
+	def integral_z(self) -> float:
+		return self._integral_z
+
+	@property
+	def altitude_target(self) -> Optional[float]:
+		return self._target_z
+
+	def step(self, now: float, vz: float, z: Optional[float] = None) -> float:
+		altitude_error = None
+		if self._target_z is not None and z is not None:
+			altitude_error = z - self._target_z
+
 		if self._last_time is not None:
 			dt = now - self._last_time
 			if dt > 0.0:
@@ -229,31 +261,47 @@ class VerticalVelocityDamper:
 					-self._integral_limit, min(self._integral_limit, self._integral)
 				)
 
+				if altitude_error is not None:
+					self._integral_z += altitude_error * dt
+					self._integral_z = max(
+						-self._integral_z_limit, min(self._integral_z_limit, self._integral_z)
+					)
+
 		self._last_time = now
 
-		# PX4 VehicleLocalPosition.vz is NED: positive means downward.
-		# If the vehicle is descending, increase thrust; if climbing, reduce it.
 		thrust = self._hover_thrust + self._kp * vz + self._ki * self._integral
+
+		if altitude_error is not None:
+			thrust += self._kz * altitude_error + self._kiz * self._integral_z
+
 		return max(self._thrust_min, min(self._thrust_max, thrust))
 
 
 class VerticalSettler:
 	"""
-	"Have we been quiet for long enough" detector wrapping a
-	VerticalVelocityDamper, so the open-loop test sequence doesn't start
-	until vz has genuinely settled — not just "this one sample happened
-	to be small". See VerticalVelocityDamper for the actual thrust
-	computation; this class only adds the is-it-time-to-proceed state
-	machine on top of it.
+	"Have we been quiet for long enough, AND actually near where we
+	wanted to be" detector wrapping a VerticalVelocityDamper. See
+	VerticalVelocityDamper for the actual thrust computation; this class
+	only adds the is-it-time-to-proceed state machine on top of it.
 
 	Why a settle phase exists at all: commanding exactly hover_thrust
 	makes vertical *acceleration* zero, not velocity. If the vehicle
 	enters calibration with any residual vz (left over from arming,
 	mode-switching, or wherever the previous run ended), holding thrust
-	constant preserves that velocity instead of correcting it — the
-	sequence then climbs or crashes depending on the sign of whatever vz
-	happened to exist at t=0, even with a perfectly calibrated
-	hover_thrust.
+	constant preserves that velocity instead of correcting it.
+
+	Why settling requires altitude too, not just velocity: vz reading
+	near zero is necessary but not sufficient for "genuinely hovering" —
+	a vehicle resting on the ground or platform also reads vz≈0, since
+	the surface's normal force, not a real hover equilibrium, is what
+	stopped it. That's a real failure mode, not a hypothetical one: a
+	hover_thrust significantly off can let the vehicle descend for
+	several seconds before a velocity-only check ever notices anything
+	wrong, by which point "settled" can mean "landed," not "hovering."
+	If `altitude_tolerance_m` is given and the damper has an altitude
+	target set, settling additionally requires z to be within that
+	tolerance of the target — so a vehicle that's quietly sitting on the
+	ground far below where it started does NOT get waved through.
 
 	Pure state machine, no ROS dependency, so it's unit-testable without
 	a simulator — see calibration_node.py for how it's driven.
@@ -265,11 +313,13 @@ class VerticalSettler:
 		vz_threshold: float = 0.05,
 		min_duration_sec: float = 1.0,
 		timeout_sec: float = 15.0,
+		altitude_tolerance_m: Optional[float] = None,
 	):
 		self._damper = damper
 		self._vz_threshold = vz_threshold
 		self._min_duration_sec = min_duration_sec
 		self._timeout_sec = timeout_sec
+		self._altitude_tolerance_m = altitude_tolerance_m
 
 		self._start_time: Optional[float] = None
 		self._ok_since: Optional[float] = None
@@ -284,7 +334,7 @@ class VerticalSettler:
 	def timed_out(self) -> bool:
 		return self._timed_out
 
-	def step(self, now: float, vz: float) -> float:
+	def step(self, now: float, vz: float, z: Optional[float] = None) -> float:
 		"""
 		Advance the settle state machine by one tick and return the
 		thrust command to apply this tick. Stop calling step() once
@@ -297,7 +347,12 @@ class VerticalSettler:
 
 		elapsed = now - self._start_time
 
-		if abs(vz) < self._vz_threshold:
+		altitude_ok = True
+		target_z = self._damper.altitude_target
+		if self._altitude_tolerance_m is not None and target_z is not None and z is not None:
+			altitude_ok = abs(z - target_z) <= self._altitude_tolerance_m
+
+		if abs(vz) < self._vz_threshold and altitude_ok:
 			if self._ok_since is None:
 				self._ok_since = now
 			elif now - self._ok_since >= self._min_duration_sec:
@@ -309,7 +364,7 @@ class VerticalSettler:
 			self._settled = True
 			self._timed_out = True
 
-		return self._damper.step(now, vz)
+		return self._damper.step(now, vz, z=z)
 
 
 def exceeds_safety_bounds(
@@ -331,13 +386,13 @@ def exceeds_safety_bounds(
 
 def build_calibration_sequence(
 	hover_thrust: float,
-	roll_amplitude: float = 0.04,
-	pitch_amplitude: float = 0.04,
-	thrust_amplitude: float = 0.02,
-	roll_hold_sec: float = 1.0,
-	pitch_hold_sec: float = 1.0,
-	thrust_hold_sec: float = 1.0,
-	repeats: int = 8,
+	roll_amplitude: float = 0.08,
+	pitch_amplitude: float = 0.08,
+	thrust_amplitude: float = 0.05,
+	roll_hold_sec: float = 6.0,
+	pitch_hold_sec: float = 6.0,
+	thrust_hold_sec: float = 2.0,
+	repeats: int = 3,
 	settle_sec: float = 2.0,
 	axes: Tuple[str, ...] = ("roll", "pitch", "thrust"),
 ) -> StepSequence:

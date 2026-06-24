@@ -21,6 +21,30 @@ previous ROS VehicleAttitudeSetpoint handoff failure.
 
 Only the final open-loop calibration phase is written as identification data.
 Takeoff and settle phases are intentionally not logged to the fit CSV.
+
+Safety/damping, after a real run exposed three compounding gaps in this:
+
+  1. The damper's sign was backwards (subtracting vz's correction instead
+     of adding it) -- not a magnitude problem, active positive-feedback
+     instability: descending reduced thrust further, which accelerated
+     the descent further. Fixed in VerticalVelocityDamper.
+  2. Damping (and the safety-bounds check) didn't start until PHASE_VZ_SETTLE
+     -- everything from PHASE_PRESTREAM through PHASE_ALTITUDE_SETTLE held a
+     bare, uncorrected HOVER_THRUST with zero protection. Both now start as
+     soon as offboard thrust commands do (see _damped_hover_setpoint and the
+     centralized check at the top of on_mission_timer).
+  3. Settling only checked vz, never altitude -- a vehicle resting on the
+     ground/platform also reads vz≈0, since the surface's normal force, not
+     a real hover equilibrium, is what stopped it. VerticalSettler now also
+     requires being within ALTITUDE_SETTLE_TOLERANCE_M of the altitude
+     reached right after takeoff, captured once as soon as takeoff
+     completes and held fixed through every phase after that (DAMPER_KZ is
+     the term that actively pulls back toward it, not just toward zero
+     velocity).
+
+None of this is a substitute for HOVER_THRUST actually being close to
+correct -- it bounds how much an imperfect guess can cost, it doesn't
+remove the value of a better guess.
 """
 
 import asyncio
@@ -108,11 +132,13 @@ USE_MAVSDK_TAKEOFF = True
 # the mode and streams the same roll/pitch/thrust setpoints through the path
 # PX4 already accepted for takeoff.
 CONTROL_BACKEND = "mavsdk_offboard"  # "mavsdk_offboard" or "ros_attitude"
-# Matches takeoff.py's address exactly -- that script is the one confirmed
-# to actually connect and take off. "udpin://" vs "udp://" *should* be
-# equivalent in MAVSDK, but there's no reason to risk a difference here
-# when "udp://" is the form already known to work.
-MAVSDK_SYSTEM_ADDRESS = "udp://0.0.0.0:14540"
+# A real run with "udp://" connected successfully (confirmed: "MAVSDK:
+# connected." appeared right on schedule) -- so the earlier caution about
+# udp:// vs udpin:// behaving differently wasn't warranted, they're the
+# same thing here. MAVSDK's own runtime warning ("Connection using udp://
+# is deprecated, please use udpin:// or udpout://") is the actual reason
+# to use this form going forward.
+MAVSDK_SYSTEM_ADDRESS = "udpin://0.0.0.0:14540"
 MAVSDK_PORT_TO_FREE = 14540
 MAVSDK_OFFBOARD_PERIOD_SEC = 0.05
 MAVSDK_OFFBOARD_START_TIMEOUT_SEC = 5.0
@@ -128,17 +154,38 @@ EKF2_SETTLE_TIME = 5.0
 # to explain why. Each step now fails loudly and specifically instead.
 MAVSDK_CONNECT_TIMEOUT_SEC = 15.0
 MAVSDK_HEALTH_TIMEOUT_SEC = 30.0
-MAVSDK_TAKEOFF_ALTITUDE_TIMEOUT_SEC = 30.0
+# Raised again alongside TAKEOFF_ALTITUDE_M going from 3.0 to 6.0: the
+# observed climb rate isn't constant, it decelerates approaching the
+# target (PX4's own position control slowing down on approach), so
+# doubling the altitude needs more than double the time. Extrapolating
+# the measured post-ramp rate (~0.09 m/s, after PX4's ~15s initial
+# ramp) to the new, larger remaining distance gives a rough estimate of
+# ~80s -- likely optimistic, since that deceleration should bite earlier
+# and harder approaching a taller target. 130s gives real margin instead
+# of repeating "estimated just enough, then wasn't quite."
+MAVSDK_TAKEOFF_ALTITUDE_TIMEOUT_SEC = 130.0
 # Backstop covering the whole PHASE_MAVSDK_TAKEOFF mission phase, in case
 # something other than the three waits above hangs (e.g. arm()/takeoff()
 # themselves). Should rarely fire if the three timeouts above are doing
-# their job; it's there so NOTHING in this phase can hang forever.
-MAVSDK_TAKEOFF_PHASE_TIMEOUT_SEC = 90.0
+# their job; it's there so NOTHING in this phase can hang forever. Kept
+# comfortably above connect+health+settle+the altitude wait combined.
+MAVSDK_TAKEOFF_PHASE_TIMEOUT_SEC = 200.0
 
 # Integrated takeoff. PX4 local position is NED, so climbing means z becomes
 # more negative. The target z is captured as z_start - TAKEOFF_ALTITUDE_M when
 # the climb phase begins.
-TAKEOFF_ALTITUDE_M = 3.0
+#
+# Raised from 3.0: a real run reached 3.0m and measured area_fraction=0.979
+# right there -- the platform fills ~98% of the frame at that height, which
+# is exactly what ABORT_AREA_FRACTION_MAX=0.97 exists to catch, and it
+# tripped on the very first tick of open-loop testing before any test
+# command was even issued. area_fraction scales roughly as 1/altitude^2
+# for a fixed real-world target size, so 6.0 = 3.0 * sqrt(0.979/target),
+# solved for a target of ~0.25 (comfortable margin below the abort bound,
+# leaving room for the open-loop test's own excursions on top of it). If
+# 6.0 still isn't enough clearance, re-solve the same way using whatever
+# area_fraction this value actually produces.
+TAKEOFF_ALTITUDE_M = 6.0
 OFFBOARD_PRESTREAM_SEC = 2.0
 OFFBOARD_CONFIRM_TIMEOUT_SEC = 5.0
 TAKEOFF_ALTITUDE_TOL_M = 0.15
@@ -159,6 +206,15 @@ OFFBOARD_PROBE_ROLL_RAD = 0.04
 OFFBOARD_PROBE_DURATION_SEC = 1.2
 OFFBOARD_PROBE_MIN_ROLL_RESPONSE_RAD = 0.010
 OFFBOARD_REQUEST_REPEAT_SEC = 1.0
+
+# A real run showed the probe's last tick commanding roll=OFFBOARD_PROBE_ROLL_RAD
+# and the very next tick (one MISSION_PERIOD_SEC later) commanding roll=0.0 --
+# an instant step de-rotation -- immediately followed by a safety-bound abort
+# on vz, 0.2s into the next phase. A sudden attitude change like that can
+# produce a real vertical transient on its own; ramping the roll back to
+# level over a couple of seconds instead of stepping it removes that as a
+# cause rather than just hoping the safety margin covers it.
+PROBE_RECOVERY_SEC = 2.0
 
 # PX4 bridge topic names differ slightly across versions. Subscribing to
 # both common attitude-topic names is harmless; whichever one exists will
@@ -249,26 +305,58 @@ THRUST_MAX = 0.65
 # since whatever disturbance it's correcting for doesn't reset either.
 #
 # Commanding exactly HOVER_THRUST zeroes vertical *acceleration*, not
-# velocity, so a residual vz at t=0 would otherwise persist through the
-# whole sequence. That's what the settle phase is for. But proportional
-# damping alone (kp only) reaches an equilibrium against any constant
-# disturbance instead of cancelling it — confirmed directly from a real
-# run: the P-only formula was computing exactly as designed, while vz
-# still sat at a persistent nonzero mean in every phase, growing over
-# the run's duration. ki adds the integral action that actually drives
-# a steady disturbance's effect on vz to zero over time. integral_limit
-# bounds windup (a long, large transient — e.g. early in the settle
-# phase — accumulating a correction so large it overshoots once the
-# real disturbance is gone).
+# velocity, so a residual vz at t=0 would otherwise persist. That's
+# what kp/ki are for. kz is newer: a real run showed the damper settle
+# "successfully" (|vz|<threshold) while the vehicle had actually
+# descended onto the platform — vz reads near zero whether the vehicle
+# is genuinely hovering or just resting on a surface, and a sign bug
+# (now also fixed) made this an active runaway, not just a slow drift.
+# kz adds a term that pulls back toward the altitude reached right after
+# takeoff, not just toward zero velocity, so a `hover_thrust` guess that's
+# meaningfully wrong gets corrected before it turns into a landing.
+#
+# integral_limit was previously sized for a small residual bias (~0.01
+# m/s of vz) and is nowhere near big enough to correct a substantially
+# wrong hover_thrust guess: ki*integral_limit caps the integral term's
+# entire contribution, and the old 0.05 limit caps it at 0.001 -- a
+# rounding error, not a real correction. Widened so it can actually do
+# something. ALTITUDE_SETTLE_TOLERANCE_M is the other half of the kz
+# fix: settling now requires being near the target altitude, not just
+# near zero velocity, so "resting on the platform" can no longer pass
+# as "hovering". SETTLE_TIMEOUT_SEC raised to give a genuine recovery
+# (climbing back from a real deviation, not just damping noise) enough
+# time to actually finish instead of timing out mid-recovery.
 SETTLE_VZ_THRESHOLD = 0.05
 SETTLE_MIN_DURATION_SEC = 1.0
-SETTLE_TIMEOUT_SEC = 15.0
+SETTLE_TIMEOUT_SEC = 45.0
+ALTITUDE_SETTLE_TOLERANCE_M = 1.0
 DAMPER_KP = 0.08
 DAMPER_KI = 0.02
-DAMPER_INTEGRAL_LIMIT = 0.05
+DAMPER_KZ = 0.10
+DAMPER_KIZ = 0.02
+DAMPER_INTEGRAL_LIMIT = 0.15
+# A real 45+ second settle timeout (vz=-0.057, just past threshold) traced
+# back to a measured ~1.18m steady-state altitude error -- kz alone is
+# P-only on position and reaches an equilibrium against a constant
+# hover_thrust error instead of closing it, the same limitation ki was
+# added to fix for velocity. Simulating the same gap against kiz=0.02
+# drives the error to within ALTITUDE_SETTLE_TOLERANCE_M by ~t=10s and to
+# ~0 by t=20-30s, instead of never closing it. integral_z_limit is sized
+# in meters*seconds (not thrust units): 10.0 bounds windup without being
+# so tight it caps kiz's contribution below a plausible hover_thrust gap,
+# the same mistake the original (too-tight) DAMPER_INTEGRAL_LIMIT made.
+DAMPER_INTEGRAL_Z_LIMIT = 10.0
 
-# Hard safety bounds, checked every tick regardless of phase. Tripping
-# either one halts at HOVER_THRUST permanently (reposition and restart
+# Hard safety bounds. Checked on EVERY tick from the moment offboard
+# thrust commands start being sent (PHASE_PRESTREAM) through the rest of
+# the mission -- previously this was only checked inside the open-loop
+# test phase, which meant the entire takeoff-handoff and settle sequence
+# had zero protection. That gap is exactly how a real run produced a
+# "safety bound exceeded" abort 0.09s into open-loop testing with an
+# empty CSV: area_fraction was already past the limit from whatever
+# happened during the unprotected phases before it, and nothing could
+# have caught it earlier even if it had been far worse. Tripping either
+# bound now halts at HOVER_THRUST permanently (reposition and restart
 # the node) rather than trying to recover automatically.
 ABORT_VZ_LIMIT = 1.0
 ABORT_AREA_FRACTION_MAX = 0.97
@@ -290,6 +378,7 @@ PHASE_PRESTREAM = "prestream_offboard"
 PHASE_WAIT_OFFBOARD = "wait_offboard"
 PHASE_CLIMB = "climb"
 PHASE_OFFBOARD_PROBE = "offboard_probe"
+PHASE_PROBE_RECOVERY = "probe_recovery"
 PHASE_ALTITUDE_SETTLE = "altitude_settle"
 PHASE_VZ_SETTLE = "vz_settle"
 PHASE_OPEN_LOOP = "open_loop_test"
@@ -356,15 +445,19 @@ class CalibrationNode(Node):
 			hover_thrust=HOVER_THRUST,
 			kp=DAMPER_KP,
 			ki=DAMPER_KI,
+			kz=DAMPER_KZ,
+			kiz=DAMPER_KIZ,
 			thrust_min=THRUST_MIN,
 			thrust_max=THRUST_MAX,
 			integral_limit=DAMPER_INTEGRAL_LIMIT,
+			integral_z_limit=DAMPER_INTEGRAL_Z_LIMIT,
 		)
 		self._settler = VerticalSettler(
 			self._damper,
 			vz_threshold=SETTLE_VZ_THRESHOLD,
 			min_duration_sec=SETTLE_MIN_DURATION_SEC,
 			timeout_sec=SETTLE_TIMEOUT_SEC,
+			altitude_tolerance_m=ALTITUDE_SETTLE_TOLERANCE_M,
 		)
 		self._settle_logged = False
 		self._aborted = False
@@ -629,6 +722,23 @@ class CalibrationNode(Node):
 	def on_mission_timer(self):
 		now = time.time()
 
+		# Checked first, before any phase-specific logic, and covers every
+		# phase from PHASE_PRESTREAM onward -- previously this only ran
+		# inside the open-loop test phase, leaving the entire takeoff
+		# handoff and settle sequence with zero protection. See the
+		# constants block above for what this gap actually produced.
+		if not self._aborted and self._should_stream_offboard() and self._mission_phase not in (
+			PHASE_FINISHED, PHASE_ABORTED,
+		):
+			vz = self._vehicle_state.vz
+			area_fraction = float(getattr(self._latest_target, "area_fraction", 0.0))
+			if exceeds_safety_bounds(vz, area_fraction, ABORT_VZ_LIMIT, ABORT_AREA_FRACTION_MAX):
+				self._abort(
+					f"safety bound exceeded during phase={self._mission_phase}: "
+					f"vz={vz:.3f} m/s, area_fraction={area_fraction:.3f}"
+				)
+				return
+
 		if self._mission_phase == PHASE_ABORTED:
 			self._hold_trim()
 			return
@@ -639,6 +749,12 @@ class CalibrationNode(Node):
 				if USE_MAVSDK_TAKEOFF:
 					self._enter_phase(PHASE_MAVSDK_TAKEOFF)
 				else:
+					# No altitude target yet -- the vehicle is still on the
+					# ground here; one gets set once PHASE_CLIMB actually
+					# reaches its target altitude, same as the MAVSDK path
+					# sets one once ITS takeoff reaches altitude. Setting
+					# one now would have the damper trying to hold ground
+					# level against the climb that's about to happen.
 					self._enter_phase(PHASE_PRESTREAM)
 			return
 
@@ -658,18 +774,26 @@ class CalibrationNode(Node):
 				return
 			if self._mavsdk_takeoff_done:
 				self.get_logger().info("MAVSDK takeoff complete. Starting attitude-offboard prestream.")
+				# Captured here, at the altitude PX4's own (already-working)
+				# takeoff just reached -- this is the reference our own
+				# thrust commands need to hold onto from here on, since
+				# they're about to take over control authority.
+				self._damper.set_altitude_target(self._vehicle_state.z)
+				self.get_logger().info(
+					f"Altitude-hold target set to current z={self._vehicle_state.z:.3f} m."
+				)
 				self._enter_phase(PHASE_PRESTREAM)
 			return
 
 		if self._mission_phase == PHASE_PRESTREAM:
-			self._hold_trim()
+			self._latest_setpoint = self._damped_hover_setpoint(now)
 			if now - self._phase_start_time >= OFFBOARD_PRESTREAM_SEC:
 				self._request_offboard_and_arm(now, reason="initial handoff")
 				self._enter_phase(PHASE_WAIT_OFFBOARD)
 			return
 
 		if self._mission_phase == PHASE_WAIT_OFFBOARD:
-			self._hold_trim()
+			self._latest_setpoint = self._damped_hover_setpoint(now)
 			if self._mavsdk_offboard_error is not None:
 				self._abort(f"MAVSDK offboard start failed: {self._mavsdk_offboard_error}")
 				return
@@ -705,13 +829,7 @@ class CalibrationNode(Node):
 			return
 
 		if self._mission_phase == PHASE_OFFBOARD_PROBE:
-			self._latest_setpoint = AttitudeSetpoint(
-				timestamp=self._latest_target.timestamp,
-				roll=OFFBOARD_PROBE_ROLL_RAD,
-				pitch=0.0,
-				yaw=0.0,
-				thrust=HOVER_THRUST,
-			)
+			self._latest_setpoint = self._damped_hover_setpoint(now, roll=OFFBOARD_PROBE_ROLL_RAD)
 			if self._probe_baseline_roll is not None:
 				delta = abs(self._vehicle_state.roll - self._probe_baseline_roll)
 				self._probe_max_roll_delta = max(self._probe_max_roll_delta, delta)
@@ -729,7 +847,7 @@ class CalibrationNode(Node):
 					f"{self._probe_max_roll_delta:.4f} rad."
 				)
 				if USE_MAVSDK_TAKEOFF:
-					self._enter_phase(PHASE_ALTITUDE_SETTLE)
+					self._enter_phase(PHASE_PROBE_RECOVERY)
 				else:
 					self._takeoff_start_z = self._vehicle_state.z
 					self._takeoff_target_z = self._takeoff_start_z - TAKEOFF_ALTITUDE_M
@@ -740,6 +858,18 @@ class CalibrationNode(Node):
 						f"target_z={self._takeoff_target_z:.3f} m "
 						f"({TAKEOFF_ALTITUDE_M:.2f} m above start, NED z)."
 					)
+			return
+
+		if self._mission_phase == PHASE_PROBE_RECOVERY:
+			# Ramp roll from the probe's value back to level over
+			# PROBE_RECOVERY_SEC, instead of stepping it in one tick --
+			# see PROBE_RECOVERY_SEC's definition for why.
+			elapsed_in_phase = now - self._phase_start_time
+			ramp_fraction = max(0.0, 1.0 - elapsed_in_phase / PROBE_RECOVERY_SEC)
+			ramped_roll = OFFBOARD_PROBE_ROLL_RAD * ramp_fraction
+			self._latest_setpoint = self._damped_hover_setpoint(now, roll=ramped_roll)
+			if elapsed_in_phase >= PROBE_RECOVERY_SEC:
+				self._enter_phase(PHASE_ALTITUDE_SETTLE)
 			return
 
 		if self._mission_phase == PHASE_CLIMB:
@@ -763,21 +893,15 @@ class CalibrationNode(Node):
 					self._takeoff_stable_since = now
 				elif now - self._takeoff_stable_since >= TAKEOFF_STABLE_SEC:
 					self.get_logger().info("Takeoff altitude reached and stable. Settling before calibration.")
+					self._damper.set_altitude_target(self._vehicle_state.z)
 					self._enter_phase(PHASE_ALTITUDE_SETTLE)
 			else:
 				self._takeoff_stable_since = None
 			return
 
 		if self._mission_phase == PHASE_ALTITUDE_SETTLE:
-			self._latest_setpoint = AttitudeSetpoint(
-				timestamp=self._latest_target.timestamp,
-				roll=0.0,
-				pitch=0.0,
-				yaw=0.0,
-				thrust=self._takeoff_thrust(),
-			)
+			self._latest_setpoint = self._damped_hover_setpoint(now)
 			if now - self._phase_start_time >= TEST_SETTLE_SEC:
-				self._damper.reset()
 				self._enter_phase(PHASE_VZ_SETTLE)
 			return
 
@@ -788,7 +912,8 @@ class CalibrationNode(Node):
 				return
 
 			vz = self._vehicle_state.vz
-			thrust = self._settler.step(now, vz)
+			z = self._vehicle_state.z
+			thrust = self._settler.step(now, vz, z=z)
 			self._latest_setpoint = AttitudeSetpoint(
 				timestamp=self._latest_target.timestamp,
 				roll=0.0,
@@ -826,17 +951,10 @@ class CalibrationNode(Node):
 			self._hold_trim()
 			return
 
+		# Safety bounds are checked centrally at the top of on_mission_timer
+		# now, covering every phase from PRESTREAM onward -- not just here.
 		vz = self._vehicle_state.vz
-		area_fraction = float(getattr(self._latest_target, "area_fraction", 0.0))
-
-		if self._aborted or exceeds_safety_bounds(
-			vz, area_fraction, ABORT_VZ_LIMIT, ABORT_AREA_FRACTION_MAX
-		):
-			self._abort(
-				f"safety bound exceeded during calibration: vz={vz:.3f} m/s, "
-				f"area_fraction={area_fraction:.3f}"
-			)
-			return
+		z = self._vehicle_state.z
 
 		target_ok = bool(self._latest_target.found)
 		flow_ok = bool(self._latest_flow.valid)
@@ -858,7 +976,7 @@ class CalibrationNode(Node):
 		current_axis = self.sequence.axis_at(elapsed)
 
 		if current_axis != "thrust":
-			thrust = self._damper.step(now, vz)
+			thrust = self._damper.step(now, vz, z=z)
 
 		roll = self._clamp(roll, -ROLL_LIMIT_RAD, ROLL_LIMIT_RAD)
 		pitch = self._clamp(pitch, -PITCH_LIMIT_RAD, PITCH_LIMIT_RAD)
@@ -901,6 +1019,7 @@ class CalibrationNode(Node):
 			PHASE_WAIT_OFFBOARD,
 			PHASE_CLIMB,
 			PHASE_OFFBOARD_PROBE,
+			PHASE_PROBE_RECOVERY,
 			PHASE_ALTITUDE_SETTLE,
 			PHASE_VZ_SETTLE,
 			PHASE_OPEN_LOOP,
@@ -950,7 +1069,14 @@ class CalibrationNode(Node):
 		self._mavsdk_thread.start()
 
 	@staticmethod
-	async def _wait_for_condition(async_iterable, condition, timeout: float, label: str):
+	async def _wait_for_condition(
+		async_iterable,
+		condition,
+		timeout: float,
+		label: str,
+		progress_fn=None,
+		progress_interval: float = 5.0,
+	):
 		"""
 		Consume async_iterable until condition(item) is True, or raise a
 		clear, labeled TimeoutError after `timeout` seconds. Every
@@ -958,12 +1084,29 @@ class CalibrationNode(Node):
 		no timeout at all -- one stuck step (wrong system address, SITL
 		not up yet, a health flag that never goes true) meant the node
 		sat in PHASE_MAVSDK_TAKEOFF forever, with no error and an empty
-		diagnostics CSV as the only symptom. This is what replaced that.
+		diagnostics CSV as the only symptom. The timeout fixes that --
+		but a timeout firing only tells you a step failed, not what was
+		actually happening leading up to it (e.g. "stuck at 0m the whole
+		time" vs "climbing, just slower than expected" look identical
+		from the outside otherwise). progress_fn, if given, is called
+		with (item, elapsed_sec) every progress_interval seconds while
+		still waiting, so a future timeout comes with that context
+		instead of just "it failed".
 		"""
 		async def _inner():
+			loop = asyncio.get_event_loop()
+			start = loop.time()
+			last_progress = start
+
 			async for item in async_iterable:
 				if condition(item):
 					return item
+
+				if progress_fn is not None:
+					now = loop.time()
+					if now - last_progress >= progress_interval:
+						last_progress = now
+						progress_fn(item, now - start)
 
 		try:
 			return await asyncio.wait_for(_inner(), timeout=timeout)
@@ -1028,11 +1171,21 @@ class CalibrationNode(Node):
 		self.get_logger().info("MAVSDK: takeoff command.")
 		await drone.action.takeoff()
 
+		def _log_takeoff_progress(position, elapsed):
+			current_alt = position.relative_altitude_m - home_baro_offset
+			self.get_logger().info(
+				f"MAVSDK: still climbing after {elapsed:.0f}s -- "
+				f"current relative altitude={current_alt:.2f} m, "
+				f"target={TAKEOFF_ALTITUDE_M - 0.20:.2f} m"
+			)
+
 		await self._wait_for_condition(
 			drone.telemetry.position(),
 			lambda position: (position.relative_altitude_m - home_baro_offset) >= TAKEOFF_ALTITUDE_M - 0.20,
 			MAVSDK_TAKEOFF_ALTITUDE_TIMEOUT_SEC,
 			"takeoff altitude reached",
+			progress_fn=_log_takeoff_progress,
+			progress_interval=5.0,
 		)
 		self.get_logger().info("MAVSDK: reached takeoff altitude; hovering.")
 
@@ -1150,6 +1303,25 @@ class CalibrationNode(Node):
 			pitch=0.0,
 			yaw=0.0,
 			thrust=HOVER_THRUST,
+		)
+
+	def _damped_hover_setpoint(self, now: float, roll: float = 0.0, pitch: float = 0.0) -> AttitudeSetpoint:
+		"""
+		Build a setpoint with thrust from the shared VerticalVelocityDamper
+		(velocity + altitude-hold) rather than a bare HOVER_THRUST. Used
+		throughout the takeoff handoff (PRESTREAM onward) instead of
+		_hold_trim(), so a hover_thrust guess that's meaningfully wrong
+		gets corrected starting from the moment our own thrust commands
+		take over control authority -- not several seconds later, by
+		which point real altitude can already have been lost.
+		"""
+		thrust = self._damper.step(now, self._vehicle_state.vz, z=self._vehicle_state.z)
+		return AttitudeSetpoint(
+			timestamp=getattr(self._latest_target, "timestamp", 0.0),
+			roll=roll,
+			pitch=pitch,
+			yaw=0.0,
+			thrust=thrust,
 		)
 
 	def _enter_phase(self, phase: str):
