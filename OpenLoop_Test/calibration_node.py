@@ -200,7 +200,7 @@ MAVSDK_TAKEOFF_PHASE_TIMEOUT_SEC = 200.0
 # leaving room for the open-loop test's own excursions on top of it). If
 # 6.0 still isn't enough clearance, re-solve the same way using whatever
 # area_fraction this value actually produces.
-TAKEOFF_ALTITUDE_M = 6.0
+TAKEOFF_ALTITUDE_M = 5
 OFFBOARD_PRESTREAM_SEC = 2.0
 OFFBOARD_CONFIRM_TIMEOUT_SEC = 5.0
 TAKEOFF_ALTITUDE_TOL_M = 0.15
@@ -289,7 +289,7 @@ HOVER_THRUST = 0.73
 # separate b from noise.
 ROLL_TEST_AMPLITUDE_RAD = 0.04
 PITCH_TEST_AMPLITUDE_RAD = 0.04
-THRUST_TEST_AMPLITUDE = 0.02
+THRUST_TEST_AMPLITUDE = 0.04
 
 # Hold duration, per axis (not shared — see build_calibration_sequence's
 # docstring). Roll/pitch raised from 2.0s to 6.0s: for a roughly
@@ -302,9 +302,42 @@ THRUST_TEST_AMPLITUDE = 0.02
 # see fit_axis_models.py's wide-range warning).
 ROLL_TEST_HOLD_SEC = 1.0
 PITCH_TEST_HOLD_SEC = 1.0
-THRUST_TEST_HOLD_SEC = 1.0
+THRUST_TEST_HOLD_SEC = 1.5
 
-TEST_REPEATS = 8
+ROLL_TEST_REPEATS = 8
+PITCH_TEST_REPEATS = 8
+# Halved from 8: a real run showed vz climbing monotonically from ~0 to
+# 0.47 m/s over one uninterrupted ~30s thrust test -- the vertical
+# damper is fully disabled during thrust's own test (it's what's being
+# identified), so a residual hover_thrust error has nothing checking it
+# for the whole duration. THRUST_RESET_SEC below is the other half of
+# the fix: bounding how far that can drift between repeats rather than
+# requiring hover_thrust to be guessed exactly right. Fewer, periodically
+# reset repeats means less time for the same residual error to
+# compound between corrections.
+THRUST_TEST_REPEATS = 4
+# Brief damped return-to-trim between thrust repeats (not within one --
+# see build_axis_step_train's docstring). Labeled "settle", not
+# "thrust", so the vertical damper activates for it and
+# fit_axis_models.py excludes it from the thrust fit automatically, the
+# same way it already excludes the inter-axis gaps.
+#
+# 4.0s, not a round number picked for convenience -- swept reset
+# duration from 2-10s in simulation and found a real, sharp band
+# (5.5-7s) where it's actively worse than no reset at all: the damper
+# is mildly underdamped at these short timescales (its gains were tuned
+# for the much longer vertical settle, not a few-second touch-up), so a
+# duration landing mid-oscillation amplifies drift instead of removing
+# it. 4.0s lands in a genuinely good window (small, non-growing residual
+# vz at the end of every reset, not just the first), validated across a
+# range of plausible mass_gain and residual-bias combinations -- not a
+# perfect guarantee for every case (a couple of the more extreme
+# combinations tested still showed some growth), but a clear, validated
+# improvement over the uninterrupted version. If a future run still
+# shows meaningful drift during thrust testing, the more robust fix
+# would be a runtime "wait until actually settled" check between
+# repeats (like VerticalSettler) instead of this fixed duration.
+THRUST_RESET_SEC = 6.0
 TEST_SETTLE_SEC = 2.0
 # Now running all three axes back to back in one CSV: roll's own
 # identification has been clean and significant for a while, the
@@ -535,7 +568,10 @@ class CalibrationNode(Node):
 			roll_hold_sec=ROLL_TEST_HOLD_SEC,
 			pitch_hold_sec=PITCH_TEST_HOLD_SEC,
 			thrust_hold_sec=THRUST_TEST_HOLD_SEC,
-			repeats=TEST_REPEATS,
+			roll_repeats=ROLL_TEST_REPEATS,
+			pitch_repeats=PITCH_TEST_REPEATS,
+			thrust_repeats=THRUST_TEST_REPEATS,
+			thrust_reset_sec=THRUST_RESET_SEC,
 			settle_sec=TEST_SETTLE_SEC,
 			axes=TEST_AXES,
 		)

@@ -509,8 +509,9 @@ def plot_commands(df: pd.DataFrame, t: np.ndarray, output_dir: str):
 		y = numeric_column(df, column_name)
 		ax.plot(t, y, label=label)
 		if column_name == "command_thrust":
-			ax.axhline(0.5, linestyle="--", linewidth=1)
-		ax.axhline(0.0, linestyle="--", linewidth=1)
+			ax.axhline(0.73, linestyle="--", linewidth=1)
+		else:
+			ax.axhline(0.0, linestyle="--", linewidth=1)
 		ax.set_ylabel(label)
 		ax.grid(True)
 		ax.legend(loc="best")

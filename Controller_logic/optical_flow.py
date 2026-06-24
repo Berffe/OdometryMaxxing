@@ -5,19 +5,9 @@ Production path:
 
 	update(frame_bgr, timestamp, target=None) -> FlowResult
 
-When a valid TargetEstimate is provided, the dense optical flow and the
-scalar divergence are computed only inside the target bounding box.
-
-Debug path:
-
-	python -m bee_control.optical_flow
-
-or:
-
-	python optical_flow.py
-
-When run as a script, this file imports optical_flow_debug.py and starts
-the visual debug test. The dense flow field is still not part of FlowResult.
+When a valid TargetEstimate is provided, dense optical flow and divergence are
+computed only inside the target bounding box. The controller uses the normalized
+mean flow fields, not the raw px/s fields.
 """
 
 from typing import Optional, Tuple
@@ -89,30 +79,17 @@ class OpticalFlowEstimator:
 			self._prev_gray = gray
 			self._prev_bgr = frame_bgr.copy()
 			self._prev_timestamp = timestamp
-
 			result = FlowResult(timestamp=timestamp, valid=False)
-			self._save_debug(
-				result=result,
-				current_frame=frame_bgr,
-				message="Waiting for previous frame",
-			)
-
+			self._save_debug(result=result, current_frame=frame_bgr, message="Waiting for previous frame")
 			return result
 
 		dt = float(timestamp - self._prev_timestamp)
-
 		if dt <= 1e-6:
 			self._prev_gray = gray
 			self._prev_bgr = frame_bgr.copy()
 			self._prev_timestamp = timestamp
-
 			result = FlowResult(timestamp=timestamp, valid=False)
-			self._save_debug(
-				result=result,
-				current_frame=frame_bgr,
-				message="Invalid dt",
-			)
-
+			self._save_debug(result=result, current_frame=frame_bgr, message="Invalid dt")
 			return result
 
 		previous_frame = self._prev_bgr.copy() if self._prev_bgr is not None else None
@@ -127,7 +104,6 @@ class OpticalFlowEstimator:
 			self._prev_gray = gray
 			self._prev_bgr = frame_bgr.copy()
 			self._prev_timestamp = timestamp
-
 			result = FlowResult(timestamp=timestamp, valid=False)
 			self._save_debug(
 				result=result,
@@ -136,14 +112,12 @@ class OpticalFlowEstimator:
 				roi=None,
 				message="No valid target ROI",
 			)
-
 			return result
 
 		if roi is None:
 			roi = (0, 0, image_width, image_height)
 
 		x0, y0, x1, y1 = roi
-
 		prev_roi = self._prev_gray[y0:y1, x0:x1]
 		gray_roi = gray[y0:y1, x0:x1]
 
@@ -151,7 +125,6 @@ class OpticalFlowEstimator:
 			self._prev_gray = gray
 			self._prev_bgr = frame_bgr.copy()
 			self._prev_timestamp = timestamp
-
 			result = FlowResult(timestamp=timestamp, valid=False)
 			self._save_debug(
 				result=result,
@@ -160,7 +133,6 @@ class OpticalFlowEstimator:
 				roi=roi,
 				message="ROI too small",
 			)
-
 			return result
 
 		flow_px_per_frame = cv2.calcOpticalFlowFarneback(
@@ -175,18 +147,20 @@ class OpticalFlowEstimator:
 			self._poly_sigma,
 			0,
 		)
-
 		flow_px_s = flow_px_per_frame / dt
 
 		mean_flow_x = float(np.mean(flow_px_s[:, :, 0]))
 		mean_flow_y = float(np.mean(flow_px_s[:, :, 1]))
+
+		# Normalized image-coordinate velocity. This matches TargetEstimate.offset_x/y.
+		mean_flow_x_norm = mean_flow_x / max(0.5 * image_width, 1.0)
+		mean_flow_y_norm = mean_flow_y / max(0.5 * image_height, 1.0)
 
 		divergence_field = self._estimate_divergence_field(
 			flow_px_s=flow_px_s,
 			image_width=image_width,
 			image_height=image_height,
 		)
-
 		raw_divergence = self._scalar_from_divergence_field(divergence_field)
 		filtered_divergence = self._filter_divergence(raw_divergence)
 
@@ -195,7 +169,14 @@ class OpticalFlowEstimator:
 			valid=True,
 			mean_flow_x=mean_flow_x,
 			mean_flow_y=mean_flow_y,
+			mean_flow_x_norm=float(mean_flow_x_norm),
+			mean_flow_y_norm=float(mean_flow_y_norm),
 			divergence=float(filtered_divergence),
+			raw_divergence=float(raw_divergence),
+			roi_x0=int(x0),
+			roi_y0=int(y0),
+			roi_x1=int(x1),
+			roi_y1=int(y1),
 		)
 
 		self._save_debug(
@@ -213,34 +194,25 @@ class OpticalFlowEstimator:
 		self._prev_gray = gray
 		self._prev_bgr = frame_bgr.copy()
 		self._prev_timestamp = timestamp
-
 		return result
 
 	def reset(self):
 		self._prev_gray = None
 		self._prev_bgr = None
 		self._prev_timestamp = None
-
 		self._filtered_divergence = 0.0
 		self._has_filtered_divergence = False
-
 		self._last_debug = {}
 
 	def last_debug_data(self) -> dict:
 		return dict(self._last_debug)
 
-	def _target_roi_from_estimate(
-		self,
-		target: Optional[TargetEstimate],
-		image_width: int,
-		image_height: int,
-	) -> Optional[ROI]:
+	def _target_roi_from_estimate(self, target: Optional[TargetEstimate], image_width: int, image_height: int) -> Optional[ROI]:
 		if target is None or not target.found:
 			return None
 
 		detection_width = float(getattr(target, "detection_width", 0.0))
 		detection_height = float(getattr(target, "detection_height", 0.0))
-
 		if detection_width <= 1.0 or detection_height <= 1.0:
 			return None
 
@@ -249,16 +221,8 @@ class OpticalFlowEstimator:
 
 		margin_x = self._roi_margin_fraction * detection_width
 		margin_y = self._roi_margin_fraction * detection_height
-
-		roi_width = max(
-			detection_width + 2.0 * margin_x,
-			float(self._min_roi_size_px),
-		)
-
-		roi_height = max(
-			detection_height + 2.0 * margin_y,
-			float(self._min_roi_size_px),
-		)
+		roi_width = max(detection_width + 2.0 * margin_x, float(self._min_roi_size_px))
+		roi_height = max(detection_height + 2.0 * margin_y, float(self._min_roi_size_px))
 
 		x0 = int(round(cx - 0.5 * roi_width))
 		y0 = int(round(cy - 0.5 * roi_height))
@@ -272,53 +236,35 @@ class OpticalFlowEstimator:
 
 		if x1 - x0 < 3 or y1 - y0 < 3:
 			return None
-
 		return (x0, y0, x1, y1)
 
-	def _estimate_divergence_field(
-		self,
-		flow_px_s: np.ndarray,
-		image_width: int,
-		image_height: int,
-	) -> np.ndarray:
+	def _estimate_divergence_field(self, flow_px_s: np.ndarray, image_width: int, image_height: int) -> np.ndarray:
 		roi_height, roi_width = flow_px_s.shape[:2]
-
 		if roi_width < 3 or roi_height < 3:
 			return np.zeros((roi_height, roi_width), dtype=np.float32)
 
-		# Convert pixel flow to normalized image-coordinate velocity.
-		# Normalization uses the full image size, not the ROI size, so the
-		# divergence scale remains consistent as the target box changes.
-		u_norm_s = flow_px_s[:, :, 0] / (0.5 * image_width)
-		v_norm_s = flow_px_s[:, :, 1] / (0.5 * image_height)
+		u_norm_s = flow_px_s[:, :, 0] / max(0.5 * image_width, 1.0)
+		v_norm_s = flow_px_s[:, :, 1] / max(0.5 * image_height, 1.0)
 
 		dx_norm = 2.0 / max(image_width - 1, 1)
 		dy_norm = 2.0 / max(image_height - 1, 1)
-
 		du_dx = np.gradient(u_norm_s, dx_norm, axis=1)
 		dv_dy = np.gradient(v_norm_s, dy_norm, axis=0)
-
 		return du_dx + dv_dy
 
 	@staticmethod
 	def _scalar_from_divergence_field(divergence_field: np.ndarray) -> float:
 		if divergence_field is None or divergence_field.size == 0:
 			return 0.0
-
 		return float(np.median(divergence_field))
 
 	def _filter_divergence(self, divergence: float) -> float:
 		alpha = max(0.0, min(1.0, self._divergence_smoothing))
-
 		if not self._has_filtered_divergence:
 			self._filtered_divergence = float(divergence)
 			self._has_filtered_divergence = True
 		else:
-			self._filtered_divergence = (
-				alpha * self._filtered_divergence
-				+ (1.0 - alpha) * float(divergence)
-			)
-
+			self._filtered_divergence = alpha * self._filtered_divergence + (1.0 - alpha) * float(divergence)
 		return self._filtered_divergence
 
 	def _save_debug(
@@ -336,7 +282,6 @@ class OpticalFlowEstimator:
 		if not self._store_debug:
 			self._last_debug = {}
 			return
-
 		self._last_debug = {
 			"result": result,
 			"previous_frame": previous_frame,
@@ -355,5 +300,4 @@ if __name__ == "__main__":
 		from ._optical_flow_debug import test
 	except ImportError:
 		from _optical_flow_debug import test
-
 	test()
