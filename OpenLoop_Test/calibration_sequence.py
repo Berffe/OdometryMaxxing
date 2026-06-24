@@ -17,6 +17,7 @@ ROS-coupled nodes and plain-Python algorithm modules).
 """
 
 from typing import List, Optional, Tuple
+import math
 
 Segment = Tuple[float, float, float, float]  # duration_sec, roll, pitch, thrust
 
@@ -277,6 +278,103 @@ class VerticalVelocityDamper:
 		return max(self._thrust_min, min(self._thrust_max, thrust))
 
 
+class LateralVelocityDamper:
+	"""
+	Stateful PI damper driving roll/pitch to cancel lateral drift (vx,
+	vy) during the pre-test handoff phases only -- NEVER during the
+	open-loop roll/pitch test itself, which would reintroduce exactly
+	the cause/effect entanglement this whole calibration setup exists
+	to avoid for those two axes. See calibration_node.py for exactly
+	which phases apply its output.
+
+	Why this exists: a real run showed target_offset_x starting around
+	0.35-0.37 (well off-center) and continuing to drift through the
+	whole test. roll=pitch=0 zeroes lateral *acceleration*, not
+	velocity, and OFFBOARD_PROBE deliberately commands a real roll to
+	verify attitude response -- nothing has corrected the resulting
+	lateral velocity since. Same gap that motivated the vertical
+	damper, one axis over.
+
+	Sign derivation -- not assumed, derived from the same ZYX Euler
+	convention _euler_to_quaternion/_quaternion_to_euler already use,
+	and checked numerically before trusting it: rotating the body-frame
+	thrust vector (0,0,-1) by roll alone gives (0, sin(roll), -cos(roll))
+	-- positive roll tilts thrust toward +Y (East, in NED, for yaw=0).
+	Rotating by pitch alone gives (-sin(pitch), 0, -cos(pitch)) --
+	positive pitch tilts thrust toward -X (South). So countering a
+	positive vy (drifting East) needs NEGATIVE roll; countering a
+	positive vx (drifting North) needs POSITIVE pitch. For nonzero yaw,
+	vx/vy are rotated into the body forward/right frame first (using
+	the vehicle's current heading), so the same two rules still apply
+	regardless of which way the vehicle happens to be facing -- this
+	project never actively controls yaw, so it can't be assumed to stay
+	at 0.
+
+	roll_limit/pitch_limit default well inside the test sequence's own
+	ROLL_LIMIT_RAD/PITCH_LIMIT_RAD -- this is meant to gently hold
+	position during settle phases, not aggressively chase it.
+	"""
+
+	def __init__(
+		self,
+		kp: float = 0.10,
+		ki: float = 0.03,
+		roll_limit: float = 0.05,
+		pitch_limit: float = 0.05,
+		integral_limit: float = 0.3,
+	):
+		self._kp = kp
+		self._ki = ki
+		self._roll_limit = abs(roll_limit)
+		self._pitch_limit = abs(pitch_limit)
+		self._integral_limit = abs(integral_limit)
+
+		self._integral_vx = 0.0
+		self._integral_vy = 0.0
+		self._last_time: Optional[float] = None
+
+	def reset(self):
+		self._integral_vx = 0.0
+		self._integral_vy = 0.0
+		self._last_time = None
+
+	def step(self, now: float, vx: float, vy: float, yaw: float = 0.0) -> Tuple[float, float]:
+		"""Return (roll, pitch) correction for this tick."""
+		if self._last_time is not None:
+			dt = now - self._last_time
+			if dt > 0.0:
+				self._integral_vx += vx * dt
+				self._integral_vx = max(
+					-self._integral_limit, min(self._integral_limit, self._integral_vx)
+				)
+				self._integral_vy += vy * dt
+				self._integral_vy = max(
+					-self._integral_limit, min(self._integral_limit, self._integral_vy)
+				)
+
+		self._last_time = now
+
+		cos_yaw, sin_yaw = math.cos(yaw), math.sin(yaw)
+
+		# Rotate NED (north, east) velocity and its integral into body
+		# (forward, right). Rotating the accumulated integral this way
+		# (rather than accumulating in body frame directly) is only
+		# exact if yaw stays constant -- true here, since this project
+		# never actively commands yaw changes.
+		v_forward = vx * cos_yaw + vy * sin_yaw
+		v_right = -vx * sin_yaw + vy * cos_yaw
+		integral_forward = self._integral_vx * cos_yaw + self._integral_vy * sin_yaw
+		integral_right = -self._integral_vx * sin_yaw + self._integral_vy * cos_yaw
+
+		pitch = self._kp * v_forward + self._ki * integral_forward
+		roll = -self._kp * v_right - self._ki * integral_right
+
+		roll = max(-self._roll_limit, min(self._roll_limit, roll))
+		pitch = max(-self._pitch_limit, min(self._pitch_limit, pitch))
+
+		return roll, pitch
+
+
 class VerticalSettler:
 	"""
 	"Have we been quiet for long enough, AND actually near where we
@@ -372,16 +470,26 @@ def exceeds_safety_bounds(
 	area_fraction: float,
 	vz_limit: float = 1.0,
 	area_fraction_max: float = 0.97,
+	vx: float = 0.0,
+	vy: float = 0.0,
+	lateral_velocity_limit: float = 2.0,
 ) -> bool:
 	"""
-	True if vz or area_fraction is clearly outside what a calibration
-	run should ever see in normal operation — vz this large means
-	something (the settle damper, a bad command) is actively driving a
-	runaway rather than gently exciting one axis; area_fraction this
-	high means the vehicle is on top of the target. Either is reason to
-	abort rather than continue the sequence.
+	True if vz, area_fraction, or lateral velocity is clearly outside
+	what a calibration run should ever see in normal operation — vz or
+	lateral velocity this large means something (a damper, a bad
+	command) is actively driving a runaway rather than gently exciting
+	one axis; area_fraction this high means the vehicle is on top of
+	the target. Any of these is reason to abort rather than continue
+	the sequence. vx/vy default to 0.0 so existing callers that don't
+	pass them can't trip the new check by omission.
 	"""
-	return abs(vz) > vz_limit or area_fraction > area_fraction_max
+	return (
+		abs(vz) > vz_limit
+		or area_fraction > area_fraction_max
+		or abs(vx) > lateral_velocity_limit
+		or abs(vy) > lateral_velocity_limit
+	)
 
 
 def build_calibration_sequence(

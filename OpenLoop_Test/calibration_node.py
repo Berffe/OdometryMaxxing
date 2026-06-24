@@ -45,6 +45,20 @@ Safety/damping, after a real run exposed three compounding gaps in this:
 None of this is a substitute for HOVER_THRUST actually being close to
 correct -- it bounds how much an imperfect guess can cost, it doesn't
 remove the value of a better guess.
+
+A fourth, separate gap: roll/pitch=0 zeroes lateral *acceleration*, not
+velocity, same structural issue as the vertical case one axis over. A
+real run showed target_offset_x starting well off-center and drifting
+further -- OFFBOARD_PROBE deliberately commands a real roll to verify
+attitude response, and nothing corrected the resulting lateral velocity
+afterward. LateralVelocityDamper addresses this, active during every
+pre-test phase and the inter-axis "settle" gaps within the open-loop
+sequence, but deliberately NEVER during any axis' own active test or
+during OFFBOARD_PROBE itself -- both would reintroduce exactly the
+cause/effect entanglement this whole setup exists to avoid. Its sign
+convention is derived from the same ZYX Euler convention
+_euler_to_quaternion/_quaternion_to_euler use, not assumed, and checked
+numerically before trusting it -- see LateralVelocityDamper's docstring.
 """
 
 import asyncio
@@ -102,6 +116,7 @@ from .calibration_sequence import (
 	build_calibration_sequence,
 	VerticalSettler,
 	VerticalVelocityDamper,
+	LateralVelocityDamper,
 	exceeds_safety_bounds,
 )
 
@@ -247,17 +262,23 @@ VEHICLE_COMMAND_ACK_TOPICS = (
 # phase / continuous roll-pitch damping below both use it as the
 # baseline they damp around.
 #
-# NOTE: this is 0.56, not the ~0.44 identified earlier in the project.
-# That's expected, not a leftover mistake, IF this value was identified
-# specifically for the new CONTROL_BACKEND="mavsdk_offboard" path:
-# MAVSDK's offboard.set_attitude() thrust parameter is not guaranteed to
-# use the exact same normalization as the raw VehicleAttitudeSetpoint
-# thrust_body the ROS path sent, so a value calibrated for one path isn't
-# automatically right for the other. Confirm this is genuinely the
-# MAVSDK-path hover value (not a stale guess) before trusting it --
-# the empty CSV from the last run means this hasn't been validated in
-# a successful flight yet.
-HOVER_THRUST = 0.56
+# Now backed by two independent, converging estimates rather than a
+# single guess: ~0.74 from matching an earlier abort's timing against a
+# simulated hover_thrust gap, and ~0.7325 from directly regressing this
+# run's actual (vz, command_thrust) pairs against a simple thrust-to-vz
+# plant model. Splitting the two: 0.73. Validated against the FULL
+# uncertainty in both that regression's mass_gain estimate (it was noisy,
+# R^2=0.45, so treat 4.68 as a rough number, not a precise one) and the
+# remaining hover gap: across mass_gain in [3, 11] and true hover in
+# [0.70, 0.76], this value converges to ~0 altitude error well within
+# the 45s settle budget using the EXISTING kp/ki/kz/kiz gains, unchanged.
+# (Tried increasing kiz directly first to speed up a 45s settle timeout
+# this value should now make largely moot -- that's the wrong fix here:
+# at the actual (much weaker than previously assumed) mass_gain, a
+# larger kiz drove the simulated altitude into growing oscillation
+# instead of faster convergence. Closing the gap itself is the safer
+# lever; the gains didn't need to move.)
+HOVER_THRUST = 0.73
 
 # Step-train shape. Keep the roll/pitch amplitudes comfortably inside
 # ControlLaw's roll_limit/pitch_limit, and the thrust amplitude
@@ -285,10 +306,13 @@ THRUST_TEST_HOLD_SEC = 1.0
 
 TEST_REPEATS = 8
 TEST_SETTLE_SEC = 2.0
-# Start with one axis per CSV. Change to ("pitch",) or ("thrust",) for
-# the next runs, or put all three axes back only after the one-axis runs
-# stay inside the camera field of view.
-TEST_AXES = ("roll",)
+# Now running all three axes back to back in one CSV: roll's own
+# identification has been clean and significant for a while, the
+# vertical settle is fast and reliable now, and the lateral damper
+# below addresses the main remaining risk (drifting out of frame
+# before/between axes) for a single-axis run becoming a real problem
+# over a ~3x longer one.
+TEST_AXES = ("roll", "pitch", "thrust")
 
 # Defensive clamps applied to whatever the sequence produces, mirroring
 # ControlLaw's own limits, in case the amplitudes above are ever set
@@ -296,7 +320,11 @@ TEST_AXES = ("roll",)
 ROLL_LIMIT_RAD = 0.10
 PITCH_LIMIT_RAD = 0.10
 THRUST_MIN = 0.35
-THRUST_MAX = 0.65
+# Headroom above HOVER_THRUST=0.73 for kp/ki/kz/kiz to actually have
+# authority -- a ceiling sitting at or below the true hover value means
+# the damper saturates with zero corrective authority left, regardless
+# of how good the gains are.
+THRUST_MAX = 0.80
 
 # Pre-test settle phase, and the continuous damping during roll/pitch
 # testing that follows it, share ONE VerticalVelocityDamper instance
@@ -347,6 +375,28 @@ DAMPER_INTEGRAL_LIMIT = 0.15
 # the same mistake the original (too-tight) DAMPER_INTEGRAL_LIMIT made.
 DAMPER_INTEGRAL_Z_LIMIT = 10.0
 
+# Lateral (roll/pitch) damping against vx/vy drift -- active ONLY during
+# the pre-test handoff phases and the inter-axis "settle" gaps within
+# the open-loop sequence, NEVER during any axis' own active test (that
+# would reintroduce exactly the cause/effect entanglement this whole
+# setup exists to avoid). Same motivation as the vertical damper, one
+# axis over: a real run showed target_offset_x starting around 0.35-0.37
+# and drifting further, because roll=pitch=0 zeroes lateral
+# *acceleration* (not velocity) and nothing corrected the velocity that
+# OFFBOARD_PROBE's deliberate roll excursion leaves behind. Gains are
+# derived from physics (lateral accel ~= g*angle for small angles, a
+# known constant, unlike the vertical thrust-to-accel relationship which
+# had to be estimated from data) rather than guessed -- see
+# LateralVelocityDamper's docstring for the sign derivation and its
+# direct numerical verification. roll/pitch limits here are deliberately
+# small relative to ROLL_LIMIT_RAD/PITCH_LIMIT_RAD: this should gently
+# hold position, not aggressively chase it.
+LATERAL_DAMPER_KP = 0.10
+LATERAL_DAMPER_KI = 0.03
+LATERAL_DAMPER_ROLL_LIMIT = 0.05
+LATERAL_DAMPER_PITCH_LIMIT = 0.05
+LATERAL_DAMPER_INTEGRAL_LIMIT = 0.3
+
 # Hard safety bounds. Checked on EVERY tick from the moment offboard
 # thrust commands start being sent (PHASE_PRESTREAM) through the rest of
 # the mission -- previously this was only checked inside the open-loop
@@ -355,11 +405,15 @@ DAMPER_INTEGRAL_Z_LIMIT = 10.0
 # "safety bound exceeded" abort 0.09s into open-loop testing with an
 # empty CSV: area_fraction was already past the limit from whatever
 # happened during the unprotected phases before it, and nothing could
-# have caught it earlier even if it had been far worse. Tripping either
+# have caught it earlier even if it had been far worse. Tripping any
 # bound now halts at HOVER_THRUST permanently (reposition and restart
 # the node) rather than trying to recover automatically.
 ABORT_VZ_LIMIT = 1.0
 ABORT_AREA_FRACTION_MAX = 0.97
+# New alongside the lateral damper -- if it (or anything else) ever
+# drove a runaway instead of gently correcting drift, this catches it
+# the same way ABORT_VZ_LIMIT catches a vertical runaway.
+ABORT_LATERAL_VELOCITY_LIMIT = 2.0
 
 # If target/flow stays lost this long DURING the open-loop test phase
 # (not the settle phase, which doesn't need vision), there is no more
@@ -451,6 +505,13 @@ class CalibrationNode(Node):
 			thrust_max=THRUST_MAX,
 			integral_limit=DAMPER_INTEGRAL_LIMIT,
 			integral_z_limit=DAMPER_INTEGRAL_Z_LIMIT,
+		)
+		self._lateral_damper = LateralVelocityDamper(
+			kp=LATERAL_DAMPER_KP,
+			ki=LATERAL_DAMPER_KI,
+			roll_limit=LATERAL_DAMPER_ROLL_LIMIT,
+			pitch_limit=LATERAL_DAMPER_PITCH_LIMIT,
+			integral_limit=LATERAL_DAMPER_INTEGRAL_LIMIT,
 		)
 		self._settler = VerticalSettler(
 			self._damper,
@@ -731,11 +792,16 @@ class CalibrationNode(Node):
 			PHASE_FINISHED, PHASE_ABORTED,
 		):
 			vz = self._vehicle_state.vz
+			vx = self._vehicle_state.vx
+			vy = self._vehicle_state.vy
 			area_fraction = float(getattr(self._latest_target, "area_fraction", 0.0))
-			if exceeds_safety_bounds(vz, area_fraction, ABORT_VZ_LIMIT, ABORT_AREA_FRACTION_MAX):
+			if exceeds_safety_bounds(
+				vz, area_fraction, ABORT_VZ_LIMIT, ABORT_AREA_FRACTION_MAX,
+				vx=vx, vy=vy, lateral_velocity_limit=ABORT_LATERAL_VELOCITY_LIMIT,
+			):
 				self._abort(
 					f"safety bound exceeded during phase={self._mission_phase}: "
-					f"vz={vz:.3f} m/s, area_fraction={area_fraction:.3f}"
+					f"vz={vz:.3f} m/s, vx={vx:.3f} m/s, vy={vy:.3f} m/s, area_fraction={area_fraction:.3f}"
 				)
 				return
 
@@ -829,7 +895,9 @@ class CalibrationNode(Node):
 			return
 
 		if self._mission_phase == PHASE_OFFBOARD_PROBE:
-			self._latest_setpoint = self._damped_hover_setpoint(now, roll=OFFBOARD_PROBE_ROLL_RAD)
+			self._latest_setpoint = self._damped_hover_setpoint(
+				now, roll=OFFBOARD_PROBE_ROLL_RAD, apply_lateral_damping=False
+			)
 			if self._probe_baseline_roll is not None:
 				delta = abs(self._vehicle_state.roll - self._probe_baseline_roll)
 				self._probe_max_roll_delta = max(self._probe_max_roll_delta, delta)
@@ -914,10 +982,13 @@ class CalibrationNode(Node):
 			vz = self._vehicle_state.vz
 			z = self._vehicle_state.z
 			thrust = self._settler.step(now, vz, z=z)
+			lateral_roll, lateral_pitch = self._lateral_damper.step(
+				now, self._vehicle_state.vx, self._vehicle_state.vy, yaw=self._vehicle_state.yaw
+			)
 			self._latest_setpoint = AttitudeSetpoint(
 				timestamp=self._latest_target.timestamp,
-				roll=0.0,
-				pitch=0.0,
+				roll=lateral_roll,
+				pitch=lateral_pitch,
 				yaw=0.0,
 				thrust=thrust,
 			)
@@ -977,6 +1048,18 @@ class CalibrationNode(Node):
 
 		if current_axis != "thrust":
 			thrust = self._damper.step(now, vz, z=z)
+
+		# Always step the lateral damper to keep its internal timing
+		# continuous (same reasoning as the vertical damper during the
+		# probe), but only apply its output during the inter-axis
+		# "settle" gaps -- never during any axis' own active test, which
+		# must stay genuinely open-loop for identification.
+		lateral_roll, lateral_pitch = self._lateral_damper.step(
+			now, self._vehicle_state.vx, self._vehicle_state.vy, yaw=self._vehicle_state.yaw
+		)
+		if current_axis == "settle":
+			roll += lateral_roll
+			pitch += lateral_pitch
 
 		roll = self._clamp(roll, -ROLL_LIMIT_RAD, ROLL_LIMIT_RAD)
 		pitch = self._clamp(pitch, -PITCH_LIMIT_RAD, PITCH_LIMIT_RAD)
@@ -1305,17 +1388,37 @@ class CalibrationNode(Node):
 			thrust=HOVER_THRUST,
 		)
 
-	def _damped_hover_setpoint(self, now: float, roll: float = 0.0, pitch: float = 0.0) -> AttitudeSetpoint:
+	def _damped_hover_setpoint(
+		self, now: float, roll: float = 0.0, pitch: float = 0.0, apply_lateral_damping: bool = True
+	) -> AttitudeSetpoint:
 		"""
 		Build a setpoint with thrust from the shared VerticalVelocityDamper
-		(velocity + altitude-hold) rather than a bare HOVER_THRUST. Used
-		throughout the takeoff handoff (PRESTREAM onward) instead of
-		_hold_trim(), so a hover_thrust guess that's meaningfully wrong
-		gets corrected starting from the moment our own thrust commands
-		take over control authority -- not several seconds later, by
-		which point real altitude can already have been lost.
+		(velocity + altitude-hold) rather than a bare HOVER_THRUST, and
+		roll/pitch nudged by the LateralVelocityDamper unless explicitly
+		disabled. Used throughout the takeoff handoff (PRESTREAM onward)
+		instead of _hold_trim(), so a hover_thrust guess that's
+		meaningfully wrong gets corrected starting from the moment our
+		own thrust commands take over control authority -- not several
+		seconds later, by which point real altitude (or lateral position)
+		can already have drifted.
+
+		apply_lateral_damping=False is for the attitude-offboard probe
+		specifically: that phase needs a clean, known roll value to
+		measure the actual response to, and mixing in a lateral
+		correction would contaminate that measurement. The lateral
+		damper's own step() still runs either way (just below), so its
+		internal timing stays continuous across the probe instead of
+		producing a misleadingly large dt jump immediately after it.
 		"""
 		thrust = self._damper.step(now, self._vehicle_state.vz, z=self._vehicle_state.z)
+		lateral_roll, lateral_pitch = self._lateral_damper.step(
+			now, self._vehicle_state.vx, self._vehicle_state.vy, yaw=self._vehicle_state.yaw
+		)
+
+		if apply_lateral_damping:
+			roll = roll + lateral_roll
+			pitch = pitch + lateral_pitch
+
 		return AttitudeSetpoint(
 			timestamp=getattr(self._latest_target, "timestamp", 0.0),
 			roll=roll,
