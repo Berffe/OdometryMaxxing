@@ -1,0 +1,10 @@
+# Material for flower_disc.obj. See generate_flower_texture.py for how
+# flower_disc_albedo.png was generated and why (optical-flow observability).
+newmtl flower_disc
+Ka 1.000 1.000 1.000
+Kd 1.000 1.000 1.000
+Ks 0.050 0.050 0.050
+Ns 8.0
+d 1.0
+illum 2
+map_Kd ../textures/flower_top.png

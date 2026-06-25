@@ -1,5 +1,6 @@
 # Flat disc, radius=1.000, 64 segments
 # Generated for bee_platform.sdf's platform_link top visual.
+mtllib flower_disc.mtl
 v 0.0 0.0 0.0
 vt 0.5 0.5
 vn 0.0 0.0 1.0
@@ -197,6 +198,7 @@ vt 0.997592 0.450991
 vn 0.0 0.0 1.0
 
 o flower_disc
+usemtl flower_disc
 f 1/1/1 2/2/2 3/3/3
 f 1/1/1 3/3/3 4/4/4
 f 1/1/1 4/4/4 5/5/5

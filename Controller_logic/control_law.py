@@ -89,12 +89,12 @@ class ControlLaw:
         #     the LQR k_d it produces passes through zero / flips sign across the
         #     schedule (notably ~0 at af=0.133, the descent dead-zone).
         #   damp_ratio is None -> k_d = damp_scale * (LQR k_d)  (legacy).
-        roll_prop_scale: float = 1.0,
-        roll_damp_scale: float = 1.5,
+        roll_prop_scale: float = 0.5,
+        roll_damp_scale: float = 15.0,
         roll_damp_ratio=None,           # roll already stable on LQR damping; leave as-is.
-        pitch_prop_scale: float = 0.5,
-        pitch_damp_scale: float = 5.0,
-        pitch_damp_ratio: float = 5.0,  # fills the af=0.133 damping dead-zone.
+        pitch_prop_scale: float = 0.2,
+        pitch_damp_scale: float = 10.0,
+        pitch_damp_ratio: float = 10.0,  # fills the af=0.133 damping dead-zone.
         thrust_gain_scale: float = 1.0,
 
         # --- Command limits [rad] / normalized thrust. ---

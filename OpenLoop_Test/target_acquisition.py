@@ -1,59 +1,28 @@
 """
-Lightweight target acquisition, decoupled from ROS.
+Lightweight, NN-free target acquisition, decoupled from ROS.
 
-Production path:
+	update(frame_bgr, timestamp) -> TargetEstimate
 
-	update(frame_bgr, timestamp=stamp) -> TargetEstimate
+Pipeline: blur -> HSV saliency mask | Canny edges -> morphological cleanup ->
+contour selection -> centroid -> normalized offsets + bounding box. The box is
+returned so optical_flow can restrict divergence to the target ROI;
+area_fraction (box area / frame area) is the controller's scheduling variable.
 
-The detector avoids neural networks and uses:
+Two robustness behaviors:
+  - Large detections are down-weighted, never rejected (_large_area_penalty):
+    a near-full-frame flower at touchdown is the success condition, not an
+    outlier.
+  - A short temporal hold bridges single-frame dropouts (_held_target_or_lost):
+    within loss_grace_period_sec the last good estimate is reused with confidence
+    decayed toward zero, instead of immediately reporting found=False.
 
-	BGR frame
-	↓
-	Gaussian blur
-	↓
-	HSV saliency mask
-	↓
-	Canny contrast cue
-	↓
-	morphological cleanup
-	↓
-	contour selection
-	↓
-	centroid cx, cy
-	↓
-	normalized offsets offset_x, offset_y
-	↓
-	detection_width, detection_height
+TargetEstimate.fov_saturated flags when the box touches all four image
+borders: the target's true size meets or exceeds the camera's field of
+view, not just fills it. Past that point area_fraction/detection_width/
+height are a frame-size artifact, not a measurement -- see state.py.
 
-The detection box dimensions are returned in TargetEstimate so the
-optical-flow estimator can compute divergence only on the target ROI.
-TargetEstimate also carries area_fraction (detection area / frame area),
-so the controller can tell a normally-sized detection apart from one
-that fills most of the frame.
-
-A detection that covers most or all of the image is never hard-rejected:
-at the very end of a landing approach the target *is* the flower filling
-the camera's view, and that is the success condition, not an outlier.
-Large detections are only down-weighted relative to normally-sized ones
-(see _large_area_penalty), so a well-formed full-frame contour still
-wins when nothing better-shaped competes with it.
-
-A short temporal hold also bridges single-frame detection dropouts
-(motion blur, a shadow, a momentary mask gap): if no contour is found
-within `loss_grace_period_sec` of the last detection, the last known
-TargetEstimate is reused with its confidence decayed toward zero instead
-of immediately reporting found=False.
-
-Debug path:
-
-	python -m bee_control.target_acquisition
-
-or:
-
-	python target_acquisition.py
-
-When run as a script, this file imports target_acquisition_debug.py and
-starts the visual test.
+Run `python target_acquisition.py` (or `-m bee_control.target_acquisition`) to
+launch the visual debug test.
 """
 
 from typing import Optional, Sequence, Tuple
@@ -86,6 +55,7 @@ class TargetAcquisition:
 		canny_low: int = 60,
 		canny_high: int = 140,
 		loss_grace_period_sec: float = 0.15,
+		fov_saturation_margin_px: int = 2,
 	):
 		self._hsv_ranges = list(hsv_ranges) if hsv_ranges is not None else None
 
@@ -109,6 +79,7 @@ class TargetAcquisition:
 		self._loss_grace_period_sec = float(loss_grace_period_sec)
 		self._last_found_target: Optional[TargetEstimate] = None
 		self._last_found_time: Optional[float] = None
+		self._fov_saturation_margin_px = max(0, int(fov_saturation_margin_px))
 
 	def update(
 		self,
@@ -226,17 +197,10 @@ class TargetAcquisition:
 
 	def _held_target_or_lost(self, timestamp: float) -> TargetEstimate:
 		"""
-		Bridge brief detection dropouts instead of immediately reporting
-		the target as lost.
-
-		A single bad frame (motion blur, a shadow crossing the flower, a
-		momentary mask gap) should not flip `found` to False, especially
-		in the last seconds of the approach where the controller is
-		actively descending on the assumption a target is present. While
-		inside the grace period, the last known-good estimate is reused
-		with its timestamp updated and its confidence linearly decayed
-		toward zero, so downstream consumers (control law, diagnostics)
-		can tell the estimate is aging rather than freshly detected.
+		Bridge brief detection dropouts. Within loss_grace_period_sec of the
+		last good detection, reuse it with confidence linearly decayed toward
+		zero (decay = 1 - elapsed/grace), so downstream consumers can tell the
+		estimate is aging rather than freshly detected. Otherwise report lost.
 		"""
 		if (
 			self._loss_grace_period_sec > 0.0
@@ -404,6 +368,7 @@ class TargetAcquisition:
 		_, _, detection_width, detection_height = cv2.boundingRect(contour)
 
 		confidence = self._estimate_confidence(contour, area_fraction)
+		fov_saturated = self._is_fov_saturated(contour, width, height)
 
 		return TargetEstimate(
 			timestamp=timestamp,
@@ -414,19 +379,15 @@ class TargetAcquisition:
 			detection_width=float(detection_width),
 			detection_height=float(detection_height),
 			area_fraction=float(area_fraction),
+			fov_saturated=fov_saturated,
 		)
 
 	def _large_area_penalty(self, area_fraction: float) -> float:
 		"""
-		Down-weight, but never reject, contours that cover a large
-		fraction of the frame.
-
-		At the very end of a landing approach the target (the flower) is
-		expected to fill most or all of the image — that is the success
-		condition, not an outlier to discard. The penalty ramps from 1.0
-		at `max_area_fraction` down to `min_large_area_penalty` at
-		`absolute_max_area_fraction`, then holds at that floor all the
-		way to full-frame coverage instead of continuing to fall to zero.
+		Down-weight (never reject) contours covering a large frame fraction; a
+		full-frame flower at touchdown is the success condition. The penalty
+		ramps linearly 1.0 -> min_large_area_penalty as area_fraction goes from
+		max_area_fraction to absolute_max_area_fraction, then holds at that floor.
 		"""
 		if area_fraction <= self._max_area_fraction:
 			return 1.0
@@ -440,6 +401,24 @@ class TargetAcquisition:
 		ratio = max(0.0, min(1.0, ratio))
 
 		return 1.0 - (1.0 - self._min_large_area_penalty) * ratio
+
+	def _is_fov_saturated(self, contour, width: int, height: int) -> bool:
+		"""
+		True if the contour's bounding box touches all four image borders
+		(within fov_saturation_margin_px) -- the true target's projected size
+		meets or exceeds the camera's field of view, not just fills it.
+		cv2.boundingRect cannot report a box larger than the image array, so
+		area_fraction/detection_width/height stop tracking true range past
+		this point, regardless of how much closer the target actually gets.
+		"""
+		x, y, w, h = cv2.boundingRect(contour)
+		m = self._fov_saturation_margin_px
+		return (
+			x <= m
+			and y <= m
+			and (x + w) >= width - m
+			and (y + h) >= height - m
+		)
 
 	@staticmethod
 	def _estimate_confidence(contour, area_fraction: float) -> float:

@@ -71,6 +71,8 @@ class DiagnosticsWriter:
 
 		self._t0 = None
 		self._row_count = 0
+		self._run_status = "ok"
+		self._finalized = False
 
 	def write(
 		self,
@@ -133,6 +135,7 @@ class DiagnosticsWriter:
 			"target_area_fraction": self._safe_float(
 				getattr(target, "area_fraction", 0.0)
 			),
+			"target_fov_saturated": self._safe_bool(getattr(target, "fov_saturated", False)),
 
 			# --------------------------------------------------------
 			# Optical flow
@@ -202,10 +205,36 @@ class DiagnosticsWriter:
 		if self._flush_every_row:
 			self._file.flush()
 
+	def set_run_status(self, status: str):
+		"""
+		Tag the run's outcome ("ok", "aborted", "settle_timeout",
+		"op_point_drift", ...). On close(), the status is appended to the
+		filename (calibration_..._<status>.csv) so failed runs are obvious
+		and stay out of the fit by default -- glob '*_ok.csv' or pass
+		fit_axis_models.py --exclude <status>. Only the first non-"ok"
+		status sticks, so the original abort reason is not overwritten.
+		"""
+		clean = "".join(c if c.isalnum() else "_" for c in str(status)).strip("_") or "ok"
+		if self._run_status == "ok":
+			self._run_status = clean
+
 	def close(self):
+		"""Flush, close, and rename the file to embed the run status."""
+		if self._finalized:
+			return
+		self._finalized = True
+
 		if not self._file.closed:
 			self._file.flush()
 			self._file.close()
+
+		stem, ext = os.path.splitext(self.filepath)
+		tagged = f"{stem}_{self._run_status}{ext}"
+		try:
+			os.replace(self.filepath, tagged)
+			self.filepath = tagged
+		except OSError:
+			pass  # best-effort: keep the original name if rename fails
 
 	def row_count(self) -> int:
 		return self._row_count
@@ -263,6 +292,7 @@ class DiagnosticsWriter:
 			"target_detection_width_px",
 			"target_detection_height_px",
 			"target_area_fraction",
+			"target_fov_saturated",
 
 			# Optical flow
 			"flow_timestamp_sec",

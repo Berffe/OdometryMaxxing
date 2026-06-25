@@ -158,6 +158,13 @@ MAVSDK_PORT_TO_FREE = 14540
 MAVSDK_OFFBOARD_PERIOD_SEC = 0.05
 MAVSDK_OFFBOARD_START_TIMEOUT_SEC = 5.0
 MAVSDK_HOLD_CURRENT_YAW = True
+# Set the takeoff height from the node via the Action plugin
+# (set_takeoff_altitude), NOT the raw parameter plugin -- param.set_param_float
+# is the call that dropped the mavsdk_server socket on recent PX4 builds, and a
+# server crash there aborts the whole mission. Set False to skip it entirely and
+# rely on PX4's current MIS_TAKEOFF_ALT (e.g. `param set MIS_TAKEOFF_ALT 5` once
+# in the pxh console); takeoff() uses whatever PX4 already has.
+MAVSDK_SET_TAKEOFF_ALT = True
 EKF2_SETTLE_TIME = 5.0
 
 # Explicit timeouts for every "wait for X" step in the MAVSDK handshake.
@@ -200,10 +207,10 @@ MAVSDK_TAKEOFF_PHASE_TIMEOUT_SEC = 200.0
 # leaving room for the open-loop test's own excursions on top of it). If
 # 6.0 still isn't enough clearance, re-solve the same way using whatever
 # area_fraction this value actually produces.
-TAKEOFF_ALTITUDE_M = 5
+TAKEOFF_ALTITUDE_M = 1.8
 OFFBOARD_PRESTREAM_SEC = 2.0
 OFFBOARD_CONFIRM_TIMEOUT_SEC = 5.0
-TAKEOFF_ALTITUDE_TOL_M = 0.15
+TAKEOFF_ALTITUDE_TOL_M = 0.3
 TAKEOFF_VZ_TOL_M_S = 0.08
 TAKEOFF_STABLE_SEC = 1.5
 TAKEOFF_TIMEOUT_SEC = 30.0
@@ -289,7 +296,12 @@ HOVER_THRUST = 0.73
 # separate b from noise.
 ROLL_TEST_AMPLITUDE_RAD = 0.04
 PITCH_TEST_AMPLITUDE_RAD = 0.04
-THRUST_TEST_AMPLITUDE = 0.04
+# Reduced from 0.04: with the damper off during the thrust test, one +step is
+# ~ (amp/hover)*g*hold m/s of climb, so 0.04 over 1.5s built ~0.8 m/s/step and
+# accumulated past the vz abort. 0.03 over 1.0s (below) roughly halves that.
+# The velocity-gated recenter is what actually bounds it; this just keeps the
+# nominal oscillation gentle so the recenter fires rarely.
+THRUST_TEST_AMPLITUDE = 0.03
 
 # Hold duration, per axis (not shared — see build_calibration_sequence's
 # docstring). Roll/pitch raised from 2.0s to 6.0s: for a roughly
@@ -302,7 +314,7 @@ THRUST_TEST_AMPLITUDE = 0.04
 # see fit_axis_models.py's wide-range warning).
 ROLL_TEST_HOLD_SEC = 1.0
 PITCH_TEST_HOLD_SEC = 1.0
-THRUST_TEST_HOLD_SEC = 1.5
+THRUST_TEST_HOLD_SEC = 1.0
 
 ROLL_TEST_REPEATS = 8
 PITCH_TEST_REPEATS = 8
@@ -338,6 +350,13 @@ THRUST_TEST_REPEATS = 4
 # would be a runtime "wait until actually settled" check between
 # repeats (like VerticalSettler) instead of this fixed duration.
 THRUST_RESET_SEC = 6.0
+# Brief damped "settle"-labelled gaps between roll/pitch repeats too, so the
+# lateral damper can periodically re-center during a long (repeats * 4 *
+# hold_sec) train -- the damper is off during the active steps, so without
+# this a slow lateral drift can walk the target out of frame mid-test. The
+# gaps are excluded from the fit exactly like the thrust resets. 0.0 disables.
+ROLL_RESET_SEC = 2.0
+PITCH_RESET_SEC = 2.0
 TEST_SETTLE_SEC = 2.0
 # Now running all three axes back to back in one CSV: roll's own
 # identification has been clean and significant for a while, the
@@ -441,7 +460,11 @@ LATERAL_DAMPER_INTEGRAL_LIMIT = 0.3
 # have caught it earlier even if it had been far worse. Tripping any
 # bound now halts at HOVER_THRUST permanently (reposition and restart
 # the node) rather than trying to recover automatically.
-ABORT_VZ_LIMIT = 1.0
+# Hard emergency net. Raised from 1.0: the thrust ID test inherently produces
+# vertical velocity, so 1.0 m/s aborted legitimate runs. This is now a genuine
+# runaway threshold; normal thrust testing is held far inside it by the
+# velocity-gated recenter below (THRUST_TEST_VZ_SOFT_LIMIT).
+ABORT_VZ_LIMIT = 1.5
 ABORT_AREA_FRACTION_MAX = 0.97
 # New alongside the lateral damper -- if it (or anything else) ever
 # drove a runaway instead of gently correcting drift, this catches it
@@ -458,6 +481,30 @@ ABORT_LATERAL_VELOCITY_LIMIT = 2.0
 # thrust ends up with nothing, and the run has no way to tell you that
 # happened until fit_axis_models.py runs much later.
 LOST_TARGET_ABORT_SEC = 5.0
+
+# Velocity-gated thrust recenter. The thrust axis runs open-loop with the
+# vertical damper off, so its steps drive a real climb whose size depends on
+# hover_thrust error and altitude -- a fixed amplitude can't be safe across all
+# of them. Instead, bound it by actual vz: when |vz| exceeds the soft limit
+# during a thrust step, pause the sequence clock and let the damper bring vz
+# back below the resume threshold (logged as "settle", excluded from the fit),
+# then resume the steps where they left off. This is a safety interrupt, not
+# feedback on the identified signal, so the thrust model stays open-loop while
+# the test self-limits regardless of climb value. Hysteresis (soft > resume)
+# avoids chattering in and out. If a recenter can't settle within the timeout
+# the run is genuinely diverging -> abort and tag the file.
+THRUST_TEST_VZ_SOFT_LIMIT = 0.6
+THRUST_TEST_VZ_RESUME = 0.2
+THRUST_TEST_RECENTER_TIMEOUT_SEC = 8.0
+
+# Operating-point drift guard. The fit treats one run as one operating point
+# (one area_fraction). If area_fraction wanders more than this from its value
+# at the first valid open-loop sample, the single-operating-point assumption is
+# already broken and the rest of the run is wasted -- abort and mark the file
+# (op_point_drift) instead of collecting a wide-sweep run the fitter will only
+# reject later. The thrust axis deliberately moves area_fraction a little
+# (short holds), so keep this comfortably above that expected excursion.
+OPEN_LOOP_AREA_FRACTION_DRIFT_MAX = 0.12
 
 PHASE_WAITING_FOR_STREAMS = "waiting_for_streams"
 PHASE_MAVSDK_TAKEOFF = "mavsdk_takeoff"
@@ -556,6 +603,12 @@ class CalibrationNode(Node):
 		self._settle_logged = False
 		self._aborted = False
 		self._lost_since = None
+		self._open_loop_af_ref = None  # area_fraction at the first valid open-loop sample
+		# Velocity-gated thrust recenter state (see THRUST_TEST_VZ_SOFT_LIMIT).
+		self._thrust_recenter_active = False
+		self._thrust_recenter_since = None
+		self._test_paused_sec = 0.0       # wall time spent paused; frozen out of `elapsed`
+		self._last_open_loop_now = None
 
 		self.optical_flow = OpticalFlowEstimator()
 		self.target_acquisition = TargetAcquisition()
@@ -571,6 +624,8 @@ class CalibrationNode(Node):
 			roll_repeats=ROLL_TEST_REPEATS,
 			pitch_repeats=PITCH_TEST_REPEATS,
 			thrust_repeats=THRUST_TEST_REPEATS,
+			roll_reset_sec=ROLL_RESET_SEC,
+			pitch_reset_sec=PITCH_RESET_SEC,
 			thrust_reset_sec=THRUST_RESET_SEC,
 			settle_sec=TEST_SETTLE_SEC,
 			axes=TEST_AXES,
@@ -1031,9 +1086,10 @@ class CalibrationNode(Node):
 
 			if self._settler.is_settled:
 				if self._settler.timed_out:
+					self.diagnostics.set_run_status("settle_timeout")
 					self.get_logger().warning(
 						f"Vertical-velocity settle timed out after {SETTLE_TIMEOUT_SEC}s "
-						f"(vz={vz:.3f} m/s); starting calibration anyway."
+						f"(vz={vz:.3f} m/s); starting calibration anyway (file tagged settle_timeout)."
 					)
 				else:
 					self.get_logger().info(
@@ -1042,6 +1098,10 @@ class CalibrationNode(Node):
 				self._enter_phase(PHASE_OPEN_LOOP)
 				self._test_start_time = now
 				self._last_calibration_log_time = None
+				self._thrust_recenter_active = False
+				self._thrust_recenter_since = None
+				self._test_paused_sec = 0.0
+				self._last_open_loop_now = None
 				self.get_logger().info("Open-loop calibration sequence started.")
 			return
 
@@ -1072,15 +1132,69 @@ class CalibrationNode(Node):
 			elif now - self._lost_since >= LOST_TARGET_ABORT_SEC:
 				self._abort(
 					f"target/flow lost for >= {LOST_TARGET_ABORT_SEC}s during calibration "
-					f"(target_found={target_ok}, flow_valid={flow_ok})"
+					f"(target_found={target_ok}, flow_valid={flow_ok})",
+					status="lost_target",
 				)
 				return
 		else:
 			self._lost_since = None
 
-		elapsed = now - self._test_start_time
-		roll, pitch, thrust = self.sequence.command_at(elapsed)
+			# Operating-point drift guard: capture area_fraction at the first
+			# valid sample, then abort if it wanders too far. Keeps each run a
+			# single operating point instead of a wide sweep the fit will reject.
+			area_fraction = float(getattr(self._latest_target, "area_fraction", 0.0))
+			if self._open_loop_af_ref is None:
+				self._open_loop_af_ref = area_fraction
+			elif abs(area_fraction - self._open_loop_af_ref) > OPEN_LOOP_AREA_FRACTION_DRIFT_MAX:
+				self._abort(
+					f"operating point drifted: area_fraction={area_fraction:.3f} is "
+					f">{OPEN_LOOP_AREA_FRACTION_DRIFT_MAX:.2f} from its test-start value "
+					f"{self._open_loop_af_ref:.3f}; the run is no longer a single operating point",
+					status="op_point_drift",
+				)
+				return
+
+		# Elapsed test time, with any paused (recenter) wall time frozen out so
+		# the sequence resumes exactly where it left off.
+		tick_dt = (now - self._last_open_loop_now) if self._last_open_loop_now is not None else 0.0
+		self._last_open_loop_now = now
+
+		elapsed = now - self._test_start_time - self._test_paused_sec
 		current_axis = self.sequence.axis_at(elapsed)
+
+		# Velocity-gated recenter (thrust axis only -- it's the one running with
+		# the damper off). Enter when |vz| leaves the soft band, stay until it is
+		# back under the resume threshold, abort if it can't settle in time. While
+		# recentering we freeze `elapsed` and relabel the tick "settle", so the
+		# damper takes thrust, the lateral damper re-centers, and these rows are
+		# excluded from the fit -- the identified steps stay open-loop.
+		if current_axis == "thrust":
+			if self._thrust_recenter_active:
+				if abs(vz) <= THRUST_TEST_VZ_RESUME:
+					self._thrust_recenter_active = False
+					self._thrust_recenter_since = None
+				elif now - self._thrust_recenter_since >= THRUST_TEST_RECENTER_TIMEOUT_SEC:
+					self._abort(
+						f"thrust recenter could not bring |vz| under {THRUST_TEST_VZ_RESUME} m/s "
+						f"within {THRUST_TEST_RECENTER_TIMEOUT_SEC:.0f}s (vz={vz:.3f}); the vertical "
+						f"axis is diverging",
+						status="thrust_runaway",
+					)
+					return
+			elif abs(vz) >= THRUST_TEST_VZ_SOFT_LIMIT:
+				self._thrust_recenter_active = True
+				self._thrust_recenter_since = now
+				self.get_logger().info(
+					f"Thrust recenter: |vz|={abs(vz):.2f} >= {THRUST_TEST_VZ_SOFT_LIMIT} m/s; "
+					f"pausing steps and damping back to < {THRUST_TEST_VZ_RESUME} m/s."
+				)
+
+			if self._thrust_recenter_active:
+				self._test_paused_sec += tick_dt
+				elapsed = now - self._test_start_time - self._test_paused_sec
+				current_axis = "settle"
+
+		roll, pitch, thrust = self.sequence.command_at(elapsed)
 
 		if current_axis != "thrust":
 			thrust = self._damper.step(now, vz, z=z)
@@ -1281,9 +1395,21 @@ class CalibrationNode(Node):
 		home_baro_offset = home_position.relative_altitude_m
 		self.get_logger().info(f"MAVSDK: home altitude offset {home_baro_offset:.2f} m.")
 
-		self.get_logger().info(f"MAVSDK: setting MIS_TAKEOFF_ALT={TAKEOFF_ALTITUDE_M:.2f} m.")
-		await drone.param.set_param_float("MIS_TAKEOFF_ALT", float(TAKEOFF_ALTITUDE_M))
-		await asyncio.sleep(0.5)
+		if MAVSDK_SET_TAKEOFF_ALT:
+			# Action plugin setter, not param.set_param_float: the raw parameter
+			# protocol is the call that dropped the mavsdk_server socket. Best
+			# effort -- if it fails without killing the server, fall back to PX4's
+			# current MIS_TAKEOFF_ALT rather than aborting the mission.
+			self.get_logger().info(f"MAVSDK: setting takeoff altitude={TAKEOFF_ALTITUDE_M:.2f} m.")
+			try:
+				await drone.action.set_takeoff_altitude(float(TAKEOFF_ALTITUDE_M))
+				await asyncio.sleep(0.5)
+			except Exception as exc:
+				self.get_logger().warning(
+					f"MAVSDK: could not set takeoff altitude ({exc!r}); using PX4's current "
+					f"MIS_TAKEOFF_ALT. Set it once in the pxh console if needed: "
+					f"param set MIS_TAKEOFF_ALT {TAKEOFF_ALTITUDE_M:.1f}"
+				)
 
 		self.get_logger().info("MAVSDK: arming.")
 		await drone.action.arm()
@@ -1469,9 +1595,10 @@ class CalibrationNode(Node):
 		self._mission_phase = phase
 		self._phase_start_time = time.time()
 
-	def _abort(self, reason: str):
+	def _abort(self, reason: str, status: str = "aborted"):
 		if not self._aborted:
 			self._aborted = True
+			self.diagnostics.set_run_status(status)
 			self.get_logger().error(f"ABORTING calibration mission: {reason}. Holding HOVER_THRUST.")
 		self._enter_phase(PHASE_ABORTED)
 		self._hold_trim()

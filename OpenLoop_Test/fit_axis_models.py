@@ -1,68 +1,37 @@
 """
-Fit control_law.py's per-axis local model from calibration logs.
+Fit control_law.py's per-axis models from calibration logs.
 
-Each axis is modeled as e[k+1] = a*e[k] + b*u[k] (see control_law.py's
-module docstring). Given one or more diagnostics CSVs (or directories
-containing them) produced by calibration_node.py, this script recovers
-(a, b) per axis by ordinary least squares on consecutive samples, fits
-a small intercept term `c` alongside them to absorb any trim mismatch,
-and reports goodness-of-fit.
+Models (OLS on consecutive in-phase samples, with a small intercept c that
+absorbs trim mismatch):
+    scalar roll/pitch/thrust : e[k+1] = a e[k] + b u[k] + c
+    state  roll/pitch        : [offset, flow][k+1] = A [offset, flow][k] + B u[k] + c
+    visual MIMO (diagnostic) : [flow_x, flow_y] = G [roll, pitch] + c
+control_law.py uses the 2-state roll/pitch models and the scalar thrust model;
+print_controller_schedule emits exactly those, ready to paste.
 
-Usage, one operating point:
+Trust checks (R^2 alone is not enough -- when a ~ 1, e[k] predicts e[k+1] well
+even if b carries no signal): every fit reports b's standard error and
+t = b/stderr; |t| < 2 means b is not distinguishable from zero.
 
-	python fit_axis_models.py logs/calibration_20260623_140500.csv
+Data-quality selection (this is how you keep failed runs out of the model):
+    --min-altitude / --max-altitude  keep only rows in an altitude band
+                                     (altitude = -vehicle_z_m); a file that
+                                     swept altitude can be narrowed to a good band.
+    --exclude SUBSTR ...             skip files whose path matches (e.g. _2m _3m).
+    (default)                        files are auto-rejected from the schedule when
+                                     area_fraction sweeps too wide, contact is
+                                     detected, or too few rows remain; --keep-flagged
+                                     includes them anyway, --keep-contact keeps
+                                     contact windows.
 
-Usage, a whole folder of calibration runs (every *.csv inside it):
+Usage:
+    python fit_axis_models.py logs/                       # a folder of runs
+    python fit_axis_models.py logs/ --exclude _2m _3m     # drop known-bad runs
+    python fit_axis_models.py logs/ --min-altitude 2.5 --max-altitude 3.5
 
-	python fit_axis_models.py logs/
-
-Mixing files and folders, and several folders, both work too:
-
-	python fit_axis_models.py logs/batch1 logs/batch2 logs/extra_run.csv
-
-Given 2+ files (however they were specified), this additionally checks
-the assumed b(area_fraction) ~ sqrt(area_fraction) scaling and prints a
-ready-to-use schedule.
-
-R^2 is not enough on its own to trust b. When a is near 1 (as it
-usually is for these axes — see the project notes on why), e[k] alone
-already predicts e[k+1] well, so R^2 can look high even when b carries
-no real signal at all. To catch that, every AxisFit also reports b's
-standard error and a t-statistic (b / stderr); |t| < 2 means b is not
-reliably distinguishable from zero given this data's noise, regardless
-of how good R^2 looks, and gets flagged the same way a low R^2 does.
-
-This script also flags two other things that silently corrupt a fit
-and are easy to miss by eye:
-
-	- A single calibration file is only valid evidence about one
-	  operating point if area_fraction actually stayed put during the
-	  run. If it swept a wide range instead (most commonly because
-	  hover_thrust used in calibration_node.py wasn't quite right, so
-	  the "neutral" segments between test steps weren't actually
-	  neutral, or because of a genuine ground/platform contact event),
-	  the fit is describing a blend of operating points, not the one
-	  point's area_fraction mean suggests.
-	- Possible ground/platform contact: vehicle_vz_m_s pinned near zero
-	  for a sustained stretch while command_thrust is clearly varying
-	  is not something free flight produces — it means something
-	  external (the ground, the platform) is absorbing the thrust
-	  command's effect. Any samples after that point describe contact
-	  dynamics, not the free-flight model this script fits.
-
-Plots (written to --output-dir, default fit_axis_output):
-
-	- <csv_stem>_area_fraction.png   one per file: area_fraction (and
-	  vehicle_z_m on a second axis) over time, to visually confirm the
-	  operating point actually held steady, and to see any contact
-	  event directly (z stops changing while the test keeps running).
-	- b_vs_area_fraction.png         only when 2+ files are given: the
-	  fitted b for each axis against area_fraction, with the assumed
-	  sqrt(area_fraction) curve overlaid, so the scaling check from the
-	  printed table is also something you can actually look at.
-
-This script needs matplotlib/numpy for the analysis and plots, but not
-rclpy — it only reads the CSV that diagnostics_writer.py already produces.
+Plots (--output-dir, default fit_axis_output): per-file area_fraction (+vehicle_z)
+over time to confirm a steady operating point and spot contact; b_vs_area_fraction
+when 2+ files are kept. Needs numpy/matplotlib, not rclpy.
 """
 
 import argparse
@@ -285,6 +254,130 @@ def _safe_float(value: Optional[str]) -> Optional[float]:
 		return float(value)
 	except ValueError:
 		return None
+
+
+class RowFilter:
+	"""
+	Row-level data-quality gate applied before any fit.
+
+	Altitude is taken from vehicle_z_m (NED, so altitude_m = -z). Rows
+	outside [min_altitude_m, max_altitude_m] are dropped, which is how you
+	exclude a bad operating point (e.g. a 2 m / 3 m run that failed) without
+	deleting files. drop_contact removes the longest detected ground/contact
+	window. Dropping rows is safe for the consecutive-pair fitters: a removed
+	row just opens a time gap, which the dt-tolerance check already rejects.
+	"""
+
+	def __init__(
+		self,
+		min_altitude_m: Optional[float] = None,
+		max_altitude_m: Optional[float] = None,
+		drop_contact: bool = True,
+	):
+		self.min_altitude_m = min_altitude_m
+		self.max_altitude_m = max_altitude_m
+		self.drop_contact = drop_contact
+
+	def is_active(self) -> bool:
+		return (
+			self.min_altitude_m is not None
+			or self.max_altitude_m is not None
+			or self.drop_contact
+		)
+
+
+def _altitude_m(row: Dict[str, str]) -> Optional[float]:
+	"""Altitude above start in meters (NED: altitude = -vehicle_z_m)."""
+	z = _safe_float(row.get("vehicle_z_m"))
+	return None if z is None else -z
+
+
+def apply_row_filter(rows: List[Dict[str, str]], row_filter: Optional[RowFilter]) -> List[Dict[str, str]]:
+	"""Return the subset of rows passing the altitude band and contact gate."""
+	if row_filter is None or not row_filter.is_active():
+		return rows
+
+	contact_span = detect_possible_contact(rows) if row_filter.drop_contact else None
+
+	kept = []
+	for row in rows:
+		if contact_span is not None:
+			t = _safe_float(row.get("t_sec"))
+			if t is not None and contact_span[0] <= t <= contact_span[1]:
+				continue
+
+		if row_filter.min_altitude_m is not None or row_filter.max_altitude_m is not None:
+			alt = _altitude_m(row)
+			if alt is None:
+				continue
+			if row_filter.min_altitude_m is not None and alt < row_filter.min_altitude_m:
+				continue
+			if row_filter.max_altitude_m is not None and alt > row_filter.max_altitude_m:
+				continue
+
+		kept.append(row)
+
+	return kept
+
+
+def assess_file_quality(
+	rows: List[Dict[str, str]],
+	max_area_fraction_span: float = 0.15,
+	min_found_rows: int = 20,
+	max_fov_saturated_fraction: float = 0.10,
+) -> Tuple[bool, List[str]]:
+	"""
+	Decide whether a (already filtered) file is trustworthy calibration data.
+
+	Returns (ok, reasons). A file is rejected when its area_fraction still
+	sweeps wider than max_area_fraction_span (it is not one operating point),
+	when ground/platform contact is detected, when too few found rows remain
+	to fit, or when most found rows have target_fov_saturated=True.
+
+	fov_saturated is a DIFFERENT failure than a wide area_fraction span, and
+	the latter cannot catch it: once the target's true size exceeds the
+	camera's field of view, area_fraction/detection_width/height are clamped
+	at the image's own pixel dimensions and stop tracking true range, so a
+	saturated run can show a deceptively TIGHT area_fraction span (everything
+	pinned at the same clamped value) while the true altitude varies
+	substantially underneath -- exactly the case a span-only check would
+	wrongly pass as "one clean operating point." Needs the
+	target_fov_saturated column (diagnostics_writer.py); older CSVs without
+	it skip this check.
+
+	Rejected files are excluded from the cross-file schedule unless
+	--keep-flagged is passed.
+	"""
+	reasons = []
+
+	found = [r for r in rows if row_is_found(r)]
+	if len(found) < min_found_rows:
+		reasons.append(f"only {len(found)} found rows (< {min_found_rows})")
+
+	stats = area_fraction_stats(rows)
+	if stats is not None:
+		lo, _, hi = stats
+		if hi - lo > max_area_fraction_span:
+			reasons.append(
+				f"area_fraction span {hi - lo:.3f} > {max_area_fraction_span:.2f} "
+				"(not a single operating point)"
+			)
+
+	if found and "target_fov_saturated" in found[0]:
+		saturated = sum(1 for r in found if r.get("target_fov_saturated", "0") == "1")
+		frac = saturated / len(found)
+		if frac > max_fov_saturated_fraction:
+			reasons.append(
+				f"{frac*100:.0f}% of found rows have fov_saturated=True -- the target "
+				"exceeds the camera's field of view here; area_fraction/detection box "
+				"are a frame-size artifact, not a measurement, regardless of how tight "
+				"the area_fraction span looks"
+			)
+
+	if detect_possible_contact(rows) is not None:
+		reasons.append("ground/platform contact detected")
+
+	return (len(reasons) == 0, reasons)
 
 
 def build_pairs(
@@ -745,6 +838,64 @@ def row_is_found(row: Dict[str, str]) -> bool:
 	return row.get("target_found", "0") == "1"
 
 
+def divergence_motion_report(
+	rows: List[Dict[str, str]], min_samples: int = 15, min_vz_std: float = 0.03
+) -> Optional[Dict[str, float]]:
+	"""
+	Check whether optical-flow divergence still tracks vertical motion.
+
+	Physics: for a downward camera approaching a surface, divergence is the
+	inverse time-to-contact,  D ~ vz / altitude  (NED: vz > 0 = descending =
+	image expanding = D > 0). So D should correlate with vz, and more tightly
+	with vz/altitude. The thrust loop's only observable is D, so this is the
+	number that says whether thrust control has anything to act on.
+
+	The correlation is expected to collapse in the terminal phase: once the
+	target fills the frame, dense flow loses the texture spread needed to see
+	the focus of expansion, and the median over a mostly-gradient-free ROI
+	washes the signal out. This makes that failure visible per operating point
+	instead of surfacing later as an insignificant thrust b.
+
+	Returns None if there is too little vertical motion to judge.
+	"""
+	D, vz, vz_over_alt = [], [], []
+	for row in rows:
+		if str(row.get("flow_valid", "0")).strip() not in ("1", "True", "true"):
+			continue
+		d = _safe_float(row.get("flow_raw_divergence_1_s"))
+		if d is None:
+			d = _safe_float(row.get("flow_divergence_1_s"))
+		v = _safe_float(row.get("vehicle_vz_m_s"))
+		if d is None or v is None:
+			continue
+		D.append(d)
+		vz.append(v)
+		z = _safe_float(row.get("vehicle_z_m"))
+		alt = None if z is None else -z
+		vz_over_alt.append(v / alt if (alt is not None and abs(alt) > 1e-3) else np.nan)
+
+	D, vz, vz_over_alt = np.array(D), np.array(vz), np.array(vz_over_alt)
+	if len(D) < min_samples or np.std(vz) < min_vz_std:
+		return None
+
+	corr_vz = float(np.corrcoef(D, vz)[0, 1])
+	mask = np.isfinite(vz_over_alt)
+	if mask.sum() > min_samples and np.std(vz_over_alt[mask]) > 1e-6 and np.std(D[mask]) > 1e-9:
+		corr_vz_over_alt = float(np.corrcoef(D[mask], vz_over_alt[mask])[0, 1])
+	else:
+		corr_vz_over_alt = float("nan")
+	slope = float(np.polyfit(vz, D, 1)[0]) if np.std(vz) > 1e-9 else float("nan")
+
+	return {
+		"n": len(D),
+		"corr_vz": corr_vz,
+		"corr_vz_over_alt": corr_vz_over_alt,
+		"slope_D_per_vz": slope,
+		"vz_std": float(np.std(vz)),
+		"D_std": float(np.std(D)),
+	}
+
+
 def detect_possible_contact(
 	rows: List[Dict[str, str]],
 	vz_threshold: float = 0.015,
@@ -886,11 +1037,15 @@ def plot_area_fraction_over_time(rows: List[Dict[str, str]], csv_path: str, outp
 
 
 def analyze_file(
-	path: str, dt_nominal: float, dt_tolerance: float, output_dir: str
-) -> Tuple[Dict[str, Optional[AxisFit]], Optional[Tuple[float, float, float]]]:
-	rows = read_csv_rows(path)
+	path: str, dt_nominal: float, dt_tolerance: float, output_dir: str,
+	row_filter: Optional[RowFilter] = None, max_area_fraction_span: float = 0.15,
+) -> Tuple[Dict[str, Optional[AxisFit]], Optional[Tuple[float, float, float]], bool, List[str]]:
+	raw_rows = read_csv_rows(path)
+	rows = apply_row_filter(raw_rows, row_filter)
 
-	print(f"\n{path}  ({len(rows)} rows)")
+	print(f"\n{path}  ({len(raw_rows)} rows)")
+	if len(rows) != len(raw_rows):
+		print(f"  row filter kept {len(rows)}/{len(raw_rows)} rows (altitude band / contact removed)")
 
 	has_axis_column = bool(rows) and "calibration_axis" in rows[0] and any(
 		row.get("calibration_axis") for row in rows
@@ -921,6 +1076,18 @@ def analyze_file(
 		else:
 			print("  area_fraction: no valid (found) rows in this file")
 
+	found_rows = [r for r in rows if row_is_found(r)]
+	if found_rows and "target_fov_saturated" in found_rows[0]:
+		sat_frac = sum(1 for r in found_rows if r.get("target_fov_saturated", "0") == "1") / len(found_rows)
+		print(f"  fov_saturated: {sat_frac*100:.0f}% of found rows")
+		if sat_frac > 0.10:
+			print(
+				"  <- WARNING: target exceeds the camera's field of view here -- "
+				"area_fraction/detection box are clamped to the frame's own pixel "
+				"size and are not tracking true range, even where the area_fraction "
+				"span above looks tight."
+			)
+
 	contact = detect_possible_contact(rows)
 	if contact is not None:
 		start_t, end_t = contact
@@ -932,7 +1099,7 @@ def analyze_file(
 			f"thrust. Check the _area_fraction.png plot (vehicle_z_m should plateau there)."
 		)
 
-	plot_area_fraction_over_time(rows, path, output_dir)
+	plot_area_fraction_over_time(raw_rows, path, output_dir)
 
 	visual_mimo = fit_visual_mimo(rows, restrict_to_roll_pitch_axes=True)
 	if visual_mimo is None:
@@ -990,7 +1157,40 @@ def analyze_file(
 					)
 				print(f"          state {state_fit}")
 
-	return fits, stats
+	div_health = divergence_motion_report(rows)
+	if div_health is not None:
+		extra = ""
+		if div_health["corr_vz_over_alt"] == div_health["corr_vz_over_alt"]:  # not NaN
+			extra = f", corr(D, vz/alt)={div_health['corr_vz_over_alt']:+.2f}"
+		print(
+			f"  divergence vs z-motion: corr(D, vz)={div_health['corr_vz']:+.2f}{extra}  "
+			f"(n={div_health['n']}, vz_std={div_health['vz_std']:.2f} m/s)"
+		)
+		if abs(div_health["corr_vz"]) < 0.6:
+			print(
+				"    <- WARNING: divergence is weakly coupled to vertical motion here, so the "
+				"thrust loop has little real signal at this operating point. Typical once the "
+				"target fills the frame (dense flow loses the focus of expansion)."
+			)
+
+	ok, reasons = assess_file_quality(rows, max_area_fraction_span=max_area_fraction_span)
+	# A run with thrust data but a blind divergence observable would only pour
+	# noise into the thrust schedule, so flag it as well.
+	thrust_rows = sum(1 for r in rows if r.get("calibration_axis") == "thrust")
+	if div_health is not None and thrust_rows >= 10 and abs(div_health["corr_vz"]) < 0.4:
+		ok = False
+		reasons.append(
+			f"divergence not tracking vz (corr={div_health['corr_vz']:+.2f}); thrust model "
+			"is unidentifiable at this operating point"
+		)
+
+	if ok:
+		print("  verdict: OK (usable for the schedule)")
+	else:
+		print("  verdict: EXCLUDED from schedule -- " + "; ".join(reasons)
+			  + "  (override with --keep-flagged)")
+
+	return fits, stats, ok, reasons
 
 
 def collect_axis_points(
@@ -1000,7 +1200,7 @@ def collect_axis_points(
 	"""Sorted (mean_area_fraction, a, b) for every file with a valid fit+stats on this axis."""
 	points = []
 
-	for path, fits, stats in per_file_fits:
+	for path, fits, stats, *_ in per_file_fits:
 		fit = fits.get(axis)
 
 		if fit is None or stats is None:
@@ -1011,6 +1211,49 @@ def collect_axis_points(
 
 	points.sort(key=lambda p: p[0])
 	return points
+
+
+def collect_state_points(per_file_fits, axis: str):
+	"""Sorted (mean_area_fraction, AxisStateFit) for files with a valid state fit."""
+	points = []
+	for _, fits, stats, *_ in per_file_fits:
+		fit = fits.get(f"{axis}_state")
+		if fit is None or stats is None:
+			continue
+		points.append((stats[1], fit))
+	points.sort(key=lambda p: p[0])
+	return points
+
+
+def print_controller_schedule(per_file_fits):
+	"""
+	Emit schedule entries in exactly the form control_law.py consumes:
+	2-state (A, B) for roll/pitch from the [offset, flow] state fit, and
+	scalar (a, b) for thrust. Paste into ROLL_STATE_MODELS / PITCH_STATE_MODELS
+	/ THRUST_DIVERGENCE_MODELS. (The 1-state roll/pitch schedule above is only
+	a sqrt-scaling diagnostic; the controller uses these 2-state models.)
+	"""
+	print("\n--- ready-to-paste control_law.py models (kept files only) ---")
+
+	for axis, const in (("roll", "ROLL_STATE_MODELS"), ("pitch", "PITCH_STATE_MODELS")):
+		points = collect_state_points(per_file_fits, axis)
+		if not points:
+			continue
+		print(f"\n{const} = (")
+		for af, f in points:
+			print(
+				f"    ({af:.3f}, [[{f.A[0,0]:.4f}, {f.A[0,1]:.4f}], "
+				f"[{f.A[1,0]:.4f}, {f.A[1,1]:.4f}]], "
+				f"[[{f.B[0]:.5f}], [{f.B[1]:.5f}]]),"
+			)
+		print(")")
+
+	thrust_points = collect_axis_points(per_file_fits, "thrust")
+	if thrust_points:
+		print("\nTHRUST_DIVERGENCE_MODELS = (")
+		for af, a, b in thrust_points:
+			print(f"    ({af:.3f}, [[{a:.4f}]], [[{b:.4f}]]),")
+		print(")")
 
 
 def check_scaling_and_print_schedule(
@@ -1048,8 +1291,10 @@ def check_scaling_and_print_schedule(
 				else "  (large -> the sqrt model is a poor fit; use the raw schedule below instead)"
 			)
 
-		print(f"\n  Ready-to-use ScheduledLQR schedule entries for '{axis}' "
-			  f"(paste into ControlLaw's *_a/_b_ref or build a custom schedule):")
+		# 1-state schedule: a scaling diagnostic only. control_law.py uses the
+		# 2-state roll/pitch models from print_controller_schedule; for thrust
+		# the scalar entry below is the one it consumes.
+		print(f"\n  1-state {axis} schedule (diagnostic; thrust row is controller-ready):")
 		for area_fraction, a, b in points:
 			print(f"    ({area_fraction:.3f}, [[{a:.4f}]], [[{b:.4f}]], [[state_cost]], [[control_cost]]),")
 
@@ -1170,6 +1415,32 @@ def main():
 		"--recursive", action="store_true",
 		help="when a directory is given, also search its subdirectories",
 	)
+
+	# --- Data-quality selection ---
+	parser.add_argument(
+		"--min-altitude", type=float, default=None,
+		help="drop rows whose altitude (-vehicle_z_m) is below this many meters",
+	)
+	parser.add_argument(
+		"--max-altitude", type=float, default=None,
+		help="drop rows whose altitude (-vehicle_z_m) is above this many meters",
+	)
+	parser.add_argument(
+		"--keep-contact", action="store_true",
+		help="do NOT drop detected ground/platform contact windows (default: drop them)",
+	)
+	parser.add_argument(
+		"--exclude", nargs="*", default=[],
+		help="skip any CSV whose path contains one of these substrings (e.g. _2m _3m)",
+	)
+	parser.add_argument(
+		"--keep-flagged", action="store_true",
+		help="include files that fail the quality verdict in the schedule anyway",
+	)
+	parser.add_argument(
+		"--max-area-fraction-span", type=float, default=0.15,
+		help="reject a file whose area_fraction sweeps wider than this (not one operating point)",
+	)
 	args = parser.parse_args()
 
 	ensure_output_dir(args.output_dir)
@@ -1180,6 +1451,24 @@ def main():
 		print("No CSV files found from the given path(s).")
 		return
 
+	# Explicit exclusions by path substring (e.g. --exclude _2m _3m).
+	if args.exclude:
+		kept_paths = [p for p in csv_paths if not any(s in p for s in args.exclude)]
+		for p in csv_paths:
+			if p not in kept_paths:
+				print(f"Excluding (matched --exclude): {p}")
+		csv_paths = kept_paths
+
+	if not csv_paths:
+		print("All CSV files were excluded.")
+		return
+
+	row_filter = RowFilter(
+		min_altitude_m=args.min_altitude,
+		max_altitude_m=args.max_altitude,
+		drop_contact=not args.keep_contact,
+	)
+
 	if len(csv_paths) > 1:
 		print(f"Found {len(csv_paths)} CSV file(s):")
 		for path in csv_paths:
@@ -1187,16 +1476,40 @@ def main():
 
 	per_file_fits = []
 	for path in csv_paths:
-		fits, stats = analyze_file(path, args.dt, args.dt_tolerance, args.output_dir)
-		per_file_fits.append((path, fits, stats))
+		fits, stats, ok, reasons = analyze_file(
+			path, args.dt, args.dt_tolerance, args.output_dir,
+			row_filter=row_filter, max_area_fraction_span=args.max_area_fraction_span,
+		)
+		per_file_fits.append((path, fits, stats, ok, reasons))
 
-	if len(per_file_fits) > 1:
-		check_scaling_and_print_schedule(per_file_fits, args.area_fraction_ref)
-		plot_b_vs_area_fraction(per_file_fits, args.area_fraction_ref, args.output_dir)
+	# Only trustworthy files feed the cross-file schedule (unless overridden).
+	if args.keep_flagged:
+		schedule_fits = per_file_fits
+	else:
+		schedule_fits = [e for e in per_file_fits if e[3]]
 
-	aggregate_mimo = fit_visual_mimo_from_paths(csv_paths)
+	excluded = [e for e in per_file_fits if not e[3]]
+	if excluded and not args.keep_flagged:
+		print("\nExcluded from schedule (failed quality verdict):")
+		for path, _, _, _, reasons in excluded:
+			print(f"  {path}: {'; '.join(reasons)}")
+
+	if len(schedule_fits) > 1:
+		check_scaling_and_print_schedule(schedule_fits, args.area_fraction_ref)
+		plot_b_vs_area_fraction(schedule_fits, args.area_fraction_ref, args.output_dir)
+		print_controller_schedule(schedule_fits)
+	elif len(schedule_fits) <= 1:
+		print("\nNeed 2+ kept files for a schedule; "
+			  f"{len(schedule_fits)} passed the quality verdict.")
+
+	# Aggregate MIMO uses the same row filter and only the kept files.
+	kept_paths = [e[0] for e in schedule_fits] or [e[0] for e in per_file_fits]
+	all_rows: List[Dict[str, str]] = []
+	for p in kept_paths:
+		all_rows.extend(apply_row_filter(read_csv_rows(p), row_filter))
+	aggregate_mimo = fit_visual_mimo(all_rows, restrict_to_roll_pitch_axes=True)
 	if aggregate_mimo is not None:
-		print("\n--- aggregate visual MIMO flow model over all supplied CSVs ---")
+		print("\n--- aggregate visual MIMO flow model over kept CSVs ---")
 		if aggregate_mimo.input_cols == ("command_roll_rad", "command_pitch_rad"):
 			print(
 				"  using commanded attitude because actual vehicle_roll_rad/"

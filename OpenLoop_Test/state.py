@@ -1,11 +1,6 @@
 """
-Shared data containers passed between bee_node.py and the algorithm
-modules (optical_flow.py, target_acquisition.py, control_law.py,
-px4_interface.py).
-
-Keeping these as plain dataclasses (no ROS message types) means every
-module downstream of bee_node.py can be imported and unit-tested without
-rclpy being initialized.
+Shared, ROS-free data containers passed between bee_node.py and the algorithm
+modules, so the vision/control code can be imported and tested without rclpy.
 """
 
 from dataclasses import dataclass
@@ -13,11 +8,10 @@ from dataclasses import dataclass
 
 @dataclass
 class VehicleState:
-	"""Latest PX4 state estimates used only for diagnostics/identification.
+	"""PX4 local-position estimate (NED), for diagnostics/handoff only.
 
-	Position and velocity come from VehicleLocalPosition. roll/pitch and
-	attitude_yaw come from VehicleAttitude or VehicleOdometry when one of those topics is available.
-	PX4 local position uses NED convention, so vz > 0 means descending.
+	NED sign convention: z grows more negative when climbing, vz > 0 = descending.
+	Not used by the control law after visual handoff.
 	"""
 
 	# Local-position timestamp, normalized by DiagnosticsWriter when logged.
@@ -40,31 +34,34 @@ class VehicleState:
 
 @dataclass
 class FlowResult:
-	"""
-	Output of OpticalFlowEstimator.update().
+	"""Output of OpticalFlowEstimator.update().
 
-	mean_flow_x/mean_flow_y are kept in px/s for easy camera debugging.
-	mean_flow_x_norm/mean_flow_y_norm are the same image velocity in
-	normalized image coordinates per second, matching TargetEstimate's
-	offset_x/offset_y convention in [-1, 1]. Use the normalized values for
-	control and identification whenever possible.
+	Control inputs (used by control_law.py):
+	    mean_flow_x_norm / mean_flow_y_norm : normalized image velocity [1/s], in
+	        the same convention as TargetEstimate.offset_x/y. Closed-loop control
+	        uses these because the identified models have state [offset, flow_norm].
+	    divergence : filtered divergence [1/s], used by the thrust loop.
 
-	divergence is the filtered scalar used by the controller; raw_divergence
-	is logged separately for identification because filtering adds phase lag.
-
-	The ROI fields record where the optical-flow calculation was performed.
-	They are useful when a bad fit is actually caused by a changing or
-	clipped target box rather than by dynamics.
+	Debug / log-only:
+	    mean_flow_x / mean_flow_y : same velocity in px/s, kept for camera
+	        debugging and logging. Relation: *_norm = *_px_s / (0.5 * image_dim),
+	        so the normalized field is the px/s field rescaled (recoverable).
+	    raw_divergence : unfiltered divergence; logged separately because the
+	        filter adds phase lag that matters for identification.
+	    roi_* : ROI the flow was computed in (target box), x1/y1 exclusive.
 	"""
 
 	timestamp: float = 0.0
 	valid: bool = False
-	mean_flow_x: float = 0.0
-	mean_flow_y: float = 0.0
+
 	mean_flow_x_norm: float = 0.0
 	mean_flow_y_norm: float = 0.0
 	divergence: float = 0.0
+
+	mean_flow_x: float = 0.0
+	mean_flow_y: float = 0.0
 	raw_divergence: float = 0.0
+
 	roi_x0: int = -1
 	roi_y0: int = -1
 	roi_x1: int = -1
@@ -73,7 +70,23 @@ class FlowResult:
 
 @dataclass
 class TargetEstimate:
-	"""Output of TargetAcquisition.update() — what the controller should track."""
+	"""Output of TargetAcquisition.update() -- what the controller tracks.
+
+	offset_x/y : centroid offset from image center, normalized to [-1, 1].
+	area_fraction : detection area / frame area, in [0, 1]; the scheduling
+	    variable for the identified visual models.
+	fov_saturated : the detection's bounding box touches all four image
+	    borders -- the true target exceeds the camera's field of view, not
+	    just fills it. cv2.boundingRect is mechanically capped at the image
+	    array's own dimensions, so area_fraction/detection_width/height stop
+	    tracking true range entirely once this is True (confirmed: identical
+	    output across a 3x range of true target size). found stays True --
+	    a real contour is still selected -- but the geometry it reports is a
+	    frame-size artifact, not a measurement. Consumers that use these
+	    fields as a scheduling or identification variable should treat rows
+	    with fov_saturated=True as uninformative, not as a steady operating
+	    point.
+	"""
 
 	timestamp: float = 0.0
 	found: bool = False
@@ -82,20 +95,13 @@ class TargetEstimate:
 	detection_width: float = 0.0
 	detection_height: float = 0.0
 	confidence: float = 0.0
-	# Detection area as a fraction of the full frame area, in [0, 1].
-	# Lets downstream consumers (control_law.py) tell a normally-sized
-	# detection apart from one that fills most/all of the frame, which is
-	# the expected case in the final seconds of a landing approach and
-	# should not be treated like an outlier.
 	area_fraction: float = 0.0
+	fov_saturated: bool = False
 
 
 @dataclass
 class AttitudeSetpoint:
-	"""
-	Output of ControlLaw.compute(). Consumed by PX4Interface, which turns
-	this into a VehicleAttitudeSetpoint message.
-	"""
+	"""Desired attitude/thrust consumed by the MAVSDK/PX4 backend."""
 
 	timestamp: float = 0.0
 	roll: float = 0.0

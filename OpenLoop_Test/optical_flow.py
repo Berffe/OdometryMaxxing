@@ -8,6 +8,22 @@ Production path:
 When a valid TargetEstimate is provided, the dense optical flow and the
 scalar divergence are computed only inside the target bounding box.
 
+Divergence is obtained by a least-squares affine fit to the flow field
+(see _fit_divergence_affine), not a per-pixel finite-difference field
+collapsed with a median. For an affine field u=a0+a1 x+a2 y, v=b0+b1
+x+b2 y, divergence = du/dx+dv/dy = a1+b2 is EXACT and constant -- fitting
+it directly uses every valid flow vector in the ROI (weighted by how
+well it's explained by one global radial-expansion trend), instead of
+computing a local spatial derivative pixel-by-pixel and taking the
+median, which is dominated by whichever response is most common pixel-
+by-pixel rather than by the actual expansion signal. This matters
+specifically once the target fills the frame: the interior of a
+uniform, texture-poor surface gives near-zero/noisy per-pixel flow (the
+classic aperture problem), so a median across mostly-interior pixels
+washes the real signal out even though the textured rim still carries
+it; the affine fit instead lets that rim data pull the whole-field
+trend toward the correct value.
+
 Debug path:
 
 	python -m bee_control.optical_flow
@@ -47,6 +63,8 @@ class OpticalFlowEstimator:
 		roi_margin_fraction: float = 0.05,
 		min_roi_size_px: int = 32,
 		divergence_smoothing: float = 0.6,
+		min_points_for_affine_fit: int = 30,
+		affine_inlier_quantile: float = 0.85,
 		store_debug: bool = False,
 	):
 		self._prev_gray = None
@@ -67,6 +85,14 @@ class OpticalFlowEstimator:
 		self._divergence_smoothing = float(divergence_smoothing)
 		self._filtered_divergence = 0.0
 		self._has_filtered_divergence = False
+
+		# Affine-fit divergence (see module docstring). min_points is a
+		# degenerate-case guard (a typical ROI has >>1000 flow vectors);
+		# inlier_quantile keeps the best fraction by residual on a single
+		# trim-and-refit pass, so a cluster of unreliable (textureless or
+		# specular) flow vectors can't dominate the global fit.
+		self._min_points_for_affine_fit = int(min_points_for_affine_fit)
+		self._affine_inlier_quantile = float(affine_inlier_quantile)
 
 		self._store_debug = bool(store_debug)
 		self._last_debug = {}
@@ -187,13 +213,21 @@ class OpticalFlowEstimator:
 		mean_flow_x_norm = mean_flow_x / max(0.5 * image_width, 1.0)
 		mean_flow_y_norm = mean_flow_y / max(0.5 * image_height, 1.0)
 
+		# Debug-only: a per-pixel finite-difference field, useful to *look at*
+		# (e.g. to see whether signal is rim-only vs whole-field). The
+		# production scalar below is fit independently and more robustly --
+		# see the module docstring.
 		divergence_field = self._estimate_divergence_field(
 			flow_px_s=flow_px_s,
 			image_width=image_width,
 			image_height=image_height,
 		)
 
-		raw_divergence = self._scalar_from_divergence_field(divergence_field)
+		raw_divergence, n_inliers = self._fit_divergence_affine(
+			flow_px_s=flow_px_s,
+			image_width=image_width,
+			image_height=image_height,
+		)
 		filtered_divergence = self._filter_divergence(raw_divergence)
 
 		result = FlowResult(
@@ -228,6 +262,86 @@ class OpticalFlowEstimator:
 		self._prev_timestamp = timestamp
 
 		return result
+
+	def _fit_divergence_affine(
+		self,
+		flow_px_s: np.ndarray,
+		image_width: int,
+		image_height: int,
+	) -> Tuple[float, int]:
+		"""
+		Divergence via a global affine fit, not a per-pixel median.
+
+		Model (normalized image units/s, same scale as mean_flow_*_norm):
+		    u(x, y) = a0 + a1*x + a2*y
+		    v(x, y) = b0 + b1*x + b2*y
+		Solved independently by OLS (shared design matrix). For any affine
+		field, du/dx + dv/dy = a1 + b2 exactly and is constant everywhere, so
+		this is the exact divergence of the best-fit field -- using ALL valid
+		flow vectors in the ROI, not a local difference at each pixel.
+
+		The OLS slope is invariant to the coordinate origin (shifting x, y by
+		a constant only moves a0/b0), so ROI-local pixel coordinates are used
+		directly -- no need to know the ROI's offset within the full image.
+
+		One robust trim-and-refit pass keeps the best `affine_inlier_quantile`
+		fraction by residual and refits, so a cluster of unreliable vectors
+		(e.g. a textureless patch returning near-random flow) can't dominate
+		the fit the way it would dominate a per-pixel median.
+
+		Falls back to the old field-median method if too few finite flow
+		vectors remain (degenerate ROI) -- a safety net, not the normal path.
+		"""
+		roi_height, roi_width = flow_px_s.shape[:2]
+		if roi_width < 3 or roi_height < 3:
+			return 0.0, 0
+
+		u = flow_px_s[:, :, 0] / max(0.5 * image_width, 1.0)
+		v = flow_px_s[:, :, 1] / max(0.5 * image_height, 1.0)
+
+		dx_norm = 2.0 / max(image_width - 1, 1)
+		dy_norm = 2.0 / max(image_height - 1, 1)
+
+		rows, cols = np.mgrid[0:roi_height, 0:roi_width]
+		x = (cols * dx_norm).ravel().astype(np.float64)
+		y = (rows * dy_norm).ravel().astype(np.float64)
+		u_flat = u.ravel().astype(np.float64)
+		v_flat = v.ravel().astype(np.float64)
+
+		finite = np.isfinite(u_flat) & np.isfinite(v_flat)
+		n_finite = int(np.count_nonzero(finite))
+		if n_finite < self._min_points_for_affine_fit:
+			field = self._estimate_divergence_field(flow_px_s, image_width, image_height)
+			return self._scalar_from_divergence_field(field), n_finite
+
+		x, y, u_flat, v_flat = x[finite], y[finite], u_flat[finite], v_flat[finite]
+		design = np.column_stack([np.ones_like(x), x, y])
+
+		coeffs, divergence = self._affine_least_squares(design, u_flat, v_flat)
+
+		residual = (u_flat - design @ coeffs[0]) ** 2 + (v_flat - design @ coeffs[1]) ** 2
+		threshold = np.quantile(residual, self._affine_inlier_quantile)
+		inliers = residual <= threshold
+
+		if np.count_nonzero(inliers) >= self._min_points_for_affine_fit:
+			_, divergence = self._affine_least_squares(
+				design[inliers], u_flat[inliers], v_flat[inliers]
+			)
+			n_used = int(np.count_nonzero(inliers))
+		else:
+			n_used = n_finite
+
+		return float(divergence), n_used
+
+	@staticmethod
+	def _affine_least_squares(
+		design: np.ndarray, u: np.ndarray, v: np.ndarray
+	) -> Tuple[Tuple[np.ndarray, np.ndarray], float]:
+		"""OLS-solve u, v against `design`=[1, x, y]; return (coeffs, a1+b2)."""
+		coeffs_u, *_ = np.linalg.lstsq(design, u, rcond=None)
+		coeffs_v, *_ = np.linalg.lstsq(design, v, rcond=None)
+		divergence = float(coeffs_u[1] + coeffs_v[2])
+		return (coeffs_u, coeffs_v), divergence
 
 	def reset(self):
 		self._prev_gray = None

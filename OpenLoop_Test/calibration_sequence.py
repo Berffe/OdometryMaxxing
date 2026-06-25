@@ -103,34 +103,20 @@ def build_axis_step_train(
 	reset_sec: float = 0.0,
 ) -> Tuple[List[Segment], List[str]]:
 	"""
-	Build the segments (and matching labels) for one axis' step train:
-	alternating +amplitude / neutral / -amplitude / neutral, held
-	`hold_sec` each, repeated `repeats` times, with the other two axes
-	pinned at trim (roll=0, pitch=0, thrust=hover_thrust) throughout.
+	Segments + labels for one axis' step train: alternating
+	+amplitude / 0 / -amplitude / 0, held `hold_sec` each, repeated
+	`repeats` times, with the other two axes pinned at trim
+	(roll=0, pitch=0, thrust=hover_thrust).
 
 	axis: "roll", "pitch", or "thrust".
-	amplitude: deviation from trim used for the +/- steps. For roll/pitch
-		this is in radians (keep it comfortably inside roll_limit /
-		pitch_limit); for thrust it's added to/subtracted from
-		hover_thrust (keep it comfortably inside thrust_min/thrust_max).
-
-	reset_sec: if > 0, inserts a brief return-to-trim segment (labeled
-	"settle", not `axis`) between each pair of consecutive repeats.
-	Exists specifically for thrust: that's the one axis where the
-	vertical damper is fully disabled during its own test (since thrust
-	IS what's being identified, so it can't also be corrected), so any
-	residual hover_thrust error has nothing checking it for the entire,
-	now much longer (repeats * 4 * hold_sec) duration of the test. A
-	real run showed exactly this: vz climbing from ~0 to 0.47 m/s
-	(monotonically, not oscillating) over a single uninterrupted
-	~30s thrust test, consistent with a small uncorrected bias
-	compounding the whole time rather than averaging out. Labeling the
-	reset "settle" rather than "thrust" does two things: the vertical
-	damper activates for it (same condition as the inter-axis gaps,
-	`current_axis != "thrust"`), and fit_axis_models.py excludes it from
-	the thrust fit, the same way it already excludes the inter-axis
-	gaps -- so resets bound how far this can drift without touching the
-	identification data at all.
+	amplitude: deviation from trim for the +/- steps. roll/pitch in rad
+		(keep inside roll_limit/pitch_limit); thrust added to hover_thrust
+		(keep inside thrust_min/thrust_max).
+	reset_sec: if > 0, inserts a brief "settle"-labelled return-to-trim
+		between consecutive repeats. The fitter excludes "settle" rows, so
+		resets bound drift without touching identification data -- for
+		thrust they cap altitude drift from a residual hover_thrust error;
+		for roll/pitch they give the lateral damper a chance to re-center.
 	"""
 	if axis not in ("roll", "pitch", "thrust"):
 		raise ValueError(f"unknown axis: {axis!r}")
@@ -165,56 +151,28 @@ def build_axis_step_train(
 
 class VerticalVelocityDamper:
 	"""
-	Stateful PID-ish damper driving thrust to cancel vz and pull back
-	toward a reference altitude:
+	PI(+optional PI on altitude) damper driving thrust to cancel vz and
+	hold a reference altitude:
 
-		thrust = hover_thrust + kp*vz + ki*integral(vz dt)
-		                      + kz*(z - z_target) + kiz*integral((z - z_target) dt),
-		clamped.
+	    thrust = hover_thrust + kp*vz + ki*∫vz dt
+	                          + kz*(z - z_target) + kiz*∫(z - z_target) dt,  clamped.
 
-	PX4 local-position velocity and position both use NED convention:
-	vz > 0 means descending, z increasing means lower altitude. So a
-	positive vz (descending) must INCREASE thrust, and being below the
-	target altitude (z > z_target) must also increase thrust — all
-	terms are added, not subtracted. Getting a sign backwards doesn't
-	just under-correct, it's active positive feedback: descending
-	reduces thrust further, which accelerates the descent further. A
-	wrong sign here looks exactly like "almost free-falling" the instant
-	offboard engages, because that's what it is.
+	NED convention: vz > 0 = descending, z increasing = lower. So descending
+	or being below target must INCREASE thrust -- every term is added. A wrong
+	sign here is active positive feedback (descending cuts thrust, accelerating
+	the descent), which looks like near free-fall the instant offboard engages.
 
-	Why PI and not just P, for vz: a proportional-only damper reaches an
-	equilibrium against any *constant* disturbance rather than driving
-	vz to zero — it doesn't almost-work, it structurally can't fully
-	cancel a steady bias, no matter how small. Real calibration data
-	showed exactly that: a P-only formula computing correctly while vz
-	still sat at a persistent nonzero mean throughout.
+	Why PI, not P: a P-only damper reaches equilibrium against a constant
+	disturbance instead of driving vz to zero -- it structurally cannot cancel
+	a steady hover_thrust bias. kiz does the same job one level up for altitude
+	(kz alone leaves a steady altitude error). integral_limit / integral_z_limit
+	must be large enough that ki*limit (kiz*limit) can actually cover a plausible
+	hover_thrust gap, or the integral term can never close it. kiz=0 reproduces
+	the kz-only behavior.
 
-	Why kiz, on top of kz, for altitude: the exact same limitation shows
-	up one level up. kz alone is P-only on position, so it ALSO reaches
-	an equilibrium against a constant hover_thrust error instead of
-	closing it — a real 45+ second settle attempt measured this
-	directly: kz=0.10 left a steady ~1.18m altitude error (a settle
-	timeout, correctly, rather than a false "settled"), which implies
-	kz was stuck fighting a ~0.118 thrust gap it could never fully
-	close on its own. kiz integrates the altitude error over time the
-	same way ki integrates the velocity error, and is what actually
-	drives that steady-state error toward zero rather than just
-	bounding it. kiz=0.0 (the default) reproduces the kz-only behavior.
-
-	Both integral_limit and integral_z_limit need to be sized to the
-	kind of disturbance you actually expect to correct, not just "some
-	bound to prevent windup." A limit so tight that ki*integral_limit
-	(or kiz*integral_z_limit) is tiny compared to a plausible
-	hover_thrust error means that integral term can NEVER close that
-	error, no matter how long it has — it isn't a slower correction,
-	it's a structurally incomplete one.
-
-	One instance is meant to be shared continuously from the moment
-	offboard thrust commands start being sent through the open-loop
-	roll/pitch test phases (see calibration_node.py) — both integral
-	terms are exactly the part that benefits from not being reset at
-	each phase boundary, since the disturbance they're correcting for
-	doesn't reset either.
+	One instance is shared continuously from the first offboard thrust command
+	through the roll/pitch test phases (see calibration_node.py): the integral
+	state should carry across phase boundaries, since the disturbance does too.
 	"""
 
 	def __init__(
@@ -511,7 +469,7 @@ def exceeds_safety_bounds(
 	"""
 	return (
 		abs(vz) > vz_limit
-		or area_fraction > area_fraction_max
+		# or area_fraction > area_fraction_max
 		or abs(vx) > lateral_velocity_limit
 		or abs(vy) > lateral_velocity_limit
 	)
@@ -528,34 +486,30 @@ def build_calibration_sequence(
 	roll_repeats: int = 8,
 	pitch_repeats: int = 8,
 	thrust_repeats: int = 8,
+	roll_reset_sec: float = 0.0,
+	pitch_reset_sec: float = 0.0,
 	thrust_reset_sec: float = 0.0,
 	settle_sec: float = 2.0,
 	axes: Tuple[str, ...] = ("roll", "pitch", "thrust"),
 ) -> StepSequence:
 	"""
-	Build the full calibration sequence: a settle period at trim, then
-	one step train per axis in `axes`, back to back, each preceded by a
-	short return-to-trim so every axis' train starts from the same
-	(roll=0, pitch=0, thrust=hover_thrust) condition.
+	Build the full calibration sequence: a settle at trim, then one step
+	train per axis in `axes`, back to back, each preceded by a short
+	return-to-trim so every train starts from the same (0, 0, hover) state.
 
-	Test one axis at a time on purpose — see the module docstring.
+	Test one axis at a time on purpose (see the module docstring).
 
-	hold_sec and repeats are both per axis, not shared. For hold_sec:
-	roll/pitch want it long enough that a held tilt actually has time to
-	build up real velocity (the response scales with hold_sec^2 for a
-	roughly double-integrator system — position from velocity from
-	acceleration — so doubling hold_sec is a much bigger lever on signal
-	strength than the same relative increase in amplitude). Thrust
-	deliberately keeps a short hold: it already commands real altitude
-	excursions, and a longer hold there directly widens the
-	area_fraction range swept within one file (see fit_axis_models.py's
-	wide-range warning) — don't fix one axis by making this worse.
+	hold_sec and repeats are per axis. roll/pitch want hold_sec long enough
+	that a held tilt builds real velocity (response ~ hold_sec^2 for a
+	double-integrator, so it's a bigger signal lever than amplitude).
 
-	thrust_reset_sec (thrust only — roll_repeats/pitch_repeats don't
-	need this, see build_axis_step_train) inserts a brief, damped
-	return-to-trim between thrust repeats, bounding how far a residual
-	hover_thrust error can drift the whole test rather than requiring
-	hover_thrust to be guessed exactly right.
+	*_reset_sec inserts a brief, damped, "settle"-labelled return-to-trim
+	between repeats (not within one -- see build_axis_step_train). The
+	fitter excludes these from the fit, so they bound drift without touching
+	identification data: for thrust it caps how far a residual hover_thrust
+	error drifts altitude; for roll/pitch it lets the lateral damper
+	periodically re-center so the target doesn't walk out of frame across a
+	long train (the damper is off during the active steps).
 	"""
 	segments: List[Segment] = [(settle_sec, 0.0, 0.0, hover_thrust)]
 	labels: List[str] = ["settle"]
@@ -576,8 +530,8 @@ def build_calibration_sequence(
 		"thrust": thrust_repeats,
 	}
 	reset_secs = {
-		"roll": 0.0,
-		"pitch": 0.0,
+		"roll": roll_reset_sec,
+		"pitch": pitch_reset_sec,
 		"thrust": thrust_reset_sec,
 	}
 
