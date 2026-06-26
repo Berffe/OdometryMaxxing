@@ -70,9 +70,21 @@
 
 	<model name="bee_platform">
 	<pose>0 0 2 0 0 0</pose>
-	<static>true</static>
+	<static>false</static>
 
 	<link name="platform_link">
+	<gravity>false</gravity>
+	<inertial>
+		<mass>1000.0</mass>
+		<inertia>
+		<ixx>100.0</ixx>
+		<iyy>100.0</iyy>
+		<izz>100.0</izz>
+		<ixy>0.0</ixy>
+		<ixz>0.0</ixz>
+		<iyz>0.0</iyz>
+		</inertia>
+	</inertial>
 	<visual name="visual_body">
 		<geometry>
 		<cylinder>
@@ -112,17 +124,16 @@
 		</material>
 	</visual>
 
-	<!-- Robust physical deck.
-	     The visual cylinder remains thin (length=0.2, top face at z=+0.1).
-	     The collision is thicker and shifted down, so its top face stays aligned
-	     with the visible deck top: -0.3 + 0.8/2 = +0.1. This reduces
-	     tunneling when the drone touches down or the motors are stopped. -->
+	<!-- Physical deck.
+	     Collision now matches the visible cylinder: no thick hidden platform,
+	     no shifted invisible support. Because the model is non-static and gravity
+	     is disabled above, this collision should move with the commanded platform
+	     pose instead of behaving like a cached static obstacle. -->
 	<collision name="collision">
-		<pose>0 0 -0.3 0 0 0</pose>
 		<geometry>
 		<cylinder>
-			<radius>1.05</radius>
-			<length>0.8</length>
+			<radius>1.0</radius>
+			<length>0.2</length>
 		</cylinder>
 		</geometry>
 		<surface>
@@ -161,8 +172,8 @@
 	     MovingPlatformController.cpp's publishPose), not via gz-sim's
 	     generic pose broadcasting, which two earlier approaches both
 	     confirmed unreliable for this entity: a PosePublisher SDF plugin
-	     only emitted a one-shot static snapshot for this <static>true
-	     </static> model, and SceneBroadcaster's /world/.../pose/info (a
+	     only emitted a one-shot static snapshot for the earlier <static>true
+	     </static> version of this model, and SceneBroadcaster's /world/.../pose/info (a
 	     Pose_V of every entity) bridges into ROS as tf2_msgs/msg/TFMessage
 	     with every entity's name left empty (confirmed directly via the
 	     consuming ROS node logging every child_frame_id it received), so
