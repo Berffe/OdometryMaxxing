@@ -16,6 +16,11 @@ Two robustness behaviors:
     within loss_grace_period_sec the last good estimate is reused with confidence
     decayed toward zero, instead of immediately reporting found=False.
 
+TargetEstimate.fov_saturated flags when the box touches all four image
+borders: the target's true size meets or exceeds the camera's field of
+view, not just fills it. Past that point area_fraction/detection_width/
+height are a frame-size artifact, not a measurement -- see state.py.
+
 Run `python target_acquisition.py` (or `-m bee_control.target_acquisition`) to
 launch the visual debug test.
 """
@@ -50,6 +55,7 @@ class TargetAcquisition:
 		canny_low: int = 60,
 		canny_high: int = 140,
 		loss_grace_period_sec: float = 0.15,
+		fov_saturation_margin_px: int = 2,
 	):
 		self._hsv_ranges = list(hsv_ranges) if hsv_ranges is not None else None
 
@@ -73,6 +79,7 @@ class TargetAcquisition:
 		self._loss_grace_period_sec = float(loss_grace_period_sec)
 		self._last_found_target: Optional[TargetEstimate] = None
 		self._last_found_time: Optional[float] = None
+		self._fov_saturation_margin_px = max(0, int(fov_saturation_margin_px))
 
 	def update(
 		self,
@@ -361,6 +368,7 @@ class TargetAcquisition:
 		_, _, detection_width, detection_height = cv2.boundingRect(contour)
 
 		confidence = self._estimate_confidence(contour, area_fraction)
+		fov_saturated = self._is_fov_saturated(contour, width, height)
 
 		return TargetEstimate(
 			timestamp=timestamp,
@@ -371,6 +379,7 @@ class TargetAcquisition:
 			detection_width=float(detection_width),
 			detection_height=float(detection_height),
 			area_fraction=float(area_fraction),
+			fov_saturated=fov_saturated,
 		)
 
 	def _large_area_penalty(self, area_fraction: float) -> float:
@@ -392,6 +401,24 @@ class TargetAcquisition:
 		ratio = max(0.0, min(1.0, ratio))
 
 		return 1.0 - (1.0 - self._min_large_area_penalty) * ratio
+
+	def _is_fov_saturated(self, contour, width: int, height: int) -> bool:
+		"""
+		True if the contour's bounding box touches all four image borders
+		(within fov_saturation_margin_px) -- the true target's projected size
+		meets or exceeds the camera's field of view, not just fills it.
+		cv2.boundingRect cannot report a box larger than the image array, so
+		area_fraction/detection_width/height stop tracking true range past
+		this point, regardless of how much closer the target actually gets.
+		"""
+		x, y, w, h = cv2.boundingRect(contour)
+		m = self._fov_saturation_margin_px
+		return (
+			x <= m
+			and y <= m
+			and (x + w) >= width - m
+			and (y + h) >= height - m
+		)
 
 	@staticmethod
 	def _estimate_confidence(contour, area_fraction: float) -> float:

@@ -97,6 +97,54 @@ def _validate_cost_weights(Q: np.ndarray, R: np.ndarray):
 		raise ValueError(f"R must be strictly positive definite, got eigenvalues {r_eigs}.")
 
 
+class ScalarSchedule:
+	"""
+	A single manual-tuning knob (e.g. roll_prop_scale) that is either a
+	constant, or a piecewise-linear function of a scheduling variable
+	(area_fraction) -- same clamp-to-endpoint convention as ScheduledLQR,
+	just for a plain scalar instead of a gain matrix.
+
+	Exists for closed-loop, per-operating-point gain tuning (hover at a
+	fixed altitude, tune by hand, repeat at the next altitude) as an
+	alternative to deriving the whole schedule from open-loop calibration:
+	pass a single number for the old "one value everywhere" behavior, or a
+	list of (area_fraction, value) pairs collected one altitude at a time.
+
+	value(0.1) -> 0.1                                  (constant)
+	value([(0.07, 0.4), (0.13, 0.5), (0.21, 0.6)])     (tuned per altitude)
+	"""
+
+	def __init__(self, value):
+		if isinstance(value, (int, float)):
+			self._constant = float(value)
+			self._afs = None
+			self._values = None
+			return
+
+		points = sorted(value, key=lambda p: p[0])
+		if not points:
+			raise ValueError("ScalarSchedule needs at least one point if not a constant")
+		self._constant = None
+		self._afs = [float(p[0]) for p in points]
+		self._values = [float(p[1]) for p in points]
+
+	def value_at(self, area_fraction: float) -> float:
+		if self._constant is not None:
+			return self._constant
+
+		afs, values = self._afs, self._values
+		if area_fraction <= afs[0]:
+			return values[0]
+		if area_fraction >= afs[-1]:
+			return values[-1]
+		for i in range(len(afs) - 1):
+			lo, hi = afs[i], afs[i + 1]
+			if lo <= area_fraction <= hi:
+				t = (area_fraction - lo) / max(hi - lo, 1e-9)
+				return (1.0 - t) * values[i] + t * values[i + 1]
+		return values[-1]
+
+
 class ScheduledLQR:
 	"""
 	Bank of LQR gains along a scalar scheduling variable, blended by linear

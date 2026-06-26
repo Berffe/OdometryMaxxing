@@ -5,12 +5,14 @@ This file summarizes the terminals needed to launch the current BEE_LAND simulat
 - PX4 SITL + Gazebo world
 - `bee_x500` custom drone model
 - Micro XRCE-DDS Agent for PX4 ↔ ROS 2 communication
-- Gazebo camera bridge to ROS 2
-- `bee_node.py` ROS 2 node for PX4 state + camera image access
+- One Gazebo → ROS 2 bridge process for camera, platform pose, and touchdown
+- `bee_node.py` ROS 2 node for PX4 state, camera image, platform pose, and touchdown handling
 
 ---
+
 ## Commandes à retenir
-Pour copier les fichiers de Windows à Linux (dans le terminal Linux!) :
+
+Pour copier les fichiers de Windows à Linux (dans le terminal Linux) :
 
 ```bash
 cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Gazebo_defs/* ~/PX4-Autopilot/BEE_LAND/
@@ -25,6 +27,16 @@ cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Controller_logic/*.p
 
 cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/OpenLoop_Test/*.py ~/PX4-Autopilot/BEE_LAND/openloop/
 ```
+
+Parfois il faut rebuild l'environnement :
+
+```bash
+cd ~/PX4-Autopilot
+
+make px4_sitl gz_x500 # or
+make px4_sitl_default
+```
+
 ---
 
 ## Terminal 1 — Launch PX4 SITL + Gazebo with `bee_x500`
@@ -42,12 +54,12 @@ source build/px4_sitl_default/rootfs/gz_env.sh
 PX4_SYS_AUTOSTART=4001 \
 PX4_SIMULATOR=gz \
 PX4_SIM_MODEL=bee_x500 \
-PX4_GZ_MODEL_POSE="0,0,2.4,0,0,0" \
+PX4_GZ_MODEL_POSE="1.5,1.5,0.4,0,0,0" \
 PX4_GZ_WORLD=bee_platform \
 ./build/px4_sitl_default/bin/px4
 ```
 
-This launches PX4 SITL directly and spawns the custom `bee_x500` model inside the `bee_platform` Gazebo world.
+This launches PX4 SITL and spawns the custom `bee_x500` model inside the `bee_platform` Gazebo world.
 
 Important elements:
 
@@ -81,67 +93,93 @@ Your ROS 2 nodes can subscribe to these topics through `px4_msgs`.
 
 ---
 
-## Terminal 3 — Bridge Gazebo Camera Image to ROS 2
+## Terminal 3 — Start all Gazebo → ROS 2 bridges
 
 ```bash
 ros2 run ros_gz_bridge parameter_bridge \
-  /bee_x500/camera/image@sensor_msgs/msg/Image@gz.msgs.Image
+  /bee_x500/camera/image@sensor_msgs/msg/Image[gz.msgs.Image \
+  /platform/pose@geometry_msgs/msg/Pose[gz.msgs.Pose \
+  /bee_platform/touched@std_msgs/msg/Bool[gz.msgs.Boolean
 ```
 
-This bridges the Gazebo camera topic:
+This single persistent process bridges the three Gazebo topics needed by the controller:
 
 ```text
-/bee_x500/camera/image
+/bee_x500/camera/image      -> sensor_msgs/msg/Image
+/platform/pose              -> geometry_msgs/msg/Pose
+/bee_platform/touched       -> std_msgs/msg/Bool
 ```
 
-from Gazebo Transport into ROS 2 as:
+Direction is Gazebo → ROS 2 only. The `[` syntax is intentional.
 
-```text
-sensor_msgs/msg/Image
+Use this bridge for:
+
+- camera input to `bee_node.py`
+- platform pose diagnostics and relative-motion logging
+- touchdown detection after platform contact
+
+Before starting the bridge, Gazebo must already be publishing the topics. Check if needed:
+
+```bash
+gz topic -l | grep -E "camera|platform|touched"
+gz topic -e -t /platform/pose
+gz topic -e -t /bee_platform/touched
 ```
 
-This allows regular ROS 2 nodes, `rqt_image_view`, and `cv_bridge` to access the simulated camera image.
+Notes:
 
+- `/platform/pose` is published directly by `OscillatingPlatformController`.
+- `/bee_platform/touched` requires the contact sensor + `TouchPlugin` in `bee_platform.sdf`.
+- If either topic is missing, rebuild/reinstall the relevant Gazebo plugin or check that the updated world file is the one being loaded.
 
 ---
 
-## Terminal 4 — Run the BEE_LAND ROS Node
+## Terminal 4 — Run the BEE_LAND ROS node
 
 ```bash
 cd ~/PX4-Autopilot/BEE_LAND
 
-ros_bee # Defined in /.bashrc
+ros_bee # Defined in ~/.bashrc
 
 python3 -m controller.bee_node
-python3 -m openloop.calibration_node
-
 ```
 
-This node currently:
+For open-loop calibration instead:
+
+```bash
+python3 -m openloop.calibration_node
+```
+
+The node currently:
 
 - subscribes to PX4 local position through ROS 2
 - subscribes to the bridged Gazebo camera image
+- subscribes to the bridged platform pose
+- subscribes to the bridged touchdown signal
 - converts ROS images using `cv_bridge`
 - displays the camera feed with OpenCV
-- logs basic vehicle position and image information
+- computes target detection, optical flow, and visual control commands
+- logs diagnostics to CSV
+- enters landed mode and requests motor stop after confirmed touchdown
 
 Expected output includes messages like:
 
 ```text
 bee_land_node started.
-Waiting for PX4 local position on /fmu/out/vehicle_local_position_v1
-Waiting for camera images on /bee_x500/camera/image
-image #30: 640x480, encoding=rgb8
-local position: x=..., y=..., z=...
+Waiting for required streams: local_position and camera.
+First platform pose received on /platform/pose: ...
+Touchdown detection enabled: listening on /bee_platform/touched ...
 ```
+
 ---
 
-## Terminal 5 — Optional Camera and ROS Checks
+## Terminal 5 — Optional checks
 
 Check if ROS sees the camera topic:
 
 ```bash
-ros2 topic list | grep image
+ros_bee
+ros2 topic list | grep camera
 ```
 
 Expected:
@@ -174,24 +212,69 @@ Then select:
 /bee_x500/camera/image
 ```
 
+Check if ROS sees the platform pose topic:
+
+```bash
+ros2 topic list | grep platform
+ros2 topic info /platform/pose -v
+ros2 topic hz /platform/pose
+```
+
+Expected:
+
+```text
+Publisher count: >= 1
+```
+
+and a steady rate from `ros2 topic hz`.
+
+Check touchdown:
+
+```bash
+ros2 topic echo /bee_platform/touched
+ros2 topic echo /bee_land/touchdown
+```
+
+Expected after contact:
+
+```text
+data: true
+```
+
+If `platform_*` / `relative_*` diagnostics columns are empty, check:
+
+```bash
+gz topic -l | grep platform
+gz topic -e -t /platform/pose
+ros2 topic list | grep platform
+ros2 topic hz /platform/pose
+```
+
+If touchdown is not detected, check:
+
+```bash
+gz topic -l | grep touched
+gz topic -e -t /bee_platform/touched
+ros2 topic list | grep touched
+ros2 topic echo /bee_platform/touched
+```
+
 ---
 
 ## Current Architecture
 
 ```text
-Gazebo world
+Gazebo camera
     |
-    | publishes camera image
     v
 /bee_x500/camera/image  [gz.msgs.Image]
     |
-    | ros_gz_bridge
+    | ros_gz_bridge, Terminal 3
     v
 /bee_x500/camera/image  [sensor_msgs/msg/Image]
     |
-    | bee_node.py
     v
-OpenCV image display / future optical flow processing
+bee_node.py
 ```
 
 ```text
@@ -205,9 +288,42 @@ MicroXRCEAgent udp4 -p 8888
     v
 /fmu/out/... topics
     |
-    | bee_node.py
     v
-Vehicle state access / future landing controller
+bee_node.py
+```
+
+```text
+OscillatingPlatformController
+    |
+    v
+/platform/pose  [gz.msgs.Pose]
+    |
+    | ros_gz_bridge, Terminal 3
+    v
+/platform/pose  [geometry_msgs/msg/Pose]
+    |
+    v
+bee_node.py / calibration_node.py
+    |
+    v
+PlatformState diagnostics only
+```
+
+```text
+Platform contact sensor + TouchPlugin
+    |
+    v
+/bee_platform/touched  [gz.msgs.Boolean]
+    |
+    | ros_gz_bridge, Terminal 3
+    v
+/bee_platform/touched  [std_msgs/msg/Bool]
+    |
+    v
+bee_node.py
+    |
+    v
+PHASE_LANDED + /bee_land/touchdown + MAVSDK disarm/kill fallback
 ```
 
 ---
@@ -219,7 +335,7 @@ Use this order:
 ```text
 1. Terminal 1: PX4 SITL + Gazebo + bee_x500
 2. Terminal 2: MicroXRCEAgent
-3. Terminal 3: Gazebo camera bridge
+3. Terminal 3: one Gazebo → ROS 2 bridge command
 4. Terminal 4: bee_node.py
 5. Terminal 5: optional checks / rqt_image_view
 ```
@@ -228,10 +344,15 @@ If something fails, test in this order:
 
 ```text
 1. gz topic -l | grep camera
-2. ros2 topic list | grep image
-3. ros2 topic hz /bee_x500/camera/image
-4. rqt_image_view
-5. python3 bee_node.py
+2. gz topic -l | grep platform
+3. gz topic -l | grep touched
+4. ros2 topic list | grep image
+5. ros2 topic list | grep platform
+6. ros2 topic list | grep touched
+7. ros2 topic hz /bee_x500/camera/image
+8. ros2 topic hz /platform/pose
+9. ros2 topic echo /bee_platform/touched
+10. python3 -m controller.bee_node
 ```
 
 ---
@@ -241,5 +362,6 @@ If something fails, test in this order:
 - `bee_x500` is spawned through `PX4_SIM_MODEL=bee_x500`.
 - The camera image comes from Gazebo, not directly from PX4.
 - PX4 state comes through Micro XRCE-DDS and `px4_msgs`.
-- The camera bridge and PX4 DDS bridge are separate communication paths.
-- The current `bee_node.py` is a first integration node; later it can host optical flow, platform-motion estimation, and landing-control logic.
+- Camera, platform pose, and touchdown now share one `ros_gz_bridge` process.
+- The PX4 DDS bridge is still separate and requires `MicroXRCEAgent`.
+- `control_law.py` remains visual-only; touchdown is handled in `bee_node.py` as a terminal mission event.

@@ -10,6 +10,7 @@
 	<plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
 	<plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
 	<plugin filename="gz-sim-sensors-system" name="gz::sim::systems::Sensors"/>
+	<plugin filename="gz-sim-contact-system" name="gz::sim::systems::Contact"/>
 	<plugin filename="gz-sim-imu-system" name="gz::sim::systems::Imu"/>
 	<plugin filename="gz-sim-air-pressure-system" name="gz::sim::systems::AirPressure"/>
 	<plugin filename="gz-sim-magnetometer-system" name="gz::sim::systems::Magnetometer"/>
@@ -111,16 +112,70 @@
 		</material>
 	</visual>
 
+	<!-- Robust physical deck.
+	     The visual cylinder remains thin (length=0.2, top face at z=+0.1).
+	     The collision is thicker and shifted down, so its top face stays aligned
+	     with the visible deck top: -0.3 + 0.8/2 = +0.1. This reduces
+	     tunneling when the drone touches down or the motors are stopped. -->
 	<collision name="collision">
+		<pose>0 0 -0.3 0 0 0</pose>
 		<geometry>
 		<cylinder>
-			<radius>1.0</radius>
-			<length>0.2</length>
+			<radius>1.05</radius>
+			<length>0.8</length>
 		</cylinder>
 		</geometry>
+		<surface>
+		<friction>
+			<ode>
+			<mu>1.5</mu>
+			<mu2>1.5</mu2>
+			</ode>
+		</friction>
+		<contact>
+			<ode>
+			<kp>1000000</kp>
+			<kd>100</kd>
+			<max_vel>0.01</max_vel>
+			<min_depth>0.001</min_depth>
+			</ode>
+		</contact>
+		</surface>
 	</collision>
+
+	<!-- Contact sensor used by Gazebo's TouchPlugin to detect a real touchdown.
+	     It is attached to the platform collision, so we don't need to know the
+	     landing-gear collision names inside the included bee_x500/x500_base model. -->
+	<sensor name="deck_contact_sensor" type="contact">
+		<always_on>1</always_on>
+		<update_rate>100</update_rate>
+		<contact>
+			<collision>collision</collision>
+		</contact>
+	</sensor>
 	</link>
 
+	<!-- Ground truth for diagnostics (NOT analytically reconstructed, see
+	     platform_motion.py) is published directly by this plugin itself, on
+	     its own dedicated /platform/pose topic (see
+	     MovingPlatformController.cpp's publishPose), not via gz-sim's
+	     generic pose broadcasting, which two earlier approaches both
+	     confirmed unreliable for this entity: a PosePublisher SDF plugin
+	     only emitted a one-shot static snapshot for this <static>true
+	     </static> model, and SceneBroadcaster's /world/.../pose/info (a
+	     Pose_V of every entity) bridges into ROS as tf2_msgs/msg/TFMessage
+	     with every entity's name left empty (confirmed directly via the
+	     consuming ROS node logging every child_frame_id it received), so
+	     there was no way to pick this entity back out on the ROS side.
+
+	     Bridge with ros_gz_bridge:
+	       ros2 run ros_gz_bridge parameter_bridge \
+	           /platform/pose@geometry_msgs/msg/Pose@gz.msgs.Pose
+
+	     Requires the plugin rebuilt/reinstalled after this change before the
+	     new topic exists; confirm with `gz topic -l | grep platform`
+	     after relaunching. Optional <pose_topic>some/other/topic</pose_topic>
+	     tag below overrides the default /platform/pose if needed. -->
 	<plugin filename="libOscillatingPlatformController.so" name="custom::OscillatingPlatformController">
 		<link_name>platform_link</link_name>
 
@@ -132,9 +187,21 @@
 		<y_frequency>0.0</y_frequency>
 		<y_phase>0.0</y_phase>
 
-		<z_amplitude>0.0</z_amplitude>
-		<z_frequency>0.0</z_frequency>
+		<z_amplitude>0.3</z_amplitude>
+		<z_frequency>0.2</z_frequency>
 		<z_phase>0.0</z_phase>
+	</plugin>
+
+	<!-- Publishes /bee_platform/touched as gz.msgs.Boolean once the platform
+	     contact sensor has touched the bee_x500 model continuously for 0.15 s.
+	     The target string is intentionally broad: it should match bee_x500,
+	     bee_x500_0, and scoped collision names containing the model name. -->
+	<plugin filename="gz-sim-touchplugin-system"
+		name="gz::sim::systems::TouchPlugin">
+		<target>bee_x500</target>
+		<namespace>bee_platform</namespace>
+		<time>0.15</time>
+		<enabled>true</enabled>
 	</plugin>
 	</model>
 </world>

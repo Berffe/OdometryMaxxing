@@ -14,7 +14,6 @@ class VehicleState:
 	Not used by the control law after visual handoff.
 	"""
 
-	# Local-position timestamp, normalized by DiagnosticsWriter when logged.
 	timestamp: float = 0.0
 	x: float = 0.0
 	y: float = 0.0
@@ -22,14 +21,7 @@ class VehicleState:
 	vx: float = 0.0
 	vy: float = 0.0
 	vz: float = 0.0
-	yaw: float = 0.0  # VehicleLocalPosition.heading, radians
-
-	# Attitude timestamp and Euler angles from VehicleAttitude.q.
-	attitude_timestamp: float = 0.0
-	roll: float = 0.0
-	pitch: float = 0.0
-	attitude_yaw: float = 0.0
-	attitude_source: str = ""  # "vehicle_attitude" or "vehicle_odometry"
+	yaw: float = 0.0  # VehicleLocalPosition.heading [rad]
 
 
 @dataclass
@@ -97,6 +89,30 @@ class TargetEstimate:
 	confidence: float = 0.0
 	area_fraction: float = 0.0
 	fov_saturated: bool = False
+
+
+@dataclass
+class PlatformState:
+	"""
+	Known/commanded landing-platform motion, for diagnostics and relative-
+	motion analysis only -- the control law never sees this (see
+	control_law.py: visual-only by design, divergence/offset are its only
+	inputs). Reconstructed analytically by platform_motion.py from the
+	OscillatingPlatformController SDF plugin's own amplitude/frequency/phase,
+	since the plugin does not publish its pose to ROS.
+
+	Same x/y/z, vx/vy/vz shape as VehicleState, but in the SDF world's own
+	frame/units -- see platform_motion.py's module docstring for the NED-vs-
+	ENU sign/axis caveat before comparing directly against VehicleState.
+	"""
+
+	timestamp: float = 0.0
+	x: float = 0.0
+	y: float = 0.0
+	z: float = 0.0
+	vx: float = 0.0
+	vy: float = 0.0
+	vz: float = 0.0
 
 
 @dataclass

@@ -850,6 +850,16 @@ def divergence_motion_report(
 	with vz/altitude. The thrust loop's only observable is D, so this is the
 	number that says whether thrust control has anything to act on.
 
+	Uses relative_vz_m_s/relative_z_m (vehicle motion relative to the
+	platform, see platform_motion.py) when the columns are present and not
+	empty, since that -- not the vehicle's own absolute vz -- is what
+	divergence actually measures once the platform moves too: on an
+	oscillating-platform test, vehicle_vz alone is the wrong variable and can
+	show a misleadingly weak correlation even when divergence is tracking
+	the true relative motion correctly. Falls back to vehicle_vz_m_s/
+	-vehicle_z_m for older logs or a stationary platform, where they're
+	equivalent (platform velocity is zero, so relative_vz == vehicle_vz).
+
 	The correlation is expected to collapse in the terminal phase: once the
 	target fills the frame, dense flow loses the texture spread needed to see
 	the focus of expansion, and the median over a mostly-gradient-free ROI
@@ -859,20 +869,28 @@ def divergence_motion_report(
 	Returns None if there is too little vertical motion to judge.
 	"""
 	D, vz, vz_over_alt = [], [], []
+	used_relative = False
 	for row in rows:
 		if str(row.get("flow_valid", "0")).strip() not in ("1", "True", "true"):
 			continue
 		d = _safe_float(row.get("flow_raw_divergence_1_s"))
 		if d is None:
 			d = _safe_float(row.get("flow_divergence_1_s"))
-		v = _safe_float(row.get("vehicle_vz_m_s"))
+
+		v = _safe_float(row.get("relative_vz_m_s"))
+		if v is not None:
+			used_relative = True
+			alt_z = _safe_float(row.get("relative_z_m"))
+		else:
+			v = _safe_float(row.get("vehicle_vz_m_s"))
+			alt_z = _safe_float(row.get("vehicle_z_m"))
+			alt_z = None if alt_z is None else -alt_z
+
 		if d is None or v is None:
 			continue
 		D.append(d)
 		vz.append(v)
-		z = _safe_float(row.get("vehicle_z_m"))
-		alt = None if z is None else -z
-		vz_over_alt.append(v / alt if (alt is not None and abs(alt) > 1e-3) else np.nan)
+		vz_over_alt.append(v / alt_z if (alt_z is not None and abs(alt_z) > 1e-3) else np.nan)
 
 	D, vz, vz_over_alt = np.array(D), np.array(vz), np.array(vz_over_alt)
 	if len(D) < min_samples or np.std(vz) < min_vz_std:
@@ -893,7 +911,82 @@ def divergence_motion_report(
 		"slope_D_per_vz": slope,
 		"vz_std": float(np.std(vz)),
 		"D_std": float(np.std(D)),
+		"used_relative_motion": used_relative,
 	}
+
+
+def platform_tracking_report(
+	rows: List[Dict[str, str]],
+	expected_frequency_hz: Optional[float] = None,
+	min_samples: int = 30,
+) -> Optional[Dict[str, object]]:
+	"""
+	For an oscillating-platform test: does the vehicle's measured response
+	(relative_vz_m_s, or vehicle_vz_m_s if platform tracking wasn't logged)
+	actually show the commanded oscillation frequency, or something else
+	(e.g. the thrust loop's own underdamped natural mode, ringing at its own
+	frequency rather than tracking the disturbance cycle-by-cycle -- this is
+	a real, observed failure mode, not just a hypothetical: a 0.3m/0.2Hz test
+	produced a clean, large ~0.043 Hz (~23s period) response with NO energy
+	near the commanded 0.2 Hz/5s anywhere in vz, altitude, or divergence, and
+	an equivalent stationary-platform run showed no such mode at all -- so it
+	was real and platform-triggered, just not a 1:1 echo of the input).
+
+	Reports the dominant spectral peak found (via FFT) alongside the expected
+	one, so a mismatch like that is visible immediately rather than requiring
+	a manual deep-dive. Needs roughly-evenly-sampled rows; does not resample
+	irregular timestamps.
+
+	expected_frequency_hz: the platform's commanded frequency for this test
+	(match bee_platform.sdf's z_frequency, mind the Hz-vs-rad/s caveat in
+	platform_motion.py). None skips the expected-vs-found comparison.
+	"""
+	t, sig = [], []
+	used_relative = False
+	for row in rows:
+		ti = _safe_float(row.get("t_sec"))
+		v = _safe_float(row.get("relative_vz_m_s"))
+		if v is not None:
+			used_relative = True
+		else:
+			v = _safe_float(row.get("vehicle_vz_m_s"))
+		if ti is None or v is None:
+			continue
+		t.append(ti)
+		sig.append(v)
+
+	if len(t) < min_samples:
+		return None
+
+	t, sig = np.array(t), np.array(sig)
+	dt = float(np.median(np.diff(t)))
+	if dt <= 1e-6:
+		return None
+
+	n = len(sig)
+	freqs = np.fft.rfftfreq(n, d=dt)
+	spec = np.abs(np.fft.rfft(sig - sig.mean()))
+
+	valid = freqs > (1.0 / (n * dt))  # drop the DC/near-DC bin
+	if not valid.any():
+		return None
+	dominant_idx = np.argmax(np.where(valid, spec, -1))
+	dominant_freq = float(freqs[dominant_idx])
+
+	result = {
+		"used_relative_motion": used_relative,
+		"n": n,
+		"dt_sec": dt,
+		"nyquist_hz": 0.5 / dt,
+		"dominant_frequency_hz": dominant_freq,
+		"dominant_period_sec": (1.0 / dominant_freq) if dominant_freq > 1e-9 else float("inf"),
+		"signal_std": float(sig.std()),
+	}
+	if expected_frequency_hz is not None and expected_frequency_hz > 1e-9:
+		result["expected_frequency_hz"] = float(expected_frequency_hz)
+		result["expected_period_sec"] = 1.0 / expected_frequency_hz
+		result["frequency_ratio_found_over_expected"] = dominant_freq / expected_frequency_hz
+	return result
 
 
 def detect_possible_contact(
@@ -1039,6 +1132,7 @@ def plot_area_fraction_over_time(rows: List[Dict[str, str]], csv_path: str, outp
 def analyze_file(
 	path: str, dt_nominal: float, dt_tolerance: float, output_dir: str,
 	row_filter: Optional[RowFilter] = None, max_area_fraction_span: float = 0.15,
+	platform_frequency_hz: Optional[float] = None,
 ) -> Tuple[Dict[str, Optional[AxisFit]], Optional[Tuple[float, float, float]], bool, List[str]]:
 	raw_rows = read_csv_rows(path)
 	rows = apply_row_filter(raw_rows, row_filter)
@@ -1162,16 +1256,44 @@ def analyze_file(
 		extra = ""
 		if div_health["corr_vz_over_alt"] == div_health["corr_vz_over_alt"]:  # not NaN
 			extra = f", corr(D, vz/alt)={div_health['corr_vz_over_alt']:+.2f}"
+		source = "relative_vz" if div_health["used_relative_motion"] else "vehicle_vz"
 		print(
-			f"  divergence vs z-motion: corr(D, vz)={div_health['corr_vz']:+.2f}{extra}  "
+			f"  divergence vs z-motion ({source}): corr(D, vz)={div_health['corr_vz']:+.2f}{extra}  "
 			f"(n={div_health['n']}, vz_std={div_health['vz_std']:.2f} m/s)"
 		)
 		if abs(div_health["corr_vz"]) < 0.6:
 			print(
 				"    <- WARNING: divergence is weakly coupled to vertical motion here, so the "
 				"thrust loop has little real signal at this operating point. Typical once the "
-				"target fills the frame (dense flow loses the focus of expansion)."
+				"target fills the frame (dense flow loses the focus of expansion), but if "
+				f"{source}=vehicle_vz, also check this isn't simply the platform moving too -- "
+				"see platform_motion.py and --platform-frequency-hz."
 			)
+
+	track = platform_tracking_report(rows, expected_frequency_hz=platform_frequency_hz)
+	if track is not None:
+		source = "relative_vz" if track["used_relative_motion"] else "vehicle_vz (no platform tracking logged)"
+		print(
+			f"  platform tracking ({source}): dominant response at "
+			f"{track['dominant_frequency_hz']:.4f} Hz (period {track['dominant_period_sec']:.1f}s), "
+			f"signal_std={track['signal_std']:.3f}, control rate {1.0/track['dt_sec']:.2f} Hz "
+			f"(Nyquist {track['nyquist_hz']:.2f} Hz)"
+		)
+		if "expected_frequency_hz" in track:
+			ratio = track["frequency_ratio_found_over_expected"]
+			print(
+				f"    commanded {track['expected_frequency_hz']:.4f} Hz (period "
+				f"{track['expected_period_sec']:.1f}s) -> found/expected ratio={ratio:.2f}"
+			)
+			if not (0.7 <= ratio <= 1.3):
+				print(
+					"    <- WARNING: dominant response frequency does not match the commanded "
+					"platform frequency. Likely the thrust loop's own underdamped natural mode "
+					"ringing rather than a cycle-by-cycle echo of the disturbance (the loop can't "
+					"track a disturbance much faster than its own bandwidth), not a units/sign "
+					"bug in this report -- but also double-check the Hz-vs-rad/s assumption in "
+					"platform_motion.py if this is the first test at a new frequency."
+				)
 
 	ok, reasons = assess_file_quality(rows, max_area_fraction_span=max_area_fraction_span)
 	# A run with thrust data but a blind divergence observable would only pour
@@ -1441,6 +1563,12 @@ def main():
 		"--max-area-fraction-span", type=float, default=0.15,
 		help="reject a file whose area_fraction sweeps wider than this (not one operating point)",
 	)
+	parser.add_argument(
+		"--platform-frequency-hz", type=float, default=None,
+		help="commanded oscillating-platform frequency for this test (match bee_platform.sdf's "
+		     "z_frequency, mind the Hz-vs-rad/s caveat in platform_motion.py) -- enables the "
+		     "found-vs-expected check in platform_tracking_report()",
+	)
 	args = parser.parse_args()
 
 	ensure_output_dir(args.output_dir)
@@ -1479,6 +1607,7 @@ def main():
 		fits, stats, ok, reasons = analyze_file(
 			path, args.dt, args.dt_tolerance, args.output_dir,
 			row_filter=row_filter, max_area_fraction_span=args.max_area_fraction_span,
+			platform_frequency_hz=args.platform_frequency_hz,
 		)
 		per_file_fits.append((path, fits, stats, ok, reasons))
 

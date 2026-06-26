@@ -67,6 +67,17 @@ class TargetEstimate:
 	offset_x/y : centroid offset from image center, normalized to [-1, 1].
 	area_fraction : detection area / frame area, in [0, 1]; the scheduling
 	    variable for the identified visual models.
+	fov_saturated : the detection's bounding box touches all four image
+	    borders -- the true target exceeds the camera's field of view, not
+	    just fills it. cv2.boundingRect is mechanically capped at the image
+	    array's own dimensions, so area_fraction/detection_width/height stop
+	    tracking true range entirely once this is True (confirmed: identical
+	    output across a 3x range of true target size). found stays True --
+	    a real contour is still selected -- but the geometry it reports is a
+	    frame-size artifact, not a measurement. Consumers that use these
+	    fields as a scheduling or identification variable should treat rows
+	    with fov_saturated=True as uninformative, not as a steady operating
+	    point.
 	"""
 
 	timestamp: float = 0.0
@@ -77,6 +88,31 @@ class TargetEstimate:
 	detection_height: float = 0.0
 	confidence: float = 0.0
 	area_fraction: float = 0.0
+	fov_saturated: bool = False
+
+
+@dataclass
+class PlatformState:
+	"""
+	Known/commanded landing-platform motion, for diagnostics and relative-
+	motion analysis only -- the control law never sees this (see
+	control_law.py: visual-only by design, divergence/offset are its only
+	inputs). Reconstructed analytically by platform_motion.py from the
+	OscillatingPlatformController SDF plugin's own amplitude/frequency/phase,
+	since the plugin does not publish its pose to ROS.
+
+	Same x/y/z, vx/vy/vz shape as VehicleState, but in the SDF world's own
+	frame/units -- see platform_motion.py's module docstring for the NED-vs-
+	ENU sign/axis caveat before comparing directly against VehicleState.
+	"""
+
+	timestamp: float = 0.0
+	x: float = 0.0
+	y: float = 0.0
+	z: float = 0.0
+	vx: float = 0.0
+	vy: float = 0.0
+	vz: float = 0.0
 
 
 @dataclass

@@ -88,6 +88,7 @@ from rclpy.qos import (
 )
 
 from sensor_msgs.msg import Image
+from geometry_msgs.msg import Pose
 from px4_msgs.msg import VehicleAttitude, VehicleLocalPosition
 
 try:
@@ -107,7 +108,7 @@ except ImportError:
 
 from cv_bridge import CvBridge, CvBridgeError
 
-from .state import VehicleState, AttitudeSetpoint, TargetEstimate
+from .state import VehicleState, PlatformState, AttitudeSetpoint, TargetEstimate
 from .optical_flow import OpticalFlowEstimator
 from .target_acquisition import TargetAcquisition
 from .px4_interface import PX4Interface
@@ -207,10 +208,10 @@ MAVSDK_TAKEOFF_PHASE_TIMEOUT_SEC = 200.0
 # leaving room for the open-loop test's own excursions on top of it). If
 # 6.0 still isn't enough clearance, re-solve the same way using whatever
 # area_fraction this value actually produces.
-TAKEOFF_ALTITUDE_M = 1.8
+TAKEOFF_ALTITUDE_M = 5
 OFFBOARD_PRESTREAM_SEC = 2.0
 OFFBOARD_CONFIRM_TIMEOUT_SEC = 5.0
-TAKEOFF_ALTITUDE_TOL_M = 0.3
+TAKEOFF_ALTITUDE_TOL_M = 0.15
 TAKEOFF_VZ_TOL_M_S = 0.08
 TAKEOFF_STABLE_SEC = 1.5
 TAKEOFF_TIMEOUT_SEC = 30.0
@@ -258,6 +259,32 @@ VEHICLE_STATUS_TOPICS = (
 	"/fmu/out/vehicle_status",
 	"/fmu/out/vehicle_status_v1",
 )
+
+# Bridged (ros_gz_bridge) ROS2 topic for the platform's exact world pose.
+# Published directly by OscillatingPlatformController itself (see
+# MovingPlatformController.cpp's publishPose) as a plain gz.msgs.Pose, on
+# its own dedicated single-entity topic -- not via gz-sim's generic pose
+# broadcasting, which two earlier approaches both confirmed unreliable here:
+# a PosePublisher SDF plugin only emitted a one-shot static snapshot for
+# this <static>true</static> model, and SceneBroadcaster's pose/info (a
+# Pose_V of every entity) bridges through ros_gz_bridge into
+# tf2_msgs/msg/TFMessage with every entity's name left empty -- confirmed
+# directly via this node's own "Entity names seen" log -- so there was no
+# way to pick this entity back out on the ROS side. Publishing our own
+# topic sidesteps both problems entirely, back to the simple message type:
+#   ros2 run ros_gz_bridge parameter_bridge \\
+#       /platform/pose@geometry_msgs/msg/Pose@gz.msgs.Pose
+# Set PLATFORM_POSE_TOPIC to None to disable platform-state logging
+# entirely (e.g. for a stationary-platform run, or before the bridge is set
+# up) -- diagnostics rows are written with empty platform_*/relative_*
+# fields either way.
+PLATFORM_POSE_TOPIC = "/platform/pose"
+
+# Real pose telemetry is noisy/jittery sample-to-sample; smooth the finite-
+# differenced velocity the same way OpticalFlowEstimator smooths divergence,
+# so relative_vz_m_s isn't dominated by differentiation noise (see
+# optical_flow.py's module docstring for the same underlying argument).
+PLATFORM_VELOCITY_SMOOTHING = 0.5
 
 VEHICLE_COMMAND_ACK_TOPICS = (
 	"/fmu/out/vehicle_command_ack",
@@ -524,6 +551,7 @@ class CalibrationNode(Node):
 	def __init__(self):
 		super().__init__("bee_calibration_node")
 
+		self._node_start_time = time.time()
 		self.bridge = CvBridge()
 
 		self._last_position_log_time = 0.0
@@ -538,6 +566,19 @@ class CalibrationNode(Node):
 		self._attitude_status_log_period_sec = 2.0
 
 		self._vehicle_state = VehicleState()
+
+		# Platform pose (dedicated bridge -> on_platform_pose): exact
+		# world-frame position each message, finite-differenced into a
+		# smoothed velocity (see PLATFORM_VELOCITY_SMOOTHING). None until the
+		# first message arrives, or forever if PLATFORM_POSE_TOPIC is None --
+		# diagnostics rows just get empty platform_*/relative_* fields.
+		self._platform_state = None
+		self._prev_platform_pose_t = None
+		self._prev_platform_pose_xyz = None
+		self._platform_velocity_filtered = (0.0, 0.0, 0.0)
+		self._has_filtered_platform_velocity = False
+		self._platform_pose_count = 0
+		self._platform_pose_stall_logged = False
 
 		self._latest_flow = None
 		self._latest_frame = None
@@ -709,6 +750,24 @@ class CalibrationNode(Node):
 			camera_qos,
 		)
 
+		if PLATFORM_POSE_TOPIC:
+			self.create_subscription(
+				Pose,
+				PLATFORM_POSE_TOPIC,
+				self.on_platform_pose,
+				camera_qos,
+			)
+			self.get_logger().info(
+				f"Platform pose tracking enabled: listening on {PLATFORM_POSE_TOPIC}. "
+				"If platform_*/relative_* diagnostics columns stay empty, the bridge "
+				"(ros_gz_bridge) for this topic likely isn't running, or the topic name "
+				"doesn't match what Gazebo actually publishes -- see this node's warning "
+				"after a few seconds with no messages, and PLATFORM_POSE_TOPIC's comment "
+				"for how to check both."
+			)
+		else:
+			self.get_logger().info("Platform pose tracking disabled (PLATFORM_POSE_TOPIC is None).")
+
 		self.px4 = PX4Interface(self, px4_qos)
 
 		self.create_timer(HEARTBEAT_PERIOD_SEC, self.on_heartbeat_timer)
@@ -759,6 +818,58 @@ class CalibrationNode(Node):
 		self._latest_frame = frame
 		self._latest_target = target
 		self._latest_flow = flow
+
+	def on_platform_pose(self, msg: Pose):
+		"""
+		Exact platform world pose, published directly by
+		OscillatingPlatformController on its own dedicated topic (see
+		PLATFORM_POSE_TOPIC and MovingPlatformController.cpp's publishPose) --
+		no entity matching needed, since every message on this topic IS the
+		platform, by construction. Position is exact; Pose carries no
+		velocity, so velocity is finite-differenced against the previous
+		message using THIS callback's own receipt time (same time.time()
+		pattern as on_camera/on_local_position), then smoothed -- raw
+		frame-to-frame differencing of real, slightly-jittery pose telemetry
+		amplifies noise the same way it would for optical flow (see
+		optical_flow.py's module docstring for the general argument). Stored
+		directly in the SDF world's own ENU convention; platform_motion.
+		relative_motion() handles the NED conversion when this is logged
+		alongside vehicle_state.
+		"""
+		now = time.time()
+		x, y, z = msg.position.x, msg.position.y, msg.position.z
+
+		self._platform_pose_count += 1
+		if self._platform_pose_count == 1:
+			self.get_logger().info(
+				f"First platform pose received on {PLATFORM_POSE_TOPIC}: "
+				f"x={x:.3f} y={y:.3f} z={z:.3f} (SDF world/ENU). "
+				"Platform tracking is live."
+			)
+
+		if self._prev_platform_pose_t is not None:
+			dt = now - self._prev_platform_pose_t
+			if dt > 1e-3:
+				px, py, pz = self._prev_platform_pose_xyz
+				raw_v = ((x - px) / dt, (y - py) / dt, (z - pz) / dt)
+
+				alpha = PLATFORM_VELOCITY_SMOOTHING
+				if not self._has_filtered_platform_velocity:
+					self._platform_velocity_filtered = raw_v
+					self._has_filtered_platform_velocity = True
+				else:
+					fv = self._platform_velocity_filtered
+					self._platform_velocity_filtered = tuple(
+						alpha * fv[i] + (1.0 - alpha) * raw_v[i] for i in range(3)
+					)
+
+		self._prev_platform_pose_t = now
+		self._prev_platform_pose_xyz = (x, y, z)
+
+		vx, vy, vz = self._platform_velocity_filtered
+		self._platform_state = PlatformState(
+			timestamp=now, x=x, y=y, z=z, vx=vx, vy=vy, vz=vz,
+		)
 
 	def on_local_position(self, msg: VehicleLocalPosition):
 		now = time.time()
@@ -873,6 +984,27 @@ class CalibrationNode(Node):
 
 	def on_mission_timer(self):
 		now = time.time()
+
+		if (
+			PLATFORM_POSE_TOPIC
+			and self._platform_pose_count == 0
+			and not self._platform_pose_stall_logged
+			and now - self._node_start_time >= 10.0
+		):
+			self._platform_pose_stall_logged = True
+			self.get_logger().warning(
+				f"No platform pose received on {PLATFORM_POSE_TOPIC} after "
+				f"{now - self._node_start_time:.0f}s. diagnostics will log empty "
+				"platform_*/relative_* fields until this is fixed. Check, in order: "
+				f"(1) `gz topic -l` shows {PLATFORM_POSE_TOPIC} and `gz topic -e -t "
+				"<that topic>` shows live data, not just a topic name that exists -- if "
+				"not, OscillatingPlatformController's new publisher may need the plugin "
+				"rebuilt/reinstalled, or the .so may be stale; "
+				"(2) the ros_gz_bridge process for this topic is actually running; "
+				f"(3) `ros2 topic info {PLATFORM_POSE_TOPIC} -v` WHILE this node is "
+				"still running (not after stopping it) shows this node's own name as "
+				"a subscriber, not just ros_gz_bridge's internal pub/sub pair."
+			)
 
 		# Checked first, before any phase-specific logic, and covers every
 		# phase from PHASE_PRESTREAM onward -- previously this only ran
@@ -1236,6 +1368,7 @@ class CalibrationNode(Node):
 				setpoint=self._latest_setpoint,
 				vehicle_state=self._vehicle_state,
 				calibration_axis=current_axis,
+				platform_state=self._platform_state,
 			)
 
 		if self.sequence.is_finished(elapsed) and not self._sequence_finished_logged:

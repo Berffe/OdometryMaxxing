@@ -48,6 +48,11 @@ void OscillatingPlatformController::Configure(const gz::sim::Entity &entity,
 	_z_amplitude = readSdfDouble(sdf, "z_amplitude", _z_amplitude);
 	_z_frequency = readSdfDouble(sdf, "z_frequency", _z_frequency);
 	_z_phase = readSdfDouble(sdf, "z_phase", _z_phase);
+
+	// Optional <pose_topic> SDF tag; defaults to /platform/pose (see the
+	// header's comment on publishPose for why this publisher exists at all).
+	_pose_topic = readSdfString(sdf, "pose_topic", _pose_topic);
+	_pose_publisher = _transport_node.Advertise<gz::msgs::Pose>(_pose_topic);
 }
 
 void OscillatingPlatformController::PreUpdate(const gz::sim::UpdateInfo &info,
@@ -63,6 +68,7 @@ void OscillatingPlatformController::PreUpdate(const gz::sim::UpdateInfo &info,
 	target_pose.Pos() = sinusoidalPosition(t);
 
 	_model.SetWorldPoseCmd(ecm, target_pose);
+	publishPose(target_pose);
 }
 
 double OscillatingPlatformController::readSdfDouble(const std::shared_ptr<const sdf::Element> &sdf,
@@ -76,6 +82,17 @@ double OscillatingPlatformController::readSdfDouble(const std::shared_ptr<const 
 	return sdf->Get<double>(tag);
 }
 
+std::string OscillatingPlatformController::readSdfString(const std::shared_ptr<const sdf::Element> &sdf,
+		const char *tag,
+		const std::string &default_value) const
+{
+	if (!sdf->HasElement(tag)) {
+		return default_value;
+	}
+
+	return sdf->Get<std::string>(tag);
+}
+
 gz::math::Vector3d OscillatingPlatformController::sinusoidalPosition(double time_sec) const
 {
 	const double x = _initial_pose.Pos().X()
@@ -86,4 +103,21 @@ gz::math::Vector3d OscillatingPlatformController::sinusoidalPosition(double time
 			+ _z_amplitude * std::sin(2.0 * GZ_PI * _z_frequency * time_sec + _z_phase);
 
 	return {x, y, z};
+}
+
+void OscillatingPlatformController::publishPose(const gz::math::Pose3d &pose)
+{
+	gz::msgs::Pose pose_msg;
+	pose_msg.set_name("platform");
+
+	pose_msg.mutable_position()->set_x(pose.Pos().X());
+	pose_msg.mutable_position()->set_y(pose.Pos().Y());
+	pose_msg.mutable_position()->set_z(pose.Pos().Z());
+
+	pose_msg.mutable_orientation()->set_x(pose.Rot().X());
+	pose_msg.mutable_orientation()->set_y(pose.Rot().Y());
+	pose_msg.mutable_orientation()->set_z(pose.Rot().Z());
+	pose_msg.mutable_orientation()->set_w(pose.Rot().W());
+
+	_pose_publisher.Publish(pose_msg);
 }

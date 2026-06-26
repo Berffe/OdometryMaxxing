@@ -29,12 +29,27 @@ Generated plots:
 	- vehicle_dynamics.png          (vx, vy, vz, yaw)
 	- divergence.png
 	- flow_mean_velocity.png        (flow_mean_x_px_s, flow_mean_y_px_s)
+	- platform_position_xyz.png     (oscillating-platform tests only)
+	- platform_velocity_xyz.png     (oscillating-platform tests only)
+	- relative_motion.png           (vehicle motion relative to the platform)
+	- divergence_vs_relative_motion.png  (the two overlaid -- what the thrust
+	                                       loop's observable should be tracking)
+	- relative_motion_spectrum.png  (FFT of the closing rate, vs the commanded
+	                                  platform frequency if --platform-frequency-hz
+	                                  is given -- catches the loop ringing at its
+	                                  own natural frequency instead of tracking
+	                                  the disturbance cycle-by-cycle)
 	- commands.png
 	- pipeline_latency.png          (data age per subsystem at logging time)
 
 Plots are skipped (with a printed message, not an error) when their
 required columns aren't present in the CSV, so this also works on logs
-from before a given column was added.
+from before a given column was added. The platform_*/relative_* plots
+need diagnostics_writer.py's platform-tracking columns (see
+platform_motion.py); older logs or stationary-platform runs without a
+platform_state simply skip them, falling back to vehicle_vz_m_s for the
+divergence-comparison and spectrum plots (equivalent when the platform
+isn't moving).
 """
 
 import argparse
@@ -528,6 +543,238 @@ def plot_commands(df: pd.DataFrame, t: np.ndarray, output_dir: str):
 	save_current_figure(output_dir, "commands.png")
 
 
+def plot_platform_position(df: pd.DataFrame, t: np.ndarray, output_dir: str):
+	"""platform_x/y/z_m: the landing platform's own world-frame position
+	(see platform_motion.py), from an oscillating-platform test. Confirms the
+	platform is actually moving as commanded -- a flat line here on a test
+	that should show oscillation usually means the PosePublisher bridge
+	isn't wired up, not that the platform stood still."""
+	columns = [
+		("platform_x_m", "platform x [m]"),
+		("platform_y_m", "platform y [m]"),
+		("platform_z_m", "platform z [m]"),
+	]
+	available = [(name, label) for name, label in columns if name in df.columns]
+	if not available:
+		print("Skipping platform position plot. No platform_*_m columns found (not tracked this run).")
+		return
+
+	fig, axes = plt.subplots(len(available), 1, figsize=(10, 2.7 * len(available)), sharex=True)
+	if len(available) == 1:
+		axes = [axes]
+
+	for ax, (column_name, label) in zip(axes, available):
+		y = numeric_column(df, column_name)
+		if np.all(np.isnan(y)):
+			ax.set_visible(False)
+			continue
+		ax.plot(t, y, label=label, color="tab:purple")
+		ax.axhline(0.0, linestyle="--", linewidth=1)
+		ax.set_ylabel(label)
+		ax.grid(True)
+		ax.legend(loc="best")
+
+	axes[-1].set_xlabel("time [s]")
+	save_current_figure(output_dir, "platform_position_xyz.png")
+
+
+def plot_platform_velocity(df: pd.DataFrame, t: np.ndarray, output_dir: str):
+	"""platform_vx/vy/vz_m_s: the platform's own velocity, in the SDF world's
+	ENU convention (up-positive z) -- see platform_motion.py before comparing
+	directly against vehicle_vz_m_s, which is PX4 NED (down-positive)."""
+	columns = [
+		("platform_vx_m_s", "platform vx [m/s] (ENU)"),
+		("platform_vy_m_s", "platform vy [m/s] (ENU)"),
+		("platform_vz_m_s", "platform vz [m/s] (ENU, up-positive)"),
+	]
+	available = [(name, label) for name, label in columns if name in df.columns]
+	if not available:
+		print("Skipping platform velocity plot. No platform_v*_m_s columns found (not tracked this run).")
+		return
+
+	fig, axes = plt.subplots(len(available), 1, figsize=(10, 2.7 * len(available)), sharex=True)
+	if len(available) == 1:
+		axes = [axes]
+
+	for ax, (column_name, label) in zip(axes, available):
+		y = numeric_column(df, column_name)
+		if np.all(np.isnan(y)):
+			ax.set_visible(False)
+			continue
+		ax.plot(t, y, label=label, color="tab:purple")
+		ax.axhline(0.0, linestyle="--", linewidth=1)
+		ax.set_ylabel(label)
+		ax.grid(True)
+		ax.legend(loc="best")
+
+	axes[-1].set_xlabel("time [s]")
+	save_current_figure(output_dir, "platform_velocity_xyz.png")
+
+
+def plot_relative_motion(df: pd.DataFrame, t: np.ndarray, output_dir: str):
+	"""
+	relative_x/y/z_m and relative_vx/vy/vz_m_s (see platform_motion.
+	relative_motion): vehicle motion relative to the platform, in PX4's NED
+	convention, with relative_vz a "closing rate" (positive = approaching) --
+	the variable divergence actually measures once the platform moves too,
+	not vehicle_vz_m_s alone. One figure, position then velocity per axis,
+	so each pair is easy to eyeball together.
+	"""
+	axis_pairs = [
+		("relative_x_m", "relative_vx_m_s", "x"),
+		("relative_y_m", "relative_vy_m_s", "y"),
+		("relative_z_m", "relative_vz_m_s", "z (closing rate)"),
+	]
+	available = [p for p in axis_pairs if p[0] in df.columns or p[1] in df.columns]
+	if not available:
+		print("Skipping relative motion plot. No relative_*_m/relative_v*_m_s columns found (not tracked this run).")
+		return
+
+	fig, axes = plt.subplots(len(available), 2, figsize=(12, 2.7 * len(available)), sharex=True)
+	if len(available) == 1:
+		axes = axes.reshape(1, 2)
+
+	for row, (pos_col, vel_col, axis_label) in enumerate(available):
+		ax_pos, ax_vel = axes[row, 0], axes[row, 1]
+
+		if pos_col in df.columns:
+			y = numeric_column(df, pos_col)
+			ax_pos.plot(t, y, color="tab:orange")
+			ax_pos.axhline(0.0, linestyle="--", linewidth=1)
+			ax_pos.set_ylabel(f"relative {axis_label} [m]")
+			ax_pos.grid(True)
+		else:
+			ax_pos.set_visible(False)
+
+		if vel_col in df.columns:
+			y = numeric_column(df, vel_col)
+			ax_vel.plot(t, y, color="tab:red")
+			ax_vel.axhline(0.0, linestyle="--", linewidth=1)
+			ax_vel.set_ylabel(f"relative {axis_label} rate [m/s]")
+			ax_vel.grid(True)
+		else:
+			ax_vel.set_visible(False)
+
+	axes[0, 0].set_title("relative position")
+	axes[0, 1].set_title("relative velocity")
+	axes[-1, 0].set_xlabel("time [s]")
+	axes[-1, 1].set_xlabel("time [s]")
+	save_current_figure(output_dir, "relative_motion.png")
+
+
+def plot_divergence_vs_relative_motion(df: pd.DataFrame, t: np.ndarray, output_dir: str):
+	"""
+	Divergence overlaid with the closing rate it's supposed to be measuring
+	-- relative_vz_m_s if a platform was tracked this run, else vehicle_vz_m_s
+	(equivalent when the platform is stationary). Different units (1/s vs
+	m/s), so divergence is the left axis and velocity the right (twinx) --
+	this is about whether the two move TOGETHER (phase/shape), not about
+	matching scales. A weak or out-of-phase relationship here is exactly the
+	"thrust loop has nothing reliable to act on" signature (see
+	fit_axis_models.py's divergence_motion_report for the numeric version of
+	this same check).
+	"""
+	if "flow_divergence_1_s" not in df.columns:
+		print("Skipping divergence-vs-relative-motion plot. Missing flow_divergence_1_s.")
+		return
+
+	if "relative_vz_m_s" in df.columns and not np.all(np.isnan(numeric_column(df, "relative_vz_m_s"))):
+		vel_col, vel_label, used_relative = "relative_vz_m_s", "relative_vz [m/s] (closing rate)", True
+	elif "vehicle_vz_m_s" in df.columns:
+		vel_col, vel_label, used_relative = "vehicle_vz_m_s", "vehicle_vz [m/s]", False
+	else:
+		print("Skipping divergence-vs-relative-motion plot. No relative_vz_m_s or vehicle_vz_m_s.")
+		return
+
+	divergence = numeric_column(df, "flow_divergence_1_s")
+	velocity = numeric_column(df, vel_col)
+
+	fig, ax1 = plt.subplots(figsize=(10, 5))
+	title_source = "relative_vz" if used_relative else "vehicle_vz (no platform tracking logged)"
+	ax1.set_title(f"Divergence vs closing velocity ({title_source})")
+
+	l1, = ax1.plot(t, divergence, color="tab:blue", label="flow_divergence_1_s")
+	ax1.axhline(0.0, linestyle="--", linewidth=1, color="tab:blue", alpha=0.5)
+	ax1.set_xlabel("time [s]")
+	ax1.set_ylabel("divergence [1/s]", color="tab:blue")
+	ax1.tick_params(axis="y", labelcolor="tab:blue")
+	ax1.grid(True)
+
+	ax2 = ax1.twinx()
+	l2, = ax2.plot(t, velocity, color="tab:red", label=vel_label, alpha=0.8)
+	ax2.set_ylabel(vel_label, color="tab:red")
+	ax2.tick_params(axis="y", labelcolor="tab:red")
+
+	ax1.legend(handles=[l1, l2], loc="best")
+	save_current_figure(output_dir, "divergence_vs_relative_motion.png")
+
+
+def plot_relative_motion_spectrum(
+	df: pd.DataFrame, t: np.ndarray, output_dir: str, expected_frequency_hz: float = None,
+):
+	"""
+	FFT of the closing-rate signal (relative_vz_m_s, falling back to
+	vehicle_vz_m_s), to check whether the vehicle's response actually shows
+	the commanded oscillation frequency or something else -- e.g. the thrust
+	loop's own underdamped natural mode ringing instead of tracking the
+	disturbance cycle-by-cycle. This is a real, observed failure mode, not
+	hypothetical: a 0.3m/0.2Hz platform test produced a clean, large ~0.043Hz
+	(~23s period) response with NO energy near the commanded 0.2Hz/5s
+	anywhere in vz, altitude, or divergence, while an equivalent stationary-
+	platform run showed no such mode at all -- so it was real and platform-
+	triggered, just not a 1:1 echo of the input. expected_frequency_hz (match
+	bee_platform.sdf's z_frequency, mind the Hz-vs-rad/s caveat in
+	platform_motion.py) draws a reference line so a mismatch like that is
+	visible at a glance. Needs roughly-evenly-sampled rows.
+	"""
+	if "relative_vz_m_s" in df.columns and not np.all(np.isnan(numeric_column(df, "relative_vz_m_s"))):
+		vel_col, used_relative = "relative_vz_m_s", True
+	elif "vehicle_vz_m_s" in df.columns:
+		vel_col, used_relative = "vehicle_vz_m_s", False
+	else:
+		print("Skipping relative motion spectrum. No relative_vz_m_s or vehicle_vz_m_s.")
+		return
+
+	sig = numeric_column(df, vel_col)
+	finite = np.isfinite(t) & np.isfinite(sig)
+	t_f, sig_f = t[finite], sig[finite]
+	if len(t_f) < 30:
+		print("Skipping relative motion spectrum. Not enough samples.")
+		return
+
+	dt = float(np.median(np.diff(t_f)))
+	if dt <= 1e-9:
+		print("Skipping relative motion spectrum. Non-increasing/degenerate time base.")
+		return
+
+	n = len(sig_f)
+	freqs = np.fft.rfftfreq(n, d=dt)
+	spec = np.abs(np.fft.rfft(sig_f - sig_f.mean()))
+
+	valid = freqs > (1.0 / (n * dt))
+	dominant_freq = float(freqs[valid][np.argmax(spec[valid])]) if valid.any() else 0.0
+
+	plt.figure(figsize=(10, 5))
+	source = "relative_vz" if used_relative else "vehicle_vz (no platform tracking logged)"
+	plt.title(f"Spectrum of closing-rate response ({source})")
+	plt.plot(freqs, spec, color="tab:blue")
+	plt.axvline(
+		dominant_freq, linestyle="--", color="tab:blue",
+		label=f"dominant: {dominant_freq:.4f} Hz ({1.0/dominant_freq:.1f}s)" if dominant_freq > 1e-9 else "dominant: DC",
+	)
+	if expected_frequency_hz is not None and expected_frequency_hz > 1e-9:
+		plt.axvline(
+			expected_frequency_hz, linestyle=":", color="tab:red",
+			label=f"commanded: {expected_frequency_hz:.4f} Hz ({1.0/expected_frequency_hz:.1f}s)",
+		)
+	plt.xlabel("frequency [Hz]")
+	plt.ylabel("|FFT|")
+	plt.grid(True)
+	plt.legend()
+
+	save_current_figure(output_dir, "relative_motion_spectrum.png")
+
+
 def plot_pipeline_latency(df: pd.DataFrame, t: np.ndarray, output_dir: str):
 	"""
 	How stale each subsystem's measurement was at the moment its row got
@@ -723,6 +970,18 @@ def main():
 		help="TargetAcquisition's absolute_max_area_fraction, drawn as a reference line. Default: 0.95.",
 	)
 
+	parser.add_argument(
+		"--platform-frequency-hz",
+		type=float,
+		default=None,
+		help=(
+			"Commanded oscillating-platform frequency for this test (match "
+			"bee_platform.sdf's z_frequency, mind the Hz-vs-rad/s caveat in "
+			"platform_motion.py) -- drawn as a reference line on the relative "
+			"motion spectrum plot. Omit to skip that reference line."
+		),
+	)
+
 	args = parser.parse_args()
 
 	# True for commands such as:
@@ -814,6 +1073,37 @@ def main():
 			df=df,
 			t=t,
 			output_dir=output_complete,
+		)
+
+		plot_platform_position(
+			df=df,
+			t=t,
+			output_dir=output_complete,
+		)
+
+		plot_platform_velocity(
+			df=df,
+			t=t,
+			output_dir=output_complete,
+		)
+
+		plot_relative_motion(
+			df=df,
+			t=t,
+			output_dir=output_complete,
+		)
+
+		plot_divergence_vs_relative_motion(
+			df=df,
+			t=t,
+			output_dir=output_complete,
+		)
+
+		plot_relative_motion_spectrum(
+			df=df,
+			t=t,
+			output_dir=output_complete,
+			expected_frequency_hz=args.platform_frequency_hz,
 		)
 
 		plot_commands(

@@ -26,10 +26,12 @@ except ImportError:
 	OffboardError = Exception
 
 from sensor_msgs.msg import Image
+from geometry_msgs.msg import Pose
+from std_msgs.msg import Bool
 from px4_msgs.msg import VehicleLocalPosition
 from cv_bridge import CvBridge, CvBridgeError
 
-from .state import VehicleState, AttitudeSetpoint, TargetEstimate
+from .state import VehicleState, PlatformState, AttitudeSetpoint, TargetEstimate
 from .optical_flow import OpticalFlowEstimator
 from .target_acquisition import TargetAcquisition
 from .control_law import ControlLaw
@@ -66,11 +68,50 @@ ENABLE_INERTIAL_SAFETY_ABORTS = False
 SAFETY_VZ_LIMIT = 1.0
 SAFETY_LATERAL_VELOCITY_LIMIT = 2.0
 
+# Bridged (ros_gz_bridge) ROS2 topic for the platform's exact world pose.
+# Published directly by OscillatingPlatformController itself (see
+# MovingPlatformController.cpp's publishPose) as a plain gz.msgs.Pose, on
+# its own dedicated single-entity topic -- not via gz-sim's generic pose
+# broadcasting, which two earlier approaches both confirmed unreliable here:
+# a PosePublisher SDF plugin only emitted a one-shot static snapshot for
+# this <static>true</static> model, and SceneBroadcaster's pose/info (a
+# Pose_V of every entity) bridges through ros_gz_bridge into
+# tf2_msgs/msg/TFMessage with every entity's name left empty -- confirmed
+# directly via this node's own "Entity names seen" log -- so there was no
+# way to pick this entity back out on the ROS side. Publishing our own
+# topic sidesteps both problems entirely, back to the simple message type:
+#   ros2 run ros_gz_bridge parameter_bridge \
+#       /platform/pose@geometry_msgs/msg/Pose@gz.msgs.Pose
+# Same topic/bridge as calibration_node.py -- keep these in sync.
+# Diagnostics-only, same as vehicle_state: the control law never sees this
+# (see control_law.py's module docstring). Set PLATFORM_POSE_TOPIC to None
+# to disable (e.g. a stationary-platform run); diagnostics rows just get
+# empty platform_*/relative_* fields either way.
+PLATFORM_POSE_TOPIC = "/platform/pose"
+
+# Real pose telemetry is noisy/jittery sample-to-sample; smooth the finite-
+# differenced velocity the same way OpticalFlowEstimator smooths divergence
+# (see optical_flow.py's module docstring for the same underlying argument).
+PLATFORM_VELOCITY_SMOOTHING = 0.5
+
+# Touchdown bridge. The Gazebo side is published by TouchPlugin in
+# bee_platform.sdf. Bridge it with:
+#   ros2 run ros_gz_bridge parameter_bridge \
+#       /bee_platform/touched@std_msgs/msg/Bool@gz.msgs.Boolean
+TOUCHDOWN_TOPIC = "/bee_platform/touched"
+TOUCHDOWN_STATUS_TOPIC = "/bee_land/touchdown"
+ENABLE_TOUCHDOWN_MOTOR_STOP = True
+# SITL fallback: if PX4 refuses a normal disarm because its internal land
+# detector does not recognize the moving-platform touchdown yet, kill() stops
+# the simulated motors. Keep this False for real hardware.
+ENABLE_TOUCHDOWN_KILL_FALLBACK = True
+
 PHASE_WAITING_FOR_STREAMS = "waiting_for_streams"
 PHASE_MAVSDK_TAKEOFF = "mavsdk_takeoff"
 PHASE_PRESTREAM = "prestream_offboard"
 PHASE_WAIT_OFFBOARD = "wait_offboard"
 PHASE_CLOSED_LOOP = "closed_loop"
+PHASE_LANDED = "landed"
 PHASE_ABORTED = "aborted"
 
 
@@ -98,8 +139,23 @@ class BeeLandNode(Node):
 	def __init__(self):
 		super().__init__("bee_land_node")
 
+		self._node_start_time = time.time()
 		self.bridge = CvBridge()
 		self._vehicle_state = VehicleState()
+
+		# Platform pose (dedicated bridge -> on_platform_pose): exact
+		# world-frame position each message, finite-differenced into a
+		# smoothed velocity (see PLATFORM_VELOCITY_SMOOTHING). None until the
+		# first message arrives, or forever if PLATFORM_POSE_TOPIC is None --
+		# diagnostics rows just get empty platform_*/relative_* fields.
+		self._platform_state = None
+		self._prev_platform_pose_t = None
+		self._prev_platform_pose_xyz = None
+		self._platform_velocity_filtered = (0.0, 0.0, 0.0)
+		self._has_filtered_platform_velocity = False
+		self._platform_pose_count = 0
+		self._platform_pose_stall_logged = False
+
 		self._latest_flow = None
 		self._latest_frame = None
 		self._latest_target = TargetEstimate()
@@ -127,6 +183,17 @@ class BeeLandNode(Node):
 		self._mavsdk_offboard_error = None
 		self._mavsdk_stop_requested = False
 
+		# Touchdown is a mission-level terminal event, not a visual-control input.
+		# The contact signal comes from Gazebo/TouchPlugin through ros_gz_bridge.
+		self._touchdown_detected = False
+		self._touchdown_time = None
+		self._touchdown_message_count = 0
+
+		self._mavsdk_motor_stop_requested = False
+		self._mavsdk_motor_stop_attempted = False
+		self._mavsdk_motor_stop_done = False
+		self._mavsdk_motor_stop_error = None
+
 		self.optical_flow = OpticalFlowEstimator()
 		self.target_acquisition = TargetAcquisition()
 
@@ -145,6 +212,12 @@ class BeeLandNode(Node):
 			history=QoSHistoryPolicy.KEEP_LAST,
 			depth=5,
 		)
+		touchdown_status_qos = QoSProfile(
+			reliability=QoSReliabilityPolicy.RELIABLE,
+			durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,
+			history=QoSHistoryPolicy.KEEP_LAST,
+			depth=1,
+		)
 
 		self.create_subscription(
 			VehicleLocalPosition,
@@ -153,6 +226,41 @@ class BeeLandNode(Node):
 			px4_qos,
 		)
 		self.create_subscription(Image, "/bee_x500/camera/image", self.on_camera, camera_qos)
+
+		if PLATFORM_POSE_TOPIC:
+			self.create_subscription(
+				Pose,
+				PLATFORM_POSE_TOPIC,
+				self.on_platform_pose,
+				camera_qos,
+			)
+			self.get_logger().info(
+				f"Platform pose tracking enabled: listening on {PLATFORM_POSE_TOPIC}. "
+				"If platform_*/relative_* diagnostics columns stay empty, the bridge "
+				"(ros_gz_bridge) for this topic likely isn't running, or the topic name "
+				"doesn't match what Gazebo actually publishes -- see this node's warning "
+				"after a few seconds with no messages, and PLATFORM_POSE_TOPIC's comment "
+				"for how to check both."
+			)
+		else:
+			self.get_logger().info("Platform pose tracking disabled (PLATFORM_POSE_TOPIC is None).")
+
+		self._touchdown_status_pub = self.create_publisher(
+			Bool,
+			TOUCHDOWN_STATUS_TOPIC,
+			touchdown_status_qos,
+		)
+		self.create_subscription(
+			Bool,
+			TOUCHDOWN_TOPIC,
+			self.on_touchdown,
+			camera_qos,
+		)
+		self._publish_touchdown_status(False)
+		self.get_logger().info(
+			f"Touchdown detection enabled: listening on {TOUCHDOWN_TOPIC}. "
+			f"Latched status is republished on {TOUCHDOWN_STATUS_TOPIC}."
+		)
 
 		self.create_timer(MISSION_PERIOD_SEC, self.on_mission_timer)
 		self.create_timer(CONTROL_PERIOD_SEC, self.on_control_timer)
@@ -192,6 +300,83 @@ class BeeLandNode(Node):
 		self._latest_target = target
 		self._latest_flow = flow
 
+	def on_platform_pose(self, msg: Pose):
+		"""
+		Exact platform world pose, published directly by
+		OscillatingPlatformController on its own dedicated topic (see
+		PLATFORM_POSE_TOPIC and MovingPlatformController.cpp's publishPose) --
+		no entity matching needed, since every message on this topic IS the
+		platform, by construction. Position is exact; Pose carries no
+		velocity, so velocity is finite-differenced against the previous
+		message using this callback's own receipt time (same time.time()
+		pattern as on_camera/on_local_position), then smoothed -- raw
+		frame-to-frame differencing of real, slightly-jittery pose telemetry
+		amplifies noise the same way it would for optical flow (see
+		optical_flow.py's module docstring for the same argument). Stored in
+		the SDF world's own ENU convention; platform_motion.relative_motion()
+		handles the NED conversion when this is logged alongside
+		vehicle_state. Diagnostics-only -- never read by control_law.
+		"""
+		now = time.time()
+		x, y, z = msg.position.x, msg.position.y, msg.position.z
+
+		self._platform_pose_count += 1
+		if self._platform_pose_count == 1:
+			self.get_logger().info(
+				f"First platform pose received on {PLATFORM_POSE_TOPIC}: "
+				f"x={x:.3f} y={y:.3f} z={z:.3f} (SDF world/ENU). "
+				"Platform tracking is live."
+			)
+
+		if self._prev_platform_pose_t is not None:
+			dt = now - self._prev_platform_pose_t
+			if dt > 1e-3:
+				px, py, pz = self._prev_platform_pose_xyz
+				raw_v = ((x - px) / dt, (y - py) / dt, (z - pz) / dt)
+
+				alpha = PLATFORM_VELOCITY_SMOOTHING
+				if not self._has_filtered_platform_velocity:
+					self._platform_velocity_filtered = raw_v
+					self._has_filtered_platform_velocity = True
+				else:
+					fv = self._platform_velocity_filtered
+					self._platform_velocity_filtered = tuple(
+						alpha * fv[i] + (1.0 - alpha) * raw_v[i] for i in range(3)
+					)
+
+		self._prev_platform_pose_t = now
+		self._prev_platform_pose_xyz = (x, y, z)
+
+		vx, vy, vz = self._platform_velocity_filtered
+		self._platform_state = PlatformState(
+			timestamp=now, x=x, y=y, z=z, vx=vx, vy=vy, vz=vz,
+		)
+
+	def on_touchdown(self, msg: Bool):
+		"""Gazebo/TouchPlugin contact event bridged from /bee_platform/touched.
+
+		The event is latched: after the first True sample, the mission is considered
+		landed even if the contact signal later drops because the platform moves or
+		the vehicle bounces. TouchPlugin's <time> parameter in the SDF already filters
+		out single-frame grazes before this callback receives True.
+		"""
+		self._touchdown_message_count += 1
+		if not bool(msg.data):
+			return
+
+		if self._touchdown_detected:
+			return
+
+		self._touchdown_detected = True
+		self._touchdown_time = time.time()
+		self.get_logger().warning(
+			"Gazebo touchdown detected: platform contact is stable."
+		)
+		self._publish_touchdown_status(True)
+
+		if self._mission_phase == PHASE_CLOSED_LOOP:
+			self._enter_landed_phase("touchdown contact event")
+
 	def on_local_position(self, msg: VehicleLocalPosition):
 		now = time.time()
 		self._have_local_position = True
@@ -212,6 +397,36 @@ class BeeLandNode(Node):
 
 	def on_mission_timer(self):
 		now = time.time()
+
+		if (
+			PLATFORM_POSE_TOPIC
+			and self._platform_pose_count == 0
+			and not self._platform_pose_stall_logged
+			and now - self._node_start_time >= 10.0
+		):
+			self._platform_pose_stall_logged = True
+			self.get_logger().warning(
+				f"No platform pose received on {PLATFORM_POSE_TOPIC} after "
+				f"{now - self._node_start_time:.0f}s. diagnostics will log empty "
+				"platform_*/relative_* fields until this is fixed. Check, in order: "
+				f"(1) `gz topic -l` shows {PLATFORM_POSE_TOPIC} and `gz topic -e -t "
+				"<that topic>` shows live data, not just a topic name that exists -- if "
+				"not, OscillatingPlatformController's new publisher may need the plugin "
+				"rebuilt/reinstalled, or the .so may be stale; "
+				"(2) the ros_gz_bridge process for this topic is actually running; "
+				f"(3) `ros2 topic info {PLATFORM_POSE_TOPIC} -v` WHILE this node is "
+				"still running (not after stopping it) shows this node's own name as "
+				"a subscriber, not just ros_gz_bridge's internal pub/sub pair."
+			)
+
+		if self._mission_phase == PHASE_LANDED:
+			# Keep the terminal state latched and keep publishing an explicit zero-
+			# thrust command until the MAVSDK worker confirms motor stop or the node
+			# is shut down by the user.
+			self._latest_setpoint = self._landed_zero_thrust_setpoint()
+			self._publish_touchdown_status(True)
+			return
+
 		if self._mission_phase == PHASE_ABORTED:
 			# Keep streaming a safe inertial hold setpoint instead of simply
 			# stopping MAVSDK offboard. Stopping the stream can trigger a PX4
@@ -265,6 +480,10 @@ class BeeLandNode(Node):
 			return
 
 		if self._mission_phase == PHASE_CLOSED_LOOP:
+			if self._touchdown_detected:
+				self._enter_landed_phase("latched touchdown flag")
+				return
+
 			if not self._closed_loop_logged:
 				self._closed_loop_logged = True
 				self.get_logger().info("Closed-loop visual landing/hover attempt running.")
@@ -276,12 +495,23 @@ class BeeLandNode(Node):
 		if self._latest_flow is None or self._latest_frame is None:
 			return
 
+		if self._mission_phase == PHASE_LANDED:
+			self._latest_setpoint = self._landed_zero_thrust_setpoint()
+			self._publish_touchdown_status(True)
+			self._write_diagnostics_row()
+			return
+
 		if self._mission_phase == PHASE_ABORTED:
 			self._latest_setpoint = self._neutral_visual_hold_setpoint()
 			self._write_diagnostics_row()
 			return
 
 		if self._mission_phase != PHASE_CLOSED_LOOP:
+			return
+
+		if self._touchdown_detected:
+			self._enter_landed_phase("latched touchdown flag")
+			self._write_diagnostics_row()
 			return
 
 		# Optional diagnostic-only safety aborts. Disabled by default because the
@@ -337,6 +567,7 @@ class BeeLandNode(Node):
 			flow=self._latest_flow,
 			setpoint=self._latest_setpoint,
 			vehicle_state=self._vehicle_state,
+			platform_state=self._platform_state,
 		)
 
 	def _ready_to_start(self) -> bool:
@@ -441,8 +672,68 @@ class BeeLandNode(Node):
 
 		self._mavsdk_offboard_started = True
 		while not self._mavsdk_stop_requested:
+			if self._mavsdk_motor_stop_requested and not self._mavsdk_motor_stop_done:
+				await self._try_mavsdk_motor_stop(drone)
+				if self._mavsdk_motor_stop_done:
+					break
+
 			await self._send_mavsdk_attitude_setpoint(drone)
 			await asyncio.sleep(MAVSDK_OFFBOARD_PERIOD_SEC)
+
+	async def _try_mavsdk_motor_stop(self, drone):
+		"""Stop motors after confirmed Gazebo touchdown.
+
+		Normal disarm is tried first. In SITL, kill() is used as a fallback when PX4's
+		internal land detector refuses the disarm on the moving platform. This method
+		attempts motor stop only once to avoid spamming MAVSDK/PX4 with repeated
+		commands if both methods fail.
+		"""
+		if self._mavsdk_motor_stop_attempted:
+			return
+
+		self._mavsdk_motor_stop_attempted = True
+		self._latest_setpoint = self._landed_zero_thrust_setpoint()
+
+		# Push one zero-thrust setpoint before asking PX4 to stop the motors.
+		try:
+			await self._send_mavsdk_attitude_setpoint(drone)
+		except Exception as exc:
+			self.get_logger().warning(
+				f"MAVSDK: failed to send final zero-thrust setpoint before disarm: {repr(exc)}"
+			)
+
+		try:
+			self.get_logger().warning("MAVSDK: touchdown confirmed, requesting disarm.")
+			await drone.action.disarm()
+			self.get_logger().warning("MAVSDK: disarm accepted after touchdown.")
+			self._mavsdk_motor_stop_done = True
+			self._mavsdk_stop_requested = True
+			return
+		except Exception as exc:
+			self._mavsdk_motor_stop_error = repr(exc)
+			self.get_logger().error(
+				f"MAVSDK: disarm failed after touchdown: {self._mavsdk_motor_stop_error}"
+			)
+
+		if not ENABLE_TOUCHDOWN_KILL_FALLBACK:
+			self.get_logger().error(
+				"MAVSDK: kill fallback disabled; keeping zero-thrust offboard stream alive."
+			)
+			return
+
+		try:
+			self.get_logger().error(
+				"MAVSDK: using kill fallback after confirmed Gazebo contact. SITL only."
+			)
+			await drone.action.kill()
+			self.get_logger().warning("MAVSDK: kill accepted after touchdown.")
+			self._mavsdk_motor_stop_done = True
+			self._mavsdk_stop_requested = True
+		except Exception as kill_exc:
+			self._mavsdk_motor_stop_error = repr(kill_exc)
+			self.get_logger().error(
+				f"MAVSDK: kill fallback failed: {self._mavsdk_motor_stop_error}"
+			)
 
 	async def _send_mavsdk_attitude_setpoint(self, drone):
 		sp = self._latest_setpoint
@@ -488,6 +779,41 @@ class BeeLandNode(Node):
 				os.kill(int(pid), signal.SIGKILL)
 			except ProcessLookupError:
 				pass
+
+	def _publish_touchdown_status(self, value: bool):
+		msg = Bool()
+		msg.data = bool(value)
+		self._touchdown_status_pub.publish(msg)
+
+	def _landed_zero_thrust_setpoint(self) -> AttitudeSetpoint:
+		"""Terminal setpoint after confirmed touchdown.
+
+		This is deliberately separate from _neutral_visual_hold_setpoint(): abort keeps
+		hover thrust, while a successful landing commands zero thrust until PX4/MAVSDK
+		accepts disarm or kill.
+		"""
+		return AttitudeSetpoint(
+			timestamp=getattr(self._latest_target, "timestamp", 0.0),
+			roll=0.0,
+			pitch=0.0,
+			yaw=0.0,
+			thrust=0.0,
+		)
+
+	def _enter_landed_phase(self, reason: str):
+		if self._mission_phase == PHASE_LANDED:
+			return
+
+		self.get_logger().warning(f"LANDING COMPLETE: {reason}. Entering landed phase.")
+		self._latest_setpoint = self._landed_zero_thrust_setpoint()
+		self._publish_touchdown_status(True)
+		if ENABLE_TOUCHDOWN_MOTOR_STOP:
+			self._mavsdk_motor_stop_requested = True
+		else:
+			self.get_logger().warning(
+				"Touchdown motor stop disabled; landed phase will only stream zero thrust."
+			)
+		self._enter_phase(PHASE_LANDED)
 
 	def _neutral_visual_hold_setpoint(self) -> AttitudeSetpoint:
 		"""Neutral visual-hover setpoint used after abort/target loss.

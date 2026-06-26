@@ -10,8 +10,10 @@ It logs, at each control tick:
 	- optical-flow outputs
 	- attitude/thrust commands
 	- vehicle state, for diagnostics only
+	- platform state and vehicle-relative motion, for diagnostics only
+	  (oscillating-platform tests -- see platform_motion.py)
 
-The vehicle state is not used by the control law.
+Neither the vehicle state nor the platform state is used by the control law.
 """
 
 import csv
@@ -24,16 +26,20 @@ try:
 	from .state import (
 		AttitudeSetpoint,
 		FlowResult,
+		PlatformState,
 		TargetEstimate,
 		VehicleState,
 	)
+	from .platform_motion import relative_motion
 except ImportError:
 	from state import (
 		AttitudeSetpoint,
 		FlowResult,
+		PlatformState,
 		TargetEstimate,
 		VehicleState,
 	)
+	from platform_motion import relative_motion
 
 
 class DiagnosticsWriter:
@@ -82,12 +88,22 @@ class DiagnosticsWriter:
 		setpoint: Optional[AttitudeSetpoint],
 		vehicle_state: Optional[VehicleState],
 		calibration_axis: Optional[str] = None,
+		platform_state: Optional[PlatformState] = None,
 	):
 		"""
 		Write one diagnostics row.
 
 		This should be called after the control law computes the latest
 		setpoint, usually once per control timer tick.
+
+		platform_state: the landing platform's reconstructed motion for an
+		oscillating-platform test (see platform_motion.py) -- None (the
+		default) for a stationary platform or any run that doesn't track it,
+		which writes empty platform_*/relative_* fields. When present, the
+		vehicle-relative motion (relative_x/y/z_m, relative_vx/vy/vz_m_s) is
+		computed and logged alongside it -- see platform_motion.relative_motion's
+		docstring for the sign convention (relative_vz is a "closing rate",
+		positive = approaching, matching divergence's own sign directly).
 
 		calibration_axis: only meaningful for calibration_node.py — which
 		axis ("roll"/"pitch"/"thrust"/"settle") the step sequence was
@@ -108,6 +124,8 @@ class DiagnosticsWriter:
 			self._t0 = float(wall_timestamp)
 
 		t_sec = float(wall_timestamp) - self._t0
+
+		relative = relative_motion(vehicle_state, platform_state)
 
 		row = {
 			# --------------------------------------------------------
@@ -194,6 +212,24 @@ class DiagnosticsWriter:
 			"vehicle_attitude_source": getattr(vehicle_state, "attitude_source", "") or "",
 
 			# --------------------------------------------------------
+			# Platform state and vehicle-relative motion, diagnostics only
+			# (oscillating-platform tests; empty if platform_state is None --
+			# see platform_motion.py and write()'s docstring)
+			# --------------------------------------------------------
+			"platform_x_m": self._optional_float(getattr(platform_state, "x", None)),
+			"platform_y_m": self._optional_float(getattr(platform_state, "y", None)),
+			"platform_z_m": self._optional_float(getattr(platform_state, "z", None)),
+			"platform_vx_m_s": self._optional_float(getattr(platform_state, "vx", None)),
+			"platform_vy_m_s": self._optional_float(getattr(platform_state, "vy", None)),
+			"platform_vz_m_s": self._optional_float(getattr(platform_state, "vz", None)),
+			"relative_x_m": self._optional_float(relative[0]),
+			"relative_y_m": self._optional_float(relative[1]),
+			"relative_z_m": self._optional_float(relative[2]),
+			"relative_vx_m_s": self._optional_float(relative[3]),
+			"relative_vy_m_s": self._optional_float(relative[4]),
+			"relative_vz_m_s": self._optional_float(relative[5]),
+
+			# --------------------------------------------------------
 			# Calibration-only metadata (empty outside calibration_node.py)
 			# --------------------------------------------------------
 			"calibration_axis": calibration_axis if calibration_axis else "",
@@ -277,6 +313,18 @@ class DiagnosticsWriter:
 			return -1
 
 	@staticmethod
+	def _optional_float(value):
+		"""float(value), or "" if value is None -- distinguishes "not tracked
+		this run" from "tracked and happens to be 0.0" (e.g. platform_*/
+		relative_* fields when platform_state isn't passed to write())."""
+		if value is None:
+			return ""
+		try:
+			return float(value)
+		except (TypeError, ValueError):
+			return ""
+
+	@staticmethod
 	def _fieldnames():
 		return [
 			# Time
@@ -329,6 +377,20 @@ class DiagnosticsWriter:
 			"vehicle_pitch_rad",
 			"vehicle_attitude_yaw_rad",
 			"vehicle_attitude_source",
+
+			# Platform state and vehicle-relative motion, diagnostics only
+			"platform_x_m",
+			"platform_y_m",
+			"platform_z_m",
+			"platform_vx_m_s",
+			"platform_vy_m_s",
+			"platform_vz_m_s",
+			"relative_x_m",
+			"relative_y_m",
+			"relative_z_m",
+			"relative_vx_m_s",
+			"relative_vy_m_s",
+			"relative_vz_m_s",
 
 			# Calibration-only metadata
 			"calibration_axis",
