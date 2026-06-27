@@ -1,5 +1,5 @@
 """
-Closed-loop visual controller: scheduled LQR baseline + manual per-altitude trim.
+Closed-loop visual controller: single-baseline LQR + manual per-altitude trim.
 
 Constraint: once the visual controller is active, commands use ONLY visual data
 (target offset, normalized optical flow, divergence, area_fraction). No PX4
@@ -7,19 +7,27 @@ position/velocity enters the control law.
 
 Per lateral axis (roll <- x, pitch <- y), the identified open-loop model is
     x[k+1] = A(af) x[k] + B(af) u[k],     x = [offset, flow_norm]^T
-with A, B scheduled on area_fraction (af). solve_discrete_lqr gives the optimal
-baseline gain K_lqr = [k_p, k_d]; the command is
+with A, B (and the scalar thrust divergence model's a, b) coming from a
+SINGLE trusted open-loop measurement (af=0.133, ~2m relative altitude) --
+see ROLL_STATE_MODELS/PITCH_STATE_MODELS/THRUST_DIVERGENCE_MODELS' comment
+for why the other open-loop knots that used to live there were dropped
+rather than kept as a multi-point schedule. solve_discrete_lqr gives the
+optimal baseline gain K_lqr = [k_p, k_d] from that one measurement; the
+command is
     u = sign * ( -(k_p_eff*offset + k_d_eff*flow) )
-with k_p_eff/k_d_eff derived from K_lqr via the manual trim knobs below. Open-
-loop calibration (calibration_node.py) is hard to collect cleanly -- platform-
-overflow, contact, drift -- so it is treated as a STARTING POINT only: it sets
-the gain SHAPE and sign/order-of-magnitude, not the final numbers.
+with k_p_eff/k_d_eff derived from K_lqr via the manual trim knobs below.
+This single baseline is a STARTING POINT only -- it sets the gain SHAPE and
+sign/order-of-magnitude at one operating point, not the final numbers at
+every altitude.
 
 The trim knobs (roll_prop_scale, pitch_damp_ratio, thrust_gain_scale, ...) are
-the actual tuning surface, and each one accepts EITHER:
-    a single number     -> applied uniformly across the whole af schedule
-    [(af, value), ...]   -> a value tuned PER ALTITUDE, interpolated like the
-                            LQR table itself (see lqr.ScalarSchedule)
+where altitude-dependent behavior actually lives now, and each one accepts
+EITHER:
+    a single number     -> applied uniformly at every area_fraction
+    [(af, value), ...]   -> a value tuned PER ALTITUDE, interpolated the
+                            same way ScheduledLQR's table used to be (see
+                            lqr.ScalarSchedule) -- this is now the ONLY
+                            place that kind of schedule lives in this file
 The intended workflow for the second form is closed-loop, not open-loop:
   1. Hover (divergence_setpoint=0) at a fixed altitude, hand-tune
      roll/pitch_prop_scale and damp_ratio against the REAL closed-loop
@@ -31,15 +39,26 @@ The intended workflow for the second form is closed-loop, not open-loop:
      z-motion, so divergence ~0 and the thrust gain has nothing to react
      to -- the platform's own oscillation is what makes the thrust loop's
      dynamics observable without the vehicle itself having to descend.
-Collect a few (af, value) pairs this way and pass them straight in.
+Collect a few (af, value) pairs this way and pass them straight in -- e.g.
+roll_prop_scale/roll_damp_ratio default to a single point at af=0.215 (the
+one altitude validated so far); add more points as more altitudes get their
+own closed-loop run, the same way roll/pitch's damping was tuned.
 
-Damping note: in the open-loop fit the optimal k_d is ~30x smaller than k_p, so
-the flow (velocity) term barely acts. damp_ratio (k_d = ratio*k_p) exists to
-deliberately raise it, since it doesn't depend on the LQR's unreliable k_d
-(the flow row is noisy and flips sign across the schedule). If the loop still
-oscillates after raising damping, relax *_slew_rate/command_filter_alpha: a
-tight slew rate rate-limits the damping command itself and reintroduces the
-lag the damping was meant to remove.
+Note for anyone re-deriving these numbers from a NEW measurement at a
+different af: since there's only one baseline now, changing it changes the
+baseline gain EVERYWHERE, not just locally -- a prop_scale/damp_ratio tuned
+against the old multi-knot baseline will not transfer exactly (damp_ratio,
+being a k_d/k_p RATIO, transfers far more robustly than prop_scale, which
+multiplies an absolute k_p that moves with the baseline).
+
+Damping note: in the open-loop fit the optimal k_d can be near zero or even
+wrong-signed relative to k_p (pitch's baseline at af=0.133 is ~0 -- see
+PITCH_STATE_MODELS' comment), so the flow (velocity) term would barely act,
+or act backwards, left alone. damp_ratio (k_d = ratio*k_p) exists to
+deliberately set it instead, since it doesn't depend on the LQR's own
+unreliable k_d. If the loop still oscillates after raising damping, relax
+*_slew_rate/command_filter_alpha: a tight slew rate rate-limits the damping
+command itself and reintroduces the lag the damping was meant to remove.
 
 Thrust uses the scalar divergence model d[k+1] = a d[k] + b (thrust - hover),
 with LQR feedback on the divergence error plus a visual-only integral term.
@@ -72,28 +91,40 @@ except ImportError:
     from state import AttitudeSetpoint, FlowResult, TargetEstimate
 
 
-# Open-loop scheduled models from the reconstructed calibration.
+# Open-loop model from the reconstructed calibration.
 # Entry: (area_fraction, A, B) for [offset[k+1], flow[k+1]]^T = A x + B u.
+#
+# Single knot, deliberately -- only the af=0.133 (~2m relative altitude)
+# measurement is trusted. The other three knots that used to live here
+# (0.066, 0.215, 0.511) came from open-loop calibration runs with known
+# quality problems (FOV saturation, drift, contact-detection edge cases --
+# see calibration_node.py/fit_axis_models.py's quality gates, built
+# specifically because of these) and are not trusted enough to anchor the
+# LQR's gain SHAPE at those operating points.
+#
+# With one knot, ScheduledLQR.gain_at() returns this SAME baseline at every
+# area_fraction (confirmed: its clamp-to-nearest-knot logic degenerates
+# correctly to "always this one" when there's nothing to interpolate
+# between -- no special-casing needed). All actual area_fraction-dependent
+# behavior now comes entirely from the manual trim ScalarSchedules below
+# (roll/pitch_prop_scale, *_damp_ratio, thrust_gain_scale,
+# divergence_integral_gain) -- hand-tuned via closed-loop testing at each
+# altitude of interest, the same way roll/pitch's damp_ratio values were
+# already tuned, rather than read off more open-loop knots of uncertain
+# quality. Add more knots back here only if a SPECIFIC af is independently
+# re-measured and trusted enough to justify reshaping the baseline itself,
+# as opposed to just adding another (af, value) point to a trim schedule.
 ROLL_STATE_MODELS = (
-    (0.066, [[0.7508, 0.3322], [-0.5140, 0.0995]], [[-0.28352], [-0.91928]]),
     (0.133, [[0.6785, 0.2522], [-0.7866, 0.0246]], [[-0.40704], [-1.06228]]),
-    (0.215, [[0.7334, 0.3234], [-0.4976, 0.0619]], [[-0.36399], [-0.88281]]),
-    (0.511, [[0.7437, 0.4134], [-0.4053, 0.0191]], [[-0.48681], [-0.84894]]),
 )
 
 PITCH_STATE_MODELS = (
-    (0.066, [[0.6834, 0.2032], [-0.8344, 0.0830]], [[-0.56504], [-1.22694]]),
     (0.133, [[0.7885, 0.0946], [-0.4753, -0.2675]], [[-0.88419], [-1.93529]]),
-    (0.215, [[0.8739, 0.1809], [-0.3154, -0.1988]], [[-0.77769], [-1.65307]]),
-    (0.511, [[0.8375, 0.2004], [-0.3098, -0.1282]], [[-0.62260], [-1.56707]]),
 )
 
 # Scalar divergence model: d[k+1] = a d[k] + b (thrust[k] - hover).
 THRUST_DIVERGENCE_MODELS = (
-    (0.066, [[0.9856]], [[-0.0818]]),
     (0.133, [[0.9302]], [[-0.1294]]),
-    (0.215, [[0.9481]], [[-0.1192]]),
-    (0.511, [[1.0315]], [[-0.1068]]),
 )
 
 
@@ -119,36 +150,50 @@ class ControlLaw:
         #     docstring). prop_scale multiplies the LQR proportional gain k_p.
         #     Damping is set ONE of two ways, per axis:
         #       damp_ratio is not None -> k_d = damp_ratio * k_p  (RECOMMENDED).
-        #         Guarantees damping is non-zero and same-signed as k_p at every
-        #         area_fraction. Needed because the open-loop flow row is noisy
-        #         and the LQR k_d it produces passes through zero / flips sign
-        #         across the schedule (notably ~0 at af=0.133).
+        #         Guarantees damping is non-zero and same-signed as k_p
+        #         regardless of the baseline's own k_d -- needed because the
+        #         open-loop flow row is noisy and the LQR k_d it produces can
+        #         be near zero or wrong-signed (see ROLL/PITCH_STATE_MODELS:
+        #         pitch's baseline k_d/k_p at the sole af=0.133 knot is ~0).
         #       damp_ratio is None -> k_d = damp_scale * (LQR k_d)  (legacy).
         #
         # Roll: switched to damp_ratio after a closed-loop hover run with the
         # legacy path (prop=0.5, damp_scale=15) showed a persistent, non-
         # decaying ~28.5s oscillation -- the SAME mode pitch had, now
-        # destabilized from the opposite direction. Roll's own LQR k_d/k_p is
-        # actually consistent across the schedule (~0.75-0.89, no dead zone
-        # like pitch's af=0.133), so damp_scale=15 on top of that gives an
-        # EFFECTIVE ratio ~24 (ratio*omega~5.4 at the 28s mode) -- command was
-        # 90% correlated with the (noisy, delayed) flow term and only 7% with
-        # actual offset, i.e. almost pure derivative feedback with little
-        # restoring force left. damp_ratio=4.5 (ratio*omega~1, same target as
-        # pitch's fix) is the new default; confirmed in closed-loop simulation
-        # that this settles cleanly where the old config only sustained.
-        roll_prop_scale=1.0,
+        # destabilized from the opposite direction. damp_ratio=4.5
+        # (ratio*omega~1, same target as pitch's fix) confirmed in closed-loop
+        # simulation settling cleanly where the old config only sustained.
+        # Validated by closed-loop testing at af=0.215 (climb=5.0m, ~3m
+        # relative altitude) -- written as a single-point schedule (not a
+        # plain float) specifically so it's obvious this is a STARTING point
+        # for one altitude, ready to grow into a real schedule as more
+        # altitudes get their own closed-loop validation, the same way the
+        # baseline model above now leans on these schedules instead of more
+        # open-loop knots. A single point behaves identically to a plain
+        # float (ScalarSchedule's clamp-to-nearest-knot degenerates the same
+        # way ScheduledLQR's does -- see ROLL_STATE_MODELS' comment) --
+        # changing nothing here, just making the TODO visible in the code
+        # rather than only in a comment.
+        roll_prop_scale=[(0.215, 1.0)],
         roll_damp_scale=1.5,            # inert while roll_damp_ratio is set; kept for the legacy path.
-        roll_damp_ratio=4.5,
+        roll_damp_ratio=[(0.215, 1.2)],
         # Pitch: damp_ratio=10 confirmed in a long closed-loop hover/descent
-        # run (std(offset_y)~0.005, zero saturation) -- working well, untouched.
-        pitch_prop_scale=0.2,
+        # run (std(offset_y)~0.005, zero saturation) -- working well.
+        # CRITICAL, not just recommended, now that ROLL_STATE_MODELS/
+        # PITCH_STATE_MODELS collapsed to the single af=0.133 knot: pitch's
+        # own LQR k_d/k_p at that exact knot is ~0.0001, i.e. zero baseline
+        # damping (the same dead zone flagged in the trim-knob comment
+        # above, previously just one knot among several, now the ONLY
+        # knot). damp_ratio=None here would mean pitch runs with
+        # essentially no damping at ANY area_fraction, not just locally --
+        # do not disable without replacing the baseline model's own (A,B).
+        pitch_prop_scale=[(0.215, 0.2)],
         pitch_damp_scale=10.0,          # inert while pitch_damp_ratio is set.
-        pitch_damp_ratio=10.0,
+        pitch_damp_ratio=[(0.215, 2.5)],
         # Thrust: still at its original conservative value -- this is the
         # next axis to tune, via hover with the platform's own z oscillation
         # turned on (see module docstring step 2), not yet exercised.
-        thrust_gain_scale=1.3,
+        thrust_gain_scale=0.55,
 
         # --- Command limits [rad] / normalized thrust. ---
         roll_limit: float = 0.035,
@@ -158,9 +203,9 @@ class ControlLaw:
 
         # --- Command shaping. Slew rates relaxed vs the first run so the
         #     damping command is not itself rate-limited away. ---
-        roll_slew_rate_rad_s: float = 0.050,
-        pitch_slew_rate_rad_s: float = 0.040,
-        thrust_slew_rate_per_s: float = 0.050,
+        roll_slew_rate_rad_s: float = 0.070,
+        pitch_slew_rate_rad_s: float = 0.060,
+        thrust_slew_rate_per_s: float = 0.070,
         command_filter_alpha: float = 0.60,
 
         # --- Visual thrust loop. Positive divergence = target expanding =

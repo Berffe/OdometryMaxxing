@@ -1,45 +1,35 @@
+"""CSV diagnostics writer for BEE_LAND runs.
+
+Important timestamp convention
+------------------------------
+``wall_timestamp`` is the only wall-clock reference used to build the relative
+``t_sec`` column. All other ``*_timestamp_sec`` fields are written as raw values
+from their own sources:
+
+- target / flow / command timestamps: vision timestamp used by bee_node.py,
+  normally Gazebo image simulation time.
+- vehicle_timestamp_sec / vehicle_px4_timestamp_sec: whatever VehicleState
+  carries, normally wall receipt time plus PX4's own timestamp depending on the
+  active state.py convention.
+- platform timestamp is not written because /platform/pose is an unstamped Pose.
+
+The writer deliberately does not subtract wall-clock origin from target/flow/PX4
+fields. Mixing those epochs caused the huge negative timestamp columns seen in
+recent logs.
 """
-CSV diagnostics writer for the bee landing controller.
 
-This module is intentionally independent from the controller logic.
-
-It logs, at each control tick:
-
-	- normalized time
-	- target acquisition outputs
-	- optical-flow outputs
-	- attitude/thrust commands
-	- vehicle state, for diagnostics only
-	- platform state and vehicle-relative motion, for diagnostics only
-	  (oscillating-platform tests -- see platform_motion.py)
-
-Neither the vehicle state nor the platform state is used by the control law.
-"""
+from __future__ import annotations
 
 import csv
 import os
 import time
-from datetime import datetime
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
 try:
-	from .state import (
-		AttitudeSetpoint,
-		FlowResult,
-		PlatformState,
-		TargetEstimate,
-		VehicleState,
-	)
-	from .platform_motion import relative_motion
-except ImportError:
-	from state import (
-		AttitudeSetpoint,
-		FlowResult,
-		PlatformState,
-		TargetEstimate,
-		VehicleState,
-	)
-	from platform_motion import relative_motion
+	from .state import AttitudeSetpoint, FlowResult, PlatformState, TargetEstimate, VehicleState
+except ImportError:  # Allows standalone import/tests from the controller folder.
+	from state import AttitudeSetpoint, FlowResult, PlatformState, TargetEstimate, VehicleState
 
 
 class DiagnosticsWriter:
@@ -47,291 +37,138 @@ class DiagnosticsWriter:
 		self,
 		output_dir: str = "logs",
 		filename: Optional[str] = None,
-		flush_every_row: bool = True,
+		flush_every_row: bool = False,
 	):
-		"""
-		Create a diagnostics CSV writer.
-
-		output_dir:
-			Folder where the CSV file will be created.
-
-		filename:
-			If None, a timestamped filename is generated automatically.
-
-		flush_every_row:
-			Useful for debugging. If the program crashes, the last rows are
-			still written to disk.
-		"""
-		os.makedirs(output_dir, exist_ok=True)
+		self.output_dir = Path(output_dir)
+		self.output_dir.mkdir(parents=True, exist_ok=True)
 
 		if filename is None:
-			date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-			filename = f"bee_diagnostics_{date_str}.csv"
+			filename = time.strftime("bee_diagnostics_%Y%m%d_%H%M%S.csv")
 
-		self.filepath = os.path.join(output_dir, filename)
+		self.filepath = str(self.output_dir / filename)
 		self._flush_every_row = bool(flush_every_row)
+		self._start_wall_timestamp: Optional[float] = None
 
-		self._file = open(self.filepath, mode="w", newline="")
+		self._file = open(self.filepath, "w", newline="", encoding="utf-8")
 		self._writer = csv.DictWriter(self._file, fieldnames=self._fieldnames())
 		self._writer.writeheader()
-
-		self._t0 = None
-		self._row_count = 0
-		self._run_status = "ok"
-		self._finalized = False
+		if self._flush_every_row:
+			self._file.flush()
 
 	def write(
 		self,
-		wall_timestamp: Optional[float],
+		wall_timestamp: float,
 		target: Optional[TargetEstimate],
 		flow: Optional[FlowResult],
 		setpoint: Optional[AttitudeSetpoint],
 		vehicle_state: Optional[VehicleState],
-		calibration_axis: Optional[str] = None,
 		platform_state: Optional[PlatformState] = None,
+		calibration_axis: str = "",
+		**_: Any,
 	):
-		"""
-		Write one diagnostics row.
+		wall_timestamp = float(wall_timestamp)
+		if self._start_wall_timestamp is None:
+			self._start_wall_timestamp = wall_timestamp
 
-		This should be called after the control law computes the latest
-		setpoint, usually once per control timer tick.
+		row = {name: "" for name in self._fieldnames()}
+		row["t_sec"] = wall_timestamp - self._start_wall_timestamp
+		row["wall_timestamp"] = wall_timestamp
 
-		platform_state: the landing platform's reconstructed motion for an
-		oscillating-platform test (see platform_motion.py) -- None (the
-		default) for a stationary platform or any run that doesn't track it,
-		which writes empty platform_*/relative_* fields. When present, the
-		vehicle-relative motion (relative_x/y/z_m, relative_vx/vy/vz_m_s) is
-		computed and logged alongside it -- see platform_motion.relative_motion's
-		docstring for the sign convention (relative_vz is a "closing rate",
-		positive = approaching, matching divergence's own sign directly).
+		if target is not None:
+			row.update({
+				"target_timestamp_sec": self._raw_ts(getattr(target, "timestamp", 0.0)),
+				"target_found": self._bool_int(getattr(target, "found", False)),
+				"target_confidence": self._num(getattr(target, "confidence", 0.0)),
+				"target_offset_x": self._num(getattr(target, "offset_x", 0.0)),
+				"target_offset_y": self._num(getattr(target, "offset_y", 0.0)),
+				"target_detection_width_px": self._num(getattr(target, "detection_width", 0.0)),
+				"target_detection_height_px": self._num(getattr(target, "detection_height", 0.0)),
+				"target_area_fraction": self._num(getattr(target, "area_fraction", 0.0)),
+				"target_fov_saturated": self._bool_int(getattr(target, "fov_saturated", False)),
+			})
 
-		calibration_axis: only meaningful for calibration_node.py — which
-		axis ("roll"/"pitch"/"thrust"/"settle") the step sequence was
-		exercising for this row. None (the default, and what bee_node.py
-		always passes implicitly by omitting it) writes an empty field.
-		fit_axis_models.py uses this to fit each axis only from its own
-		matching rows — without it, a row logged while e.g. roll is the
-		one genuinely open-loop axis under test, but thrust is being
-		actively damped against drift (see calibration_node.py), would
-		look to the thrust fit like an open-loop sample when it's
-		actually closed-loop, re-introducing the exact cause/effect
-		entanglement this whole logging setup exists to avoid.
-		"""
-		if wall_timestamp is None:
-			wall_timestamp = time.time()
+		if flow is not None:
+			row.update({
+				"flow_timestamp_sec": self._raw_ts(getattr(flow, "timestamp", 0.0)),
+				"flow_valid": self._bool_int(getattr(flow, "valid", False)),
+				"flow_mean_x_px_s": self._num(getattr(flow, "mean_flow_x", 0.0)),
+				"flow_mean_y_px_s": self._num(getattr(flow, "mean_flow_y", 0.0)),
+				"flow_mean_x_norm_s": self._num(getattr(flow, "mean_flow_x_norm", 0.0)),
+				"flow_mean_y_norm_s": self._num(getattr(flow, "mean_flow_y_norm", 0.0)),
+				"flow_divergence_1_s": self._num(getattr(flow, "divergence", 0.0)),
+				"flow_raw_divergence_1_s": self._num(getattr(flow, "raw_divergence", 0.0)),
+				"flow_roi_x0": self._int_or_blank(getattr(flow, "roi_x0", -1)),
+				"flow_roi_y0": self._int_or_blank(getattr(flow, "roi_y0", -1)),
+				"flow_roi_x1": self._int_or_blank(getattr(flow, "roi_x1", -1)),
+				"flow_roi_y1": self._int_or_blank(getattr(flow, "roi_y1", -1)),
+			})
 
-		if self._t0 is None:
-			self._t0 = float(wall_timestamp)
+		if setpoint is not None:
+			row.update({
+				"command_timestamp_sec": self._raw_ts(getattr(setpoint, "timestamp", 0.0)),
+				"command_roll_rad": self._num(getattr(setpoint, "roll", 0.0)),
+				"command_pitch_rad": self._num(getattr(setpoint, "pitch", 0.0)),
+				"command_yaw_rad": self._num(getattr(setpoint, "yaw", 0.0)),
+				"command_thrust": self._num(getattr(setpoint, "thrust", 0.0)),
+			})
 
-		t_sec = float(wall_timestamp) - self._t0
+		if vehicle_state is not None:
+			row.update({
+				"vehicle_timestamp_sec": self._raw_ts(getattr(vehicle_state, "timestamp", 0.0)),
+				"vehicle_px4_timestamp_sec": self._raw_ts(getattr(vehicle_state, "px4_timestamp_sec", 0.0)),
+				"vehicle_x_m": self._num(getattr(vehicle_state, "x", 0.0)),
+				"vehicle_y_m": self._num(getattr(vehicle_state, "y", 0.0)),
+				"vehicle_z_m": self._num(getattr(vehicle_state, "z", 0.0)),
+				"vehicle_vx_m_s": self._num(getattr(vehicle_state, "vx", 0.0)),
+				"vehicle_vy_m_s": self._num(getattr(vehicle_state, "vy", 0.0)),
+				"vehicle_vz_m_s": self._num(getattr(vehicle_state, "vz", 0.0)),
+				"vehicle_yaw_rad": self._num(getattr(vehicle_state, "yaw", 0.0)),
+				"vehicle_attitude_timestamp_sec": self._raw_ts(getattr(vehicle_state, "attitude_timestamp", 0.0)),
+				"vehicle_roll_rad": self._num(getattr(vehicle_state, "roll", 0.0)),
+				"vehicle_pitch_rad": self._num(getattr(vehicle_state, "pitch", 0.0)),
+				"vehicle_attitude_yaw_rad": self._num(getattr(vehicle_state, "attitude_yaw", 0.0)),
+				"vehicle_attitude_source": getattr(vehicle_state, "attitude_source", "") or "",
+			})
 
-		relative = relative_motion(vehicle_state, platform_state)
+		if platform_state is not None:
+			row.update({
+				"platform_x_m": self._num(getattr(platform_state, "x", 0.0)),
+				"platform_y_m": self._num(getattr(platform_state, "y", 0.0)),
+				"platform_z_m": self._num(getattr(platform_state, "z", 0.0)),
+				"platform_vx_m_s": self._num(getattr(platform_state, "vx", 0.0)),
+				"platform_vy_m_s": self._num(getattr(platform_state, "vy", 0.0)),
+				"platform_vz_m_s": self._num(getattr(platform_state, "vz", 0.0)),
+			})
 
-		row = {
-			# --------------------------------------------------------
-			# Time
-			# --------------------------------------------------------
-			"t_sec": t_sec,
-			"wall_timestamp": float(wall_timestamp),
+			if vehicle_state is not None:
+				# VehicleState is PX4 local NED: z grows negative upward. PlatformState is
+				# Gazebo world ENU. Therefore relative height in the existing logs is
+				# vehicle_z_NED + platform_z_ENU, and similarly for vz.
+				row.update({
+					"relative_x_m": self._num(getattr(vehicle_state, "x", 0.0) - getattr(platform_state, "x", 0.0)),
+					"relative_y_m": self._num(getattr(vehicle_state, "y", 0.0) - getattr(platform_state, "y", 0.0)),
+					"relative_z_m": self._num(getattr(vehicle_state, "z", 0.0) + getattr(platform_state, "z", 0.0)),
+					"relative_vx_m_s": self._num(getattr(vehicle_state, "vx", 0.0) - getattr(platform_state, "vx", 0.0)),
+					"relative_vy_m_s": self._num(getattr(vehicle_state, "vy", 0.0) - getattr(platform_state, "vy", 0.0)),
+					"relative_vz_m_s": self._num(getattr(vehicle_state, "vz", 0.0) + getattr(platform_state, "vz", 0.0)),
+				})
 
-			# --------------------------------------------------------
-			# Target acquisition
-			# --------------------------------------------------------
-			"target_timestamp_sec": self._normalize_optional_timestamp(
-				getattr(target, "timestamp", None)
-			),
-			"target_found": self._safe_bool(getattr(target, "found", False)),
-			"target_confidence": self._safe_float(getattr(target, "confidence", 0.0)),
-			"target_offset_x": self._safe_float(getattr(target, "offset_x", 0.0)),
-			"target_offset_y": self._safe_float(getattr(target, "offset_y", 0.0)),
-			"target_detection_width_px": self._safe_float(
-				getattr(target, "detection_width", 0.0)
-			),
-			"target_detection_height_px": self._safe_float(
-				getattr(target, "detection_height", 0.0)
-			),
-			"target_area_fraction": self._safe_float(
-				getattr(target, "area_fraction", 0.0)
-			),
-			"target_fov_saturated": self._safe_bool(getattr(target, "fov_saturated", False)),
-
-			# --------------------------------------------------------
-			# Optical flow
-			# --------------------------------------------------------
-			"flow_timestamp_sec": self._normalize_optional_timestamp(
-				getattr(flow, "timestamp", None)
-			),
-			"flow_valid": self._safe_bool(getattr(flow, "valid", False)),
-			"flow_mean_x_px_s": self._safe_float(getattr(flow, "mean_flow_x", 0.0)),
-			"flow_mean_y_px_s": self._safe_float(getattr(flow, "mean_flow_y", 0.0)),
-			"flow_mean_x_norm_s": self._safe_float(getattr(flow, "mean_flow_x_norm", 0.0)),
-			"flow_mean_y_norm_s": self._safe_float(getattr(flow, "mean_flow_y_norm", 0.0)),
-			"flow_divergence_1_s": self._safe_float(
-				getattr(flow, "divergence", 0.0)
-			),
-			"flow_raw_divergence_1_s": self._safe_float(
-				getattr(flow, "raw_divergence", getattr(flow, "divergence", 0.0))
-			),
-			"flow_roi_x0": self._safe_int(getattr(flow, "roi_x0", -1)),
-			"flow_roi_y0": self._safe_int(getattr(flow, "roi_y0", -1)),
-			"flow_roi_x1": self._safe_int(getattr(flow, "roi_x1", -1)),
-			"flow_roi_y1": self._safe_int(getattr(flow, "roi_y1", -1)),
-
-			# --------------------------------------------------------
-			# Controller command
-			# --------------------------------------------------------
-			"command_timestamp_sec": self._normalize_optional_timestamp(
-				getattr(setpoint, "timestamp", None)
-			),
-			"command_roll_rad": self._safe_float(getattr(setpoint, "roll", 0.0)),
-			"command_pitch_rad": self._safe_float(getattr(setpoint, "pitch", 0.0)),
-			"command_yaw_rad": self._safe_float(getattr(setpoint, "yaw", 0.0)),
-			"command_thrust": self._safe_float(getattr(setpoint, "thrust", 0.0)),
-
-			# --------------------------------------------------------
-			# Vehicle state, for diagnostics only
-			# --------------------------------------------------------
-			"vehicle_timestamp_sec": self._normalize_optional_timestamp(
-				getattr(vehicle_state, "timestamp", None)
-			),
-			"vehicle_x_m": self._safe_float(getattr(vehicle_state, "x", 0.0)),
-			"vehicle_y_m": self._safe_float(getattr(vehicle_state, "y", 0.0)),
-			"vehicle_z_m": self._safe_float(getattr(vehicle_state, "z", 0.0)),
-			"vehicle_vx_m_s": self._safe_float(getattr(vehicle_state, "vx", 0.0)),
-			"vehicle_vy_m_s": self._safe_float(getattr(vehicle_state, "vy", 0.0)),
-			"vehicle_vz_m_s": self._safe_float(getattr(vehicle_state, "vz", 0.0)),
-			"vehicle_yaw_rad": self._safe_float(getattr(vehicle_state, "yaw", 0.0)),
-			"vehicle_attitude_timestamp_sec": self._normalize_optional_timestamp(
-				getattr(vehicle_state, "attitude_timestamp", None)
-			),
-			"vehicle_roll_rad": self._safe_float(getattr(vehicle_state, "roll", 0.0)),
-			"vehicle_pitch_rad": self._safe_float(getattr(vehicle_state, "pitch", 0.0)),
-			"vehicle_attitude_yaw_rad": self._safe_float(
-				getattr(vehicle_state, "attitude_yaw", 0.0)
-			),
-			"vehicle_attitude_source": getattr(vehicle_state, "attitude_source", "") or "",
-
-			# --------------------------------------------------------
-			# Platform state and vehicle-relative motion, diagnostics only
-			# (oscillating-platform tests; empty if platform_state is None --
-			# see platform_motion.py and write()'s docstring)
-			# --------------------------------------------------------
-			"platform_x_m": self._optional_float(getattr(platform_state, "x", None)),
-			"platform_y_m": self._optional_float(getattr(platform_state, "y", None)),
-			"platform_z_m": self._optional_float(getattr(platform_state, "z", None)),
-			"platform_vx_m_s": self._optional_float(getattr(platform_state, "vx", None)),
-			"platform_vy_m_s": self._optional_float(getattr(platform_state, "vy", None)),
-			"platform_vz_m_s": self._optional_float(getattr(platform_state, "vz", None)),
-			"relative_x_m": self._optional_float(relative[0]),
-			"relative_y_m": self._optional_float(relative[1]),
-			"relative_z_m": self._optional_float(relative[2]),
-			"relative_vx_m_s": self._optional_float(relative[3]),
-			"relative_vy_m_s": self._optional_float(relative[4]),
-			"relative_vz_m_s": self._optional_float(relative[5]),
-
-			# --------------------------------------------------------
-			# Calibration-only metadata (empty outside calibration_node.py)
-			# --------------------------------------------------------
-			"calibration_axis": calibration_axis if calibration_axis else "",
-		}
+		row["calibration_axis"] = calibration_axis or ""
 
 		self._writer.writerow(row)
-		self._row_count += 1
-
 		if self._flush_every_row:
 			self._file.flush()
 
-	def set_run_status(self, status: str):
-		"""
-		Tag the run's outcome ("ok", "aborted", "settle_timeout",
-		"op_point_drift", ...). On close(), the status is appended to the
-		filename (calibration_..._<status>.csv) so failed runs are obvious
-		and stay out of the fit by default -- glob '*_ok.csv' or pass
-		fit_axis_models.py --exclude <status>. Only the first non-"ok"
-		status sticks, so the original abort reason is not overwritten.
-		"""
-		clean = "".join(c if c.isalnum() else "_" for c in str(status)).strip("_") or "ok"
-		if self._run_status == "ok":
-			self._run_status = clean
-
 	def close(self):
-		"""Flush, close, and rename the file to embed the run status."""
-		if self._finalized:
-			return
-		self._finalized = True
-
-		if not self._file.closed:
+		if getattr(self, "_file", None) is not None and not self._file.closed:
 			self._file.flush()
 			self._file.close()
-
-		stem, ext = os.path.splitext(self.filepath)
-		tagged = f"{stem}_{self._run_status}{ext}"
-		try:
-			os.replace(self.filepath, tagged)
-			self.filepath = tagged
-		except OSError:
-			pass  # best-effort: keep the original name if rename fails
-
-	def row_count(self) -> int:
-		return self._row_count
-
-	def _normalize_optional_timestamp(self, timestamp):
-		"""
-		Normalize a timestamp using the first CSV write time as t=0.
-
-		Returns an empty string if the timestamp is missing or zero.
-		"""
-		if timestamp is None:
-			return ""
-
-		try:
-			timestamp = float(timestamp)
-		except (TypeError, ValueError):
-			return ""
-
-		if timestamp <= 0.0 or self._t0 is None:
-			return ""
-
-		return timestamp - self._t0
-
-	@staticmethod
-	def _safe_float(value) -> float:
-		try:
-			return float(value)
-		except (TypeError, ValueError):
-			return 0.0
-
-	@staticmethod
-	def _safe_bool(value) -> int:
-		return 1 if bool(value) else 0
-
-	@staticmethod
-	def _safe_int(value) -> int:
-		try:
-			return int(value)
-		except (TypeError, ValueError):
-			return -1
-
-	@staticmethod
-	def _optional_float(value):
-		"""float(value), or "" if value is None -- distinguishes "not tracked
-		this run" from "tracked and happens to be 0.0" (e.g. platform_*/
-		relative_* fields when platform_state isn't passed to write())."""
-		if value is None:
-			return ""
-		try:
-			return float(value)
-		except (TypeError, ValueError):
-			return ""
 
 	@staticmethod
 	def _fieldnames():
 		return [
-			# Time
 			"t_sec",
 			"wall_timestamp",
-
-			# Target acquisition
 			"target_timestamp_sec",
 			"target_found",
 			"target_confidence",
@@ -341,8 +178,6 @@ class DiagnosticsWriter:
 			"target_detection_height_px",
 			"target_area_fraction",
 			"target_fov_saturated",
-
-			# Optical flow
 			"flow_timestamp_sec",
 			"flow_valid",
 			"flow_mean_x_px_s",
@@ -355,16 +190,13 @@ class DiagnosticsWriter:
 			"flow_roi_y0",
 			"flow_roi_x1",
 			"flow_roi_y1",
-
-			# Controller command
 			"command_timestamp_sec",
 			"command_roll_rad",
 			"command_pitch_rad",
 			"command_yaw_rad",
 			"command_thrust",
-
-			# Vehicle state, diagnostics only
 			"vehicle_timestamp_sec",
+			"vehicle_px4_timestamp_sec",
 			"vehicle_x_m",
 			"vehicle_y_m",
 			"vehicle_z_m",
@@ -377,8 +209,6 @@ class DiagnosticsWriter:
 			"vehicle_pitch_rad",
 			"vehicle_attitude_yaw_rad",
 			"vehicle_attitude_source",
-
-			# Platform state and vehicle-relative motion, diagnostics only
 			"platform_x_m",
 			"platform_y_m",
 			"platform_z_m",
@@ -391,7 +221,32 @@ class DiagnosticsWriter:
 			"relative_vx_m_s",
 			"relative_vy_m_s",
 			"relative_vz_m_s",
-
-			# Calibration-only metadata
 			"calibration_axis",
 		]
+
+	@staticmethod
+	def _raw_ts(value: Any):
+		try:
+			v = float(value)
+		except (TypeError, ValueError):
+			return ""
+		return "" if v <= 0.0 else v
+
+	@staticmethod
+	def _num(value: Any):
+		try:
+			return float(value)
+		except (TypeError, ValueError):
+			return ""
+
+	@staticmethod
+	def _bool_int(value: Any) -> int:
+		return 1 if bool(value) else 0
+
+	@staticmethod
+	def _int_or_blank(value: Any):
+		try:
+			v = int(value)
+		except (TypeError, ValueError):
+			return ""
+		return "" if v < 0 else v

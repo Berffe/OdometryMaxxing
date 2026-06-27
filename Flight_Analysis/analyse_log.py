@@ -1,60 +1,55 @@
 """
-Analyse bee landing diagnostics CSV.
+Analyse BEE_LAND diagnostics CSV logs with a coherent timestamp basis.
+
+Default output is intentionally synthetic: a small set of high-signal plots and
+one text summary. Extra legacy/detail plots can be enabled with --full.
 
 Usage:
 
-	# One CSV -> write all plots directly into results/test9
-	python analyse_log.py logs/bee_diagnostics_XXXXXXXX.csv results/test9
+    # One CSV -> write plots directly into results/test9
+    python analyse_log.py logs/bee_diagnostics_XXXXXXXX.csv results/test9
 
-	# Whole folder -> write one subfolder per CSV: results/test1, results/test2, ...
-	python analyse_log.py logs
+    # Whole folder -> write one subfolder per CSV: results/test1, test2, ...
+    python analyse_log.py logs
 
-Optional:
+    # Current moving-platform tests
+    python analyse_log.py logs/bee_diagnostics_XXXXXXXX.csv results/test9 \
+        --platform-frequency-hz 0.2
 
-	python analyse_log.py logs/bee_diagnostics_XXXXXXXX.csv \
-		--image-width 640 \
-		--image-height 480 \
-		--output-dir results/test9 \
-		--divergence-setpoint 0.15 \
-		--area-fraction-schedule 0.05,0.30,0.60,0.80,0.95,1.0 \
-		--max-area-fraction 0.60 \
-		--absolute-max-area-fraction 0.95
+Default generated files:
 
-Generated plots:
+    - summary.txt
+    - detection_boxes_fov.png             field-of-view reconstruction
+    - target_detection_summary.png
+    - lateral_control.png
+    - vertical_control.png
+    - platform_motion_frequency.png       when platform_z_m is available
+    - closing_rate_spectrum.png           when relative_vz_m_s or vehicle_vz_m_s is available
 
-	- detection_boxes_fov.png
-	- target_position_offsets.png
-	- target_quality.png            (target_confidence, target_area_fraction)
-	- vehicle_position_xyz.png
-	- vehicle_dynamics.png          (vx, vy, vz, yaw)
-	- divergence.png
-	- flow_mean_velocity.png        (flow_mean_x_px_s, flow_mean_y_px_s)
-	- platform_position_xyz.png     (oscillating-platform tests only)
-	- platform_velocity_xyz.png     (oscillating-platform tests only)
-	- relative_motion.png           (vehicle motion relative to the platform)
-	- divergence_vs_relative_motion.png  (the two overlaid -- what the thrust
-	                                       loop's observable should be tracking)
-	- relative_motion_spectrum.png  (FFT of the closing rate, vs the commanded
-	                                  platform frequency if --platform-frequency-hz
-	                                  is given -- catches the loop ringing at its
-	                                  own natural frequency instead of tracking
-	                                  the disturbance cycle-by-cycle)
-	- commands.png
-	- pipeline_latency.png          (data age per subsystem at logging time)
+Optional with --full:
 
-Plots are skipped (with a printed message, not an error) when their
-required columns aren't present in the CSV, so this also works on logs
-from before a given column was added. The platform_*/relative_* plots
-need diagnostics_writer.py's platform-tracking columns (see
-platform_motion.py); older logs or stationary-platform runs without a
-platform_state simply skip them, falling back to vehicle_vz_m_s for the
-divergence-comparison and spectrum plots (equivalent when the platform
-isn't moving).
+    - vehicle_position_xyz.png
+    - platform_position_xyz.png
+    - platform_velocity_xyz.png
+    - relative_motion_xyz.png
+
+Timestamp policy:
+
+    The controller now uses image / visual timestamps for target acquisition,
+    optical flow, divergence, and control dt. This analyser follows the same
+    convention by default: it uses flow_timestamp_sec if valid, then
+    target_timestamp_sec, then command_timestamp_sec. It never mixes PX4 epoch
+    timestamps with visual timestamps by absolute value. Wall time is used only
+    as a fallback and for estimating real-time factor.
 """
 
+from __future__ import annotations
+
 import argparse
+import math
 import os
 from pathlib import Path
+from typing import Iterable, Optional, Sequence, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -62,1064 +57,829 @@ import pandas as pd
 from matplotlib.patches import Rectangle
 
 
-def read_log(csv_path: str) -> pd.DataFrame:
-	df = pd.read_csv(csv_path)
-
-	if df.empty:
-		raise ValueError(f"CSV file is empty: {csv_path}")
-
-	return df
+# ---------------------------------------------------------------------------
+# I/O and columns
+# ---------------------------------------------------------------------------
 
 
-def get_time(df: pd.DataFrame) -> np.ndarray:
-	"""
-	Return normalized time in seconds.
-
-	Priority:
-		1. t_sec column
-		2. wall_timestamp - first wall_timestamp
-		3. sample index
-	"""
-	if "t_sec" in df.columns:
-		t = pd.to_numeric(df["t_sec"], errors="coerce").to_numpy()
-		return t - np.nanmin(t)
-
-	if "wall_timestamp" in df.columns:
-		t = pd.to_numeric(df["wall_timestamp"], errors="coerce").to_numpy()
-		return t - np.nanmin(t)
-
-	return np.arange(len(df), dtype=float)
+def read_log(csv_path: str | Path) -> pd.DataFrame:
+    df = pd.read_csv(csv_path)
+    if df.empty:
+        raise ValueError(f"CSV file is empty: {csv_path}")
+    return df
 
 
 def numeric_column(df: pd.DataFrame, name: str, default: float = np.nan) -> np.ndarray:
-	if name not in df.columns:
-		return np.full(len(df), default, dtype=float)
-
-	return pd.to_numeric(df[name], errors="coerce").to_numpy(dtype=float)
+    if name not in df.columns:
+        return np.full(len(df), default, dtype=float)
+    return pd.to_numeric(df[name], errors="coerce").to_numpy(dtype=float)
 
 
 def bool_column(df: pd.DataFrame, name: str, default: bool = False) -> np.ndarray:
-	if name not in df.columns:
-		return np.full(len(df), default, dtype=bool)
+    if name not in df.columns:
+        return np.full(len(df), default, dtype=bool)
 
-	raw = df[name]
-
-	if raw.dtype == bool:
-		return raw.to_numpy(dtype=bool)
-
-	# Handles 0/1, "true"/"false", "True"/"False".
-	if raw.dtype == object:
-		cleaned = raw.astype(str).str.lower().str.strip()
-		return cleaned.isin(["1", "true", "yes", "y"]).to_numpy(dtype=bool)
-
-	return pd.to_numeric(raw, errors="coerce").fillna(0).to_numpy(dtype=float) > 0.5
+    raw = df[name]
+    if raw.dtype == bool:
+        return raw.to_numpy(dtype=bool)
+    if raw.dtype == object:
+        cleaned = raw.astype(str).str.lower().str.strip()
+        return cleaned.isin(["1", "true", "yes", "y"]).to_numpy(dtype=bool)
+    return pd.to_numeric(raw, errors="coerce").fillna(0).to_numpy(dtype=float) > 0.5
 
 
-def ensure_output_dir(output_dir: str):
-	os.makedirs(output_dir, exist_ok=True)
+def ensure_output_dir(output_dir: str | Path):
+    os.makedirs(output_dir, exist_ok=True)
 
 
-def save_current_figure(output_dir: str, filename: str):
-	path = os.path.join(output_dir, filename)
-	plt.tight_layout()
-	plt.savefig(path, dpi=160)
-	plt.close()
-	print(f"Saved: {path}")
+def save_current_figure(output_dir: str | Path, filename: str):
+    path = Path(output_dir) / filename
+    plt.tight_layout()
+    plt.savefig(path, dpi=160)
+    plt.close()
+    print(f"Saved: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Timebase handling
+# ---------------------------------------------------------------------------
+
+
+TIME_BASE_COLUMNS = {
+    "flow": "flow_timestamp_sec",
+    "target": "target_timestamp_sec",
+    "command": "command_timestamp_sec",
+    "vehicle_px4": "vehicle_px4_timestamp_sec",
+    "vehicle": "vehicle_timestamp_sec",
+    "wall": "wall_timestamp",
+    "t_sec": "t_sec",
+}
+
+
+def _valid_time_column(df: pd.DataFrame, column: str) -> Tuple[bool, np.ndarray, str]:
+    if column not in df.columns:
+        return False, np.arange(len(df), dtype=float), f"missing {column}"
+
+    raw = numeric_column(df, column)
+    finite = np.isfinite(raw)
+    if np.count_nonzero(finite) < max(3, int(0.25 * len(df))):
+        return False, raw, f"too few finite samples in {column}"
+
+    # Use finite values in row order. Repeated timestamps are tolerated, but the
+    # column must have positive elapsed time and mostly non-negative increments.
+    values = raw[finite]
+    diffs = np.diff(values)
+    positive_span = float(np.nanmax(values) - np.nanmin(values))
+    if not np.isfinite(positive_span) or positive_span <= 1e-9:
+        return False, raw, f"degenerate span in {column}"
+
+    nonnegative_fraction = float(np.mean(diffs >= -1e-9)) if len(diffs) else 1.0
+    if nonnegative_fraction < 0.90:
+        return False, raw, f"not mostly monotonic in {column}"
+
+    return True, raw, "ok"
+
+
+def choose_time_base(df: pd.DataFrame, requested: str = "auto") -> Tuple[np.ndarray, str, str]:
+    """Return elapsed time, source column, and a human-readable description."""
+    if requested != "auto":
+        column = TIME_BASE_COLUMNS[requested]
+        ok, raw, reason = _valid_time_column(df, column)
+        if not ok:
+            raise ValueError(f"Requested time base '{requested}' is invalid: {reason}")
+        return _normalize_elapsed(raw), column, f"requested {requested} ({column})"
+
+    # Match the current controller's actual visual timebase first. PX4 time is
+    # deliberately late in the list because its absolute epoch may be unrelated
+    # to Gazebo image time.
+    priority = [
+        "flow_timestamp_sec",
+        "target_timestamp_sec",
+        "command_timestamp_sec",
+        "t_sec",
+        "wall_timestamp",
+        "vehicle_timestamp_sec",
+        "vehicle_px4_timestamp_sec",
+    ]
+
+    reasons = []
+    for column in priority:
+        ok, raw, reason = _valid_time_column(df, column)
+        if ok:
+            return _normalize_elapsed(raw), column, f"auto-selected {column}"
+        reasons.append(f"{column}: {reason}")
+
+    return np.arange(len(df), dtype=float), "sample_index", "fallback sample index; " + "; ".join(reasons)
+
+
+def _normalize_elapsed(raw: np.ndarray) -> np.ndarray:
+    raw = np.asarray(raw, dtype=float)
+    finite = np.isfinite(raw)
+    if not np.any(finite):
+        return np.arange(len(raw), dtype=float)
+    t0 = float(raw[finite][0])
+    return raw - t0
+
+
+def median_positive_dt(t: np.ndarray) -> float:
+    finite = np.isfinite(t)
+    values = t[finite]
+    if len(values) < 2:
+        return float("nan")
+    diffs = np.diff(values)
+    diffs = diffs[np.isfinite(diffs) & (diffs > 1e-9)]
+    if len(diffs) == 0:
+        return float("nan")
+    return float(np.median(diffs))
+
+
+def estimate_rtf(df: pd.DataFrame, analysis_t: np.ndarray) -> Optional[float]:
+    """Estimate sim/visual time advance divided by wall time advance."""
+    wall_t = None
+    if "t_sec" in df.columns:
+        wall_t = _normalize_elapsed(numeric_column(df, "t_sec"))
+    elif "wall_timestamp" in df.columns:
+        wall_t = _normalize_elapsed(numeric_column(df, "wall_timestamp"))
+
+    if wall_t is None:
+        return None
+
+    sim_dt = np.diff(analysis_t)
+    wall_dt = np.diff(wall_t)
+    mask = np.isfinite(sim_dt) & np.isfinite(wall_dt) & (sim_dt > 1e-9) & (wall_dt > 1e-9)
+    if np.count_nonzero(mask) < 3:
+        return None
+    return float(np.median(sim_dt[mask] / wall_dt[mask]))
+
+
+# ---------------------------------------------------------------------------
+# Frequency helpers
+# ---------------------------------------------------------------------------
+
+
+def sine_fit_at_frequency(t: np.ndarray, y: np.ndarray, frequency_hz: float) -> Optional[dict]:
+    if frequency_hz is None or frequency_hz <= 0.0:
+        return None
+    mask = np.isfinite(t) & np.isfinite(y)
+    if np.count_nonzero(mask) < 8:
+        return None
+
+    tt = t[mask]
+    yy = y[mask]
+    w = 2.0 * math.pi * frequency_hz
+    X = np.column_stack([np.ones_like(tt), np.sin(w * tt), np.cos(w * tt)])
+    coeff, *_ = np.linalg.lstsq(X, yy, rcond=None)
+    offset, a_sin, b_cos = [float(v) for v in coeff]
+    y_hat = X @ coeff
+    amp = float(math.hypot(a_sin, b_cos))
+    phase = float(math.atan2(b_cos, a_sin))
+    rmse = float(np.sqrt(np.mean((yy - y_hat) ** 2)))
+    return {
+        "frequency_hz": float(frequency_hz),
+        "period_s": 1.0 / float(frequency_hz),
+        "amplitude": amp,
+        "offset": offset,
+        "phase_rad": phase,
+        "rmse": rmse,
+        "t": tt,
+        "fit": y_hat,
+    }
+
+
+def dominant_frequency_fft(
+    t: np.ndarray,
+    y: np.ndarray,
+    min_frequency_hz: float = 0.01,
+    max_frequency_hz: float = 2.0,
+) -> Optional[dict]:
+    mask = np.isfinite(t) & np.isfinite(y)
+    if np.count_nonzero(mask) < 20:
+        return None
+
+    tt = t[mask]
+    yy = y[mask]
+    order = np.argsort(tt)
+    tt = tt[order]
+    yy = yy[order]
+
+    span = float(tt[-1] - tt[0])
+    dt = median_positive_dt(tt)
+    if not np.isfinite(dt) or dt <= 1e-9 or span <= 0.0:
+        return None
+
+    n = int(max(32, math.floor(span / dt) + 1))
+    t_uniform = np.linspace(tt[0], tt[-1], n)
+    y_uniform = np.interp(t_uniform, tt, yy)
+    y_uniform = y_uniform - float(np.mean(y_uniform))
+
+    freqs = np.fft.rfftfreq(n, d=(t_uniform[1] - t_uniform[0]))
+    spec = np.abs(np.fft.rfft(y_uniform))
+    valid = (freqs >= min_frequency_hz) & (freqs <= max_frequency_hz)
+    if not np.any(valid):
+        return None
+
+    idxs = np.where(valid)[0]
+    idx = int(idxs[np.argmax(spec[valid])])
+    return {
+        "frequency_hz": float(freqs[idx]),
+        "period_s": float(1.0 / freqs[idx]) if freqs[idx] > 1e-12 else float("inf"),
+        "freqs": freqs,
+        "spectrum": spec,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Summary
+# ---------------------------------------------------------------------------
+
+
+def compute_summary(
+    df: pd.DataFrame,
+    t: np.ndarray,
+    time_column: str,
+    time_description: str,
+    expected_platform_frequency_hz: Optional[float],
+) -> str:
+    lines = []
+    lines.append("BEE_LAND log summary")
+    lines.append("====================")
+    lines.append(f"Rows: {len(df)}")
+    lines.append(f"Time base: {time_description}")
+    lines.append(f"Analysis time span: {np.nanmin(t):.3f} s -> {np.nanmax(t):.3f} s")
+    lines.append(f"Median analysis dt: {median_positive_dt(t):.4f} s")
+
+    rtf = estimate_rtf(df, t)
+    if rtf is not None:
+        lines.append(f"Median visual/sim time per wall time: {rtf:.3f}")
+
+    if "target_found" in df.columns:
+        target_found = bool_column(df, "target_found")
+        lines.append(f"Target found ratio: {np.mean(target_found):.3f}")
+    if "flow_valid" in df.columns:
+        flow_valid = bool_column(df, "flow_valid")
+        lines.append(f"Flow valid ratio: {np.mean(flow_valid):.3f}")
+    if "target_fov_saturated" in df.columns:
+        sat = bool_column(df, "target_fov_saturated")
+        lines.append(f"FOV saturated samples: {np.count_nonzero(sat)} / {len(sat)}")
+
+    for col, label in [
+        ("command_roll_rad", "roll command [rad]"),
+        ("command_pitch_rad", "pitch command [rad]"),
+        ("command_thrust", "thrust command [-]"),
+        ("flow_divergence_1_s", "flow divergence [1/s]"),
+        ("relative_z_m", "relative z [m]"),
+        ("relative_vz_m_s", "relative vz [m/s]"),
+    ]:
+        if col in df.columns:
+            y = numeric_column(df, col)
+            finite = y[np.isfinite(y)]
+            if len(finite):
+                lines.append(
+                    f"{label}: min={np.min(finite):.4g}, median={np.median(finite):.4g}, max={np.max(finite):.4g}"
+                )
+
+    if "platform_z_m" in df.columns:
+        z = numeric_column(df, "platform_z_m")
+        finite = z[np.isfinite(z)]
+        if len(finite):
+            lines.append(
+                f"Platform z range: {np.min(finite):.4f} m -> {np.max(finite):.4f} m "
+                f"(peak-to-peak {np.max(finite) - np.min(finite):.4f} m)"
+            )
+
+        dom = dominant_frequency_fft(t, z, min_frequency_hz=0.01, max_frequency_hz=2.0)
+        if dom is not None:
+            lines.append(
+                f"Platform z dominant frequency: {dom['frequency_hz']:.4f} Hz "
+                f"(period {dom['period_s']:.3f} s)"
+            )
+
+        fit = sine_fit_at_frequency(t, z, expected_platform_frequency_hz)
+        if fit is not None:
+            lines.append(
+                f"Platform z fit at expected frequency {expected_platform_frequency_hz:.4f} Hz: "
+                f"amplitude={fit['amplitude']:.4f} m, offset={fit['offset']:.4f} m, "
+                f"RMSE={fit['rmse']:.5f} m"
+            )
+
+    return "\n".join(lines) + "\n"
+
+
+def write_summary(output_dir: str | Path, summary: str):
+    path = Path(output_dir) / "summary.txt"
+    path.write_text(summary, encoding="utf-8")
+    print(summary.rstrip())
+    print(f"Saved: {path}")
+
+
+# ---------------------------------------------------------------------------
+# Plotting: synthetic defaults
+# ---------------------------------------------------------------------------
+
+
+def _mark_bool_false(ax, t: np.ndarray, mask_false: np.ndarray, label: str):
+    if np.any(mask_false):
+        ax.scatter(t[mask_false], np.zeros(np.count_nonzero(mask_false)), marker="x", s=24, label=label)
+
+
+def plot_target_detection_summary(df: pd.DataFrame, t: np.ndarray, output_dir: str):
+    required_any = ["target_offset_x", "target_offset_y", "target_area_fraction", "target_confidence"]
+    if not any(c in df.columns for c in required_any):
+        print("Skipping target detection summary. No target columns found.")
+        return
+
+    target_found = bool_column(df, "target_found", default=True)
+    fov_sat = bool_column(df, "target_fov_saturated", default=False)
+
+    fig, axes = plt.subplots(3, 1, figsize=(11, 8), sharex=True)
+    fig.suptitle("Target detection summary")
+
+    if "target_offset_x" in df.columns:
+        axes[0].plot(t, numeric_column(df, "target_offset_x"), label="offset x")
+    if "target_offset_y" in df.columns:
+        axes[0].plot(t, numeric_column(df, "target_offset_y"), label="offset y")
+    _mark_bool_false(axes[0], t, ~target_found, "target not found")
+    axes[0].axhline(0.0, linestyle="--", linewidth=1)
+    axes[0].set_ylabel("offset [-]")
+    axes[0].grid(True)
+    axes[0].legend(loc="best")
+
+    if "target_area_fraction" in df.columns:
+        axes[1].plot(t, numeric_column(df, "target_area_fraction"), label="area fraction")
+    if np.any(fov_sat):
+        axes[1].scatter(t[fov_sat], numeric_column(df, "target_area_fraction")[fov_sat], marker="o", s=18, label="FOV saturated")
+    axes[1].set_ylabel("area fraction [-]")
+    axes[1].grid(True)
+    axes[1].legend(loc="best")
+
+    if "target_confidence" in df.columns:
+        axes[2].plot(t, numeric_column(df, "target_confidence"), label="confidence")
+    axes[2].fill_between(t, 0, 1, where=~target_found, alpha=0.15, label="not found")
+    axes[2].set_ylim(-0.05, 1.05)
+    axes[2].set_ylabel("confidence [-]")
+    axes[2].set_xlabel("time [s]")
+    axes[2].grid(True)
+    axes[2].legend(loc="best")
+
+    save_current_figure(output_dir, "target_detection_summary.png")
+
+
+def plot_lateral_control(df: pd.DataFrame, t: np.ndarray, output_dir: str):
+    if not any(c in df.columns for c in ["target_offset_x", "target_offset_y", "command_roll_rad", "command_pitch_rad"]):
+        print("Skipping lateral control plot. Missing lateral target/command columns.")
+        return
+
+    fig, axes = plt.subplots(2, 1, figsize=(11, 6.5), sharex=True)
+    fig.suptitle("Lateral visual control")
+
+    if "target_offset_x" in df.columns:
+        axes[0].plot(t, numeric_column(df, "target_offset_x"), label="target_offset_x")
+    if "target_offset_y" in df.columns:
+        axes[0].plot(t, numeric_column(df, "target_offset_y"), label="target_offset_y")
+    axes[0].axhline(0.0, linestyle="--", linewidth=1)
+    axes[0].set_ylabel("image offset [-]")
+    axes[0].grid(True)
+    axes[0].legend(loc="best")
+
+    if "command_roll_rad" in df.columns:
+        axes[1].plot(t, numeric_column(df, "command_roll_rad"), label="roll command")
+    if "command_pitch_rad" in df.columns:
+        axes[1].plot(t, numeric_column(df, "command_pitch_rad"), label="pitch command")
+    axes[1].axhline(0.0, linestyle="--", linewidth=1)
+    axes[1].set_ylabel("command [rad]")
+    axes[1].set_xlabel("time [s]")
+    axes[1].grid(True)
+    axes[1].legend(loc="best")
+
+    save_current_figure(output_dir, "lateral_control.png")
+
+
+def plot_vertical_control(df: pd.DataFrame, t: np.ndarray, output_dir: str, divergence_setpoint: Optional[float]):
+    available = any(c in df.columns for c in ["flow_divergence_1_s", "relative_vz_m_s", "vehicle_vz_m_s", "command_thrust", "relative_z_m"])
+    if not available:
+        print("Skipping vertical control plot. Missing vertical/divergence/command columns.")
+        return
+
+    fig, axes = plt.subplots(3, 1, figsize=(11, 8), sharex=True)
+    fig.suptitle("Vertical / divergence control")
+
+    if "flow_divergence_1_s" in df.columns:
+        axes[0].plot(t, numeric_column(df, "flow_divergence_1_s"), label="filtered divergence")
+    if "flow_raw_divergence_1_s" in df.columns:
+        axes[0].plot(t, numeric_column(df, "flow_raw_divergence_1_s"), label="raw divergence", alpha=0.75)
+    if divergence_setpoint is not None:
+        axes[0].axhline(divergence_setpoint, linestyle=":", linewidth=1.4, label=f"setpoint {divergence_setpoint:g}")
+    axes[0].axhline(0.0, linestyle="--", linewidth=1)
+    axes[0].set_ylabel("divergence [1/s]")
+    axes[0].grid(True)
+    axes[0].legend(loc="best")
+
+    left_handles = []
+    left_labels = []
+    if "relative_vz_m_s" in df.columns:
+        line, = axes[1].plot(t, numeric_column(df, "relative_vz_m_s"), label="relative_vz closing rate")
+        left_handles.append(line)
+        left_labels.append(line.get_label())
+    elif "vehicle_vz_m_s" in df.columns:
+        line, = axes[1].plot(t, numeric_column(df, "vehicle_vz_m_s"), label="vehicle_vz")
+        left_handles.append(line)
+        left_labels.append(line.get_label())
+
+    right_handles = []
+    right_labels = []
+    if "relative_z_m" in df.columns:
+        ax_alt = axes[1].twinx()
+        line, = ax_alt.plot(t, numeric_column(df, "relative_z_m"), label="relative_z", alpha=0.45)
+        right_handles.append(line)
+        right_labels.append(line.get_label())
+        ax_alt.set_ylabel("relative z [m]")
+
+    axes[1].axhline(0.0, linestyle="--", linewidth=1)
+    axes[1].set_ylabel("velocity [m/s]")
+    axes[1].grid(True)
+    if left_handles or right_handles:
+        axes[1].legend(left_handles + right_handles, left_labels + right_labels, loc="best")
+
+    if "command_thrust" in df.columns:
+        axes[2].plot(t, numeric_column(df, "command_thrust"), label="thrust command")
+        axes[2].axhline(0.73, linestyle="--", linewidth=1, label="hover ref 0.73")
+    axes[2].set_ylabel("thrust [-]")
+    axes[2].set_xlabel("time [s]")
+    axes[2].grid(True)
+    axes[2].legend(loc="best")
+
+    save_current_figure(output_dir, "vertical_control.png")
+
+
+def plot_platform_motion_frequency(
+    df: pd.DataFrame,
+    t: np.ndarray,
+    output_dir: str,
+    expected_frequency_hz: Optional[float],
+):
+    if "platform_z_m" not in df.columns:
+        print("Skipping platform motion plot. Missing platform_z_m.")
+        return
+
+    z = numeric_column(df, "platform_z_m")
+    if np.count_nonzero(np.isfinite(z)) < 8:
+        print("Skipping platform motion plot. Not enough platform_z_m samples.")
+        return
+
+    fit = sine_fit_at_frequency(t, z, expected_frequency_hz)
+    dom = dominant_frequency_fft(t, z, min_frequency_hz=0.01, max_frequency_hz=2.0)
+
+    fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=False)
+    fig.suptitle("Platform vertical motion and frequency")
+
+    axes[0].plot(t, z, label="platform_z_m")
+    if fit is not None:
+        order = np.argsort(fit["t"])
+        axes[0].plot(
+            fit["t"][order],
+            fit["fit"][order],
+            linestyle="--",
+            label=(
+                f"fit {fit['frequency_hz']:.3f} Hz, "
+                f"A={fit['amplitude']:.3f} m, RMSE={fit['rmse']:.4f} m"
+            ),
+        )
+    axes[0].set_xlabel("time [s]")
+    axes[0].set_ylabel("platform z [m]")
+    axes[0].grid(True)
+    axes[0].legend(loc="best")
+
+    if dom is not None:
+        axes[1].plot(dom["freqs"], dom["spectrum"], label="|FFT(platform_z)|")
+        axes[1].axvline(dom["frequency_hz"], linestyle="--", label=f"dominant {dom['frequency_hz']:.4f} Hz")
+    if expected_frequency_hz is not None and expected_frequency_hz > 0.0:
+        axes[1].axvline(expected_frequency_hz, linestyle=":", label=f"expected {expected_frequency_hz:.4f} Hz")
+    axes[1].set_xlim(left=0.0, right=1.0)
+    axes[1].set_xlabel("frequency [Hz]")
+    axes[1].set_ylabel("|FFT|")
+    axes[1].grid(True)
+    axes[1].legend(loc="best")
+
+    save_current_figure(output_dir, "platform_motion_frequency.png")
+
+
+def plot_closing_rate_spectrum(
+    df: pd.DataFrame,
+    t: np.ndarray,
+    output_dir: str,
+    expected_frequency_hz: Optional[float],
+):
+    if "relative_vz_m_s" in df.columns and not np.all(np.isnan(numeric_column(df, "relative_vz_m_s"))):
+        sig = numeric_column(df, "relative_vz_m_s")
+        source = "relative_vz_m_s"
+    elif "vehicle_vz_m_s" in df.columns:
+        sig = numeric_column(df, "vehicle_vz_m_s")
+        source = "vehicle_vz_m_s"
+    else:
+        print("Skipping closing-rate spectrum. No relative_vz_m_s or vehicle_vz_m_s.")
+        return
+
+    dom = dominant_frequency_fft(t, sig, min_frequency_hz=0.01, max_frequency_hz=2.0)
+    if dom is None:
+        print("Skipping closing-rate spectrum. Not enough valid samples.")
+        return
+
+    plt.figure(figsize=(11, 5))
+    plt.title(f"Spectrum of closing-rate response ({source})")
+    plt.plot(dom["freqs"], dom["spectrum"], label=f"|FFT({source})|")
+    plt.axvline(dom["frequency_hz"], linestyle="--", label=f"dominant {dom['frequency_hz']:.4f} Hz")
+    if expected_frequency_hz is not None and expected_frequency_hz > 0.0:
+        plt.axvline(expected_frequency_hz, linestyle=":", label=f"expected platform {expected_frequency_hz:.4f} Hz")
+    plt.xlim(left=0.0, right=1.0)
+    plt.xlabel("frequency [Hz]")
+    plt.ylabel("|FFT|")
+    plt.grid(True)
+    plt.legend(loc="best")
+    save_current_figure(output_dir, "closing_rate_spectrum.png")
+
+
+# ---------------------------------------------------------------------------
+# Optional full/detail plots
+# ---------------------------------------------------------------------------
 
 
 def plot_detection_boxes_fov(
-	df: pd.DataFrame,
-	t: np.ndarray,
-	image_width: int,
-	image_height: int,
-	output_dir: str,
-	max_boxes: int = 150,
+    df: pd.DataFrame,
+    t: np.ndarray,
+    image_width: int,
+    image_height: int,
+    output_dir: str | Path,
+    max_boxes: int = 120,
 ):
-	"""
-	Reconstruct detection boxes in the camera field of view.
-
-	Uses:
-		target_offset_x
-		target_offset_y
-		target_detection_width_px
-		target_detection_height_px
-
-	Coordinate convention:
-		offset_x = -1 left, +1 right
-		offset_y = -1 top,  +1 bottom
-	"""
-	required = [
-		"target_offset_x",
-		"target_offset_y",
-		"target_detection_width_px",
-		"target_detection_height_px",
-	]
-
-	missing = [name for name in required if name not in df.columns]
-	if missing:
-		print(f"Skipping detection box plot. Missing columns: {missing}")
-		return
-
-	target_found = bool_column(df, "target_found", default=True)
-
-	offset_x = numeric_column(df, "target_offset_x")
-	offset_y = numeric_column(df, "target_offset_y")
-	box_w = numeric_column(df, "target_detection_width_px")
-	box_h = numeric_column(df, "target_detection_height_px")
-
-	valid = (
-		target_found
-		& np.isfinite(offset_x)
-		& np.isfinite(offset_y)
-		& np.isfinite(box_w)
-		& np.isfinite(box_h)
-		& (box_w > 0.0)
-		& (box_h > 0.0)
-	)
-
-	indices = np.where(valid)[0]
-
-	if len(indices) == 0:
-		print("Skipping detection box plot. No valid target detections.")
-		return
-
-	if len(indices) > max_boxes:
-		indices = np.linspace(indices[0], indices[-1], max_boxes).astype(int)
-
-	fig, ax = plt.subplots(figsize=(8, 6))
-
-	ax.set_title("Detection boxes in camera field of view")
-	ax.set_xlabel("image x [px]")
-	ax.set_ylabel("image y [px]")
-
-	ax.set_xlim(0, image_width)
-	ax.set_ylim(image_height, 0)
-	ax.set_aspect("equal", adjustable="box")
-
-	# Image border.
-	ax.add_patch(
-		Rectangle(
-			(0, 0),
-			image_width,
-			image_height,
-			fill=False,
-			linewidth=2,
-		)
-	)
-
-	# Image center.
-	ax.axvline(image_width / 2.0, linestyle="--", linewidth=1)
-	ax.axhline(image_height / 2.0, linestyle="--", linewidth=1)
-
-	# Draw boxes through time.
-	cmap = plt.get_cmap("viridis")
-	center_x_list = []
-	center_y_list = []
-
-	for k, idx in enumerate(indices):
-		alpha = 0.25 + 0.75 * k / max(len(indices) - 1, 1)
-		color = cmap(k / max(len(indices) - 1, 1))
-
-		cx = (0.5 * offset_x[idx] + 0.5) * image_width
-		cy = (0.5 * offset_y[idx] + 0.5) * image_height
-
-		x0 = cx - 0.5 * box_w[idx]
-		y0 = cy - 0.5 * box_h[idx]
-
-		rect = Rectangle(
-			(x0, y0),
-			box_w[idx],
-			box_h[idx],
-			fill=False,
-			linewidth=1.2,
-			edgecolor=(color[0], color[1], color[2], alpha),
-		)
-
-		ax.add_patch(rect)
-
-		center_x_list.append(cx)
-		center_y_list.append(cy)
-
-	ax.plot(center_x_list, center_y_list, marker=".", linewidth=1.2, label="detection center")
-	ax.legend(loc="best")
-
-	save_current_figure(output_dir, "detection_boxes_fov.png")
-
-
-def plot_target_position_offsets(df: pd.DataFrame, t: np.ndarray, output_dir: str):
-	if "target_offset_x" not in df.columns or "target_offset_y" not in df.columns:
-		print("Skipping target offset plot. Missing target_offset_x or target_offset_y.")
-		return
-
-	offset_x = numeric_column(df, "target_offset_x")
-	offset_y = numeric_column(df, "target_offset_y")
-	target_found = bool_column(df, "target_found", default=True)
-
-	plt.figure(figsize=(10, 5))
-	plt.title("Target position in image")
-	plt.plot(t, offset_x, label="target_offset_x")
-	plt.plot(t, offset_y, label="target_offset_y")
-
-	if "target_found" in df.columns:
-		not_found = ~target_found
-		if np.any(not_found):
-			plt.scatter(t[not_found], np.zeros(np.sum(not_found)), marker="x", label="target not found")
-
-	plt.axhline(0.0, linestyle="--", linewidth=1)
-	plt.xlabel("time [s]")
-	plt.ylabel("normalized image offset [-]")
-	plt.grid(True)
-	plt.legend()
-
-	save_current_figure(output_dir, "target_position_offsets.png")
-
-
-def plot_target_quality(
-	df: pd.DataFrame,
-	t: np.ndarray,
-	output_dir: str,
-	schedule_points=None,
-	max_area_fraction: float = None,
-	absolute_max_area_fraction: float = None,
-):
-	"""
-	target_confidence and target_area_fraction over time, with the
-	area_fraction schedule breakpoints (and target_acquisition.py's
-	large-area thresholds, if given) drawn as reference lines, so you
-	can see where the trajectory actually sits relative to the gain
-	schedule and the large-area penalty curve.
-	"""
-	has_confidence = "target_confidence" in df.columns
-	has_area_fraction = "target_area_fraction" in df.columns
-
-	if not has_confidence and not has_area_fraction:
-		print("Skipping target quality plot. Missing target_confidence and target_area_fraction.")
-		return
-
-	target_found = bool_column(df, "target_found", default=True)
-	not_found = ~target_found
-
-	rows = int(has_confidence) + int(has_area_fraction)
-	fig, axes = plt.subplots(rows, 1, figsize=(10, 3.2 * rows), sharex=True)
-
-	if rows == 1:
-		axes = [axes]
-
-	ax_index = 0
-
-	if has_confidence:
-		ax = axes[ax_index]
-		ax_index += 1
-
-		confidence = numeric_column(df, "target_confidence")
-		ax.plot(t, confidence, label="target_confidence", color="tab:blue")
-
-		if np.any(not_found):
-			ax.scatter(t[not_found], np.zeros(np.sum(not_found)), marker="x", color="tab:red", label="target not found")
-
-		ax.set_ylabel("confidence [-]")
-		ax.set_ylim(-0.05, 1.05)
-		ax.grid(True)
-		ax.legend(loc="best")
-
-	if has_area_fraction:
-		ax = axes[ax_index]
-		ax_index += 1
-
-		area_fraction = numeric_column(df, "target_area_fraction")
-		ax.plot(t, area_fraction, label="target_area_fraction", color="tab:green")
-
-		if schedule_points:
-			for value in schedule_points:
-				ax.axhline(value, linestyle=":", linewidth=0.8, color="gray")
-			ax.plot([], [], linestyle=":", color="gray", linewidth=0.8, label="schedule points")
-
-		if max_area_fraction is not None:
-			ax.axhline(
-				max_area_fraction, linestyle="--", linewidth=1, color="tab:orange",
-				label=f"max_area_fraction={max_area_fraction:g}",
-			)
-
-		if absolute_max_area_fraction is not None:
-			ax.axhline(
-				absolute_max_area_fraction, linestyle="--", linewidth=1, color="tab:red",
-				label=f"absolute_max_area_fraction={absolute_max_area_fraction:g}",
-			)
-
-		ax.set_ylabel("area_fraction [-]")
-		ax.set_ylim(-0.05, 1.05)
-		ax.grid(True)
-		ax.legend(loc="best")
-
-	axes[-1].set_xlabel("time [s]")
-
-	save_current_figure(output_dir, "target_quality.png")
-
-
-def plot_vehicle_position(df: pd.DataFrame, t: np.ndarray, output_dir: str):
-	if "vehicle_x_m" not in df.columns or "vehicle_y_m" not in df.columns:
-		print("Skipping vehicle position plot. Missing vehicle_x_m or vehicle_y_m.")
-		return
-
-	columns = [
-		("vehicle_x_m", "vehicle x [m]"),
-		("vehicle_y_m", "vehicle y [m]"),
-		("vehicle_z_m", "vehicle z [m]"),
-	]
-
-	available = [(name, label) for name, label in columns if name in df.columns]
-
-	if not available:
-		print("Skipping vehicle position plot. No position columns found.")
-		return
-
-	fig, axes = plt.subplots(len(available), 1, figsize=(10, 2.7 * len(available)), sharex=True)
-
-	if len(available) == 1:
-		axes = [axes]
-
-	for ax, (column_name, label) in zip(axes, available):
-		y = numeric_column(df, column_name)
-		ax.plot(t, y, label=label)
-		ax.axhline(0.0, linestyle="--", linewidth=1)
-		ax.set_ylabel(label)
-		ax.grid(True)
-		ax.legend(loc="best")
-
-	axes[-1].set_xlabel("time [s]")
-
-	save_current_figure(output_dir, "vehicle_position_xyz.png")
-
-
-def plot_vehicle_dynamics(df: pd.DataFrame, t: np.ndarray, output_dir: str):
-	"""vehicle_vx/vy/vz_m_s and vehicle_yaw_rad: the rest of VehicleState beyond position."""
-	columns = [
-		("vehicle_vx_m_s", "vehicle vx [m/s]"),
-		("vehicle_vy_m_s", "vehicle vy [m/s]"),
-		("vehicle_vz_m_s", "vehicle vz [m/s]"),
-		("vehicle_yaw_rad", "vehicle yaw [rad]"),
-	]
-
-	available = [(name, label) for name, label in columns if name in df.columns]
-
-	if not available:
-		print("Skipping vehicle dynamics plot. No velocity/yaw columns found.")
-		return
-
-	fig, axes = plt.subplots(len(available), 1, figsize=(10, 2.7 * len(available)), sharex=True)
-
-	if len(available) == 1:
-		axes = [axes]
-
-	for ax, (column_name, label) in zip(axes, available):
-		y = numeric_column(df, column_name)
-		ax.plot(t, y, label=label)
-		ax.axhline(0.0, linestyle="--", linewidth=1)
-		ax.set_ylabel(label)
-		ax.grid(True)
-		ax.legend(loc="best")
-
-	axes[-1].set_xlabel("time [s]")
-
-	save_current_figure(output_dir, "vehicle_dynamics.png")
-
-
-def plot_divergence(df: pd.DataFrame, t: np.ndarray, output_dir: str, divergence_setpoint: float = None):
-	divergence_columns = []
-
-	if "flow_divergence_1_s" in df.columns:
-		divergence_columns.append(("flow_divergence_1_s", "flow divergence"))
-
-	# Optional future columns, in case you later add D_box to diagnostics.
-	optional_columns = [
-		("box_divergence_1_s", "box divergence"),
-		("box_divergence_filtered_1_s", "box divergence filtered"),
-		# Current diagnostics_writer.py uses this name; keep the older variant too
-		# so old logs remain readable.
-		("flow_raw_divergence_1_s", "raw flow divergence"),
-		("flow_divergence_raw_1_s", "raw flow divergence"),
-	]
-
-	for column_name, label in optional_columns:
-		if column_name in df.columns:
-			divergence_columns.append((column_name, label))
-
-	if not divergence_columns:
-		print("Skipping divergence plot. Missing flow_divergence_1_s.")
-		return
-
-	flow_valid = bool_column(df, "flow_valid", default=True)
-
-	plt.figure(figsize=(10, 5))
-	plt.title("Divergence evolution")
-
-	for column_name, label in divergence_columns:
-		y = numeric_column(df, column_name)
-		plt.plot(t, y, label=label)
-
-	if divergence_setpoint is not None:
-		plt.axhline(
-			divergence_setpoint, linestyle=":", linewidth=1.4, color="tab:purple",
-			label=f"divergence_setpoint={divergence_setpoint:g}",
-		)
-
-	invalid = ~flow_valid
-	if np.any(invalid):
-		plt.scatter(t[invalid], np.zeros(np.sum(invalid)), marker="x", color="tab:red", label="flow invalid")
-
-	plt.axhline(0.0, linestyle="--", linewidth=1)
-	plt.xlabel("time [s]")
-	plt.ylabel("divergence [1/s]")
-	plt.grid(True)
-	plt.legend()
-
-	save_current_figure(output_dir, "divergence.png")
-
-
-def plot_flow_velocity(df: pd.DataFrame, t: np.ndarray, output_dir: str):
-	"""flow_mean_x_px_s / flow_mean_y_px_s: the mean optical flow over the target ROI."""
-	has_x = "flow_mean_x_px_s" in df.columns
-	has_y = "flow_mean_y_px_s" in df.columns
-
-	if not has_x and not has_y:
-		print("Skipping flow velocity plot. Missing flow_mean_x_px_s and flow_mean_y_px_s.")
-		return
-
-	flow_valid = bool_column(df, "flow_valid", default=True)
-
-	plt.figure(figsize=(10, 5))
-	plt.title("Mean optical flow over the target ROI")
-
-	if has_x:
-		plt.plot(t, numeric_column(df, "flow_mean_x_px_s"), label="flow_mean_x_px_s")
-	if has_y:
-		plt.plot(t, numeric_column(df, "flow_mean_y_px_s"), label="flow_mean_y_px_s")
-
-	invalid = ~flow_valid
-	if np.any(invalid):
-		plt.scatter(t[invalid], np.zeros(np.sum(invalid)), marker="x", color="tab:red", label="flow invalid")
-
-	plt.axhline(0.0, linestyle="--", linewidth=1)
-	plt.xlabel("time [s]")
-	plt.ylabel("mean flow [px/s]")
-	plt.grid(True)
-	plt.legend()
-
-	save_current_figure(output_dir, "flow_mean_velocity.png")
-
-
-def plot_commands(df: pd.DataFrame, t: np.ndarray, output_dir: str):
-	command_columns = [
-		("command_roll_rad", "roll command [rad]"),
-		("command_pitch_rad", "pitch command [rad]"),
-		("command_yaw_rad", "yaw command [rad]"),
-		("command_thrust", "thrust command [-]"),
-	]
-
-	available = [(name, label) for name, label in command_columns if name in df.columns]
-
-	if not available:
-		print("Skipping command plot. No command columns found.")
-		return
-
-	fig, axes = plt.subplots(len(available), 1, figsize=(10, 2.7 * len(available)), sharex=True)
-
-	if len(available) == 1:
-		axes = [axes]
-
-	for ax, (column_name, label) in zip(axes, available):
-		y = numeric_column(df, column_name)
-		ax.plot(t, y, label=label)
-		if column_name == "command_thrust":
-			ax.axhline(0.73, linestyle="--", linewidth=1)
-		else:
-			ax.axhline(0.0, linestyle="--", linewidth=1)
-		ax.set_ylabel(label)
-		ax.grid(True)
-		ax.legend(loc="best")
-
-	axes[-1].set_xlabel("time [s]")
-
-	save_current_figure(output_dir, "commands.png")
-
-
-def plot_platform_position(df: pd.DataFrame, t: np.ndarray, output_dir: str):
-	"""platform_x/y/z_m: the landing platform's own world-frame position
-	(see platform_motion.py), from an oscillating-platform test. Confirms the
-	platform is actually moving as commanded -- a flat line here on a test
-	that should show oscillation usually means the PosePublisher bridge
-	isn't wired up, not that the platform stood still."""
-	columns = [
-		("platform_x_m", "platform x [m]"),
-		("platform_y_m", "platform y [m]"),
-		("platform_z_m", "platform z [m]"),
-	]
-	available = [(name, label) for name, label in columns if name in df.columns]
-	if not available:
-		print("Skipping platform position plot. No platform_*_m columns found (not tracked this run).")
-		return
-
-	fig, axes = plt.subplots(len(available), 1, figsize=(10, 2.7 * len(available)), sharex=True)
-	if len(available) == 1:
-		axes = [axes]
-
-	for ax, (column_name, label) in zip(axes, available):
-		y = numeric_column(df, column_name)
-		if np.all(np.isnan(y)):
-			ax.set_visible(False)
-			continue
-		ax.plot(t, y, label=label, color="tab:purple")
-		ax.axhline(0.0, linestyle="--", linewidth=1)
-		ax.set_ylabel(label)
-		ax.grid(True)
-		ax.legend(loc="best")
-
-	axes[-1].set_xlabel("time [s]")
-	save_current_figure(output_dir, "platform_position_xyz.png")
-
-
-def plot_platform_velocity(df: pd.DataFrame, t: np.ndarray, output_dir: str):
-	"""platform_vx/vy/vz_m_s: the platform's own velocity, in the SDF world's
-	ENU convention (up-positive z) -- see platform_motion.py before comparing
-	directly against vehicle_vz_m_s, which is PX4 NED (down-positive)."""
-	columns = [
-		("platform_vx_m_s", "platform vx [m/s] (ENU)"),
-		("platform_vy_m_s", "platform vy [m/s] (ENU)"),
-		("platform_vz_m_s", "platform vz [m/s] (ENU, up-positive)"),
-	]
-	available = [(name, label) for name, label in columns if name in df.columns]
-	if not available:
-		print("Skipping platform velocity plot. No platform_v*_m_s columns found (not tracked this run).")
-		return
-
-	fig, axes = plt.subplots(len(available), 1, figsize=(10, 2.7 * len(available)), sharex=True)
-	if len(available) == 1:
-		axes = [axes]
-
-	for ax, (column_name, label) in zip(axes, available):
-		y = numeric_column(df, column_name)
-		if np.all(np.isnan(y)):
-			ax.set_visible(False)
-			continue
-		ax.plot(t, y, label=label, color="tab:purple")
-		ax.axhline(0.0, linestyle="--", linewidth=1)
-		ax.set_ylabel(label)
-		ax.grid(True)
-		ax.legend(loc="best")
-
-	axes[-1].set_xlabel("time [s]")
-	save_current_figure(output_dir, "platform_velocity_xyz.png")
-
-
-def plot_relative_motion(df: pd.DataFrame, t: np.ndarray, output_dir: str):
-	"""
-	relative_x/y/z_m and relative_vx/vy/vz_m_s (see platform_motion.
-	relative_motion): vehicle motion relative to the platform, in PX4's NED
-	convention, with relative_vz a "closing rate" (positive = approaching) --
-	the variable divergence actually measures once the platform moves too,
-	not vehicle_vz_m_s alone. One figure, position then velocity per axis,
-	so each pair is easy to eyeball together.
-	"""
-	axis_pairs = [
-		("relative_x_m", "relative_vx_m_s", "x"),
-		("relative_y_m", "relative_vy_m_s", "y"),
-		("relative_z_m", "relative_vz_m_s", "z (closing rate)"),
-	]
-	available = [p for p in axis_pairs if p[0] in df.columns or p[1] in df.columns]
-	if not available:
-		print("Skipping relative motion plot. No relative_*_m/relative_v*_m_s columns found (not tracked this run).")
-		return
-
-	fig, axes = plt.subplots(len(available), 2, figsize=(12, 2.7 * len(available)), sharex=True)
-	if len(available) == 1:
-		axes = axes.reshape(1, 2)
-
-	for row, (pos_col, vel_col, axis_label) in enumerate(available):
-		ax_pos, ax_vel = axes[row, 0], axes[row, 1]
-
-		if pos_col in df.columns:
-			y = numeric_column(df, pos_col)
-			ax_pos.plot(t, y, color="tab:orange")
-			ax_pos.axhline(0.0, linestyle="--", linewidth=1)
-			ax_pos.set_ylabel(f"relative {axis_label} [m]")
-			ax_pos.grid(True)
-		else:
-			ax_pos.set_visible(False)
-
-		if vel_col in df.columns:
-			y = numeric_column(df, vel_col)
-			ax_vel.plot(t, y, color="tab:red")
-			ax_vel.axhline(0.0, linestyle="--", linewidth=1)
-			ax_vel.set_ylabel(f"relative {axis_label} rate [m/s]")
-			ax_vel.grid(True)
-		else:
-			ax_vel.set_visible(False)
-
-	axes[0, 0].set_title("relative position")
-	axes[0, 1].set_title("relative velocity")
-	axes[-1, 0].set_xlabel("time [s]")
-	axes[-1, 1].set_xlabel("time [s]")
-	save_current_figure(output_dir, "relative_motion.png")
-
-
-def plot_divergence_vs_relative_motion(df: pd.DataFrame, t: np.ndarray, output_dir: str):
-	"""
-	Divergence overlaid with the closing rate it's supposed to be measuring
-	-- relative_vz_m_s if a platform was tracked this run, else vehicle_vz_m_s
-	(equivalent when the platform is stationary). Different units (1/s vs
-	m/s), so divergence is the left axis and velocity the right (twinx) --
-	this is about whether the two move TOGETHER (phase/shape), not about
-	matching scales. A weak or out-of-phase relationship here is exactly the
-	"thrust loop has nothing reliable to act on" signature (see
-	fit_axis_models.py's divergence_motion_report for the numeric version of
-	this same check).
-	"""
-	if "flow_divergence_1_s" not in df.columns:
-		print("Skipping divergence-vs-relative-motion plot. Missing flow_divergence_1_s.")
-		return
-
-	if "relative_vz_m_s" in df.columns and not np.all(np.isnan(numeric_column(df, "relative_vz_m_s"))):
-		vel_col, vel_label, used_relative = "relative_vz_m_s", "relative_vz [m/s] (closing rate)", True
-	elif "vehicle_vz_m_s" in df.columns:
-		vel_col, vel_label, used_relative = "vehicle_vz_m_s", "vehicle_vz [m/s]", False
-	else:
-		print("Skipping divergence-vs-relative-motion plot. No relative_vz_m_s or vehicle_vz_m_s.")
-		return
-
-	divergence = numeric_column(df, "flow_divergence_1_s")
-	velocity = numeric_column(df, vel_col)
-
-	fig, ax1 = plt.subplots(figsize=(10, 5))
-	title_source = "relative_vz" if used_relative else "vehicle_vz (no platform tracking logged)"
-	ax1.set_title(f"Divergence vs closing velocity ({title_source})")
-
-	l1, = ax1.plot(t, divergence, color="tab:blue", label="flow_divergence_1_s")
-	ax1.axhline(0.0, linestyle="--", linewidth=1, color="tab:blue", alpha=0.5)
-	ax1.set_xlabel("time [s]")
-	ax1.set_ylabel("divergence [1/s]", color="tab:blue")
-	ax1.tick_params(axis="y", labelcolor="tab:blue")
-	ax1.grid(True)
-
-	ax2 = ax1.twinx()
-	l2, = ax2.plot(t, velocity, color="tab:red", label=vel_label, alpha=0.8)
-	ax2.set_ylabel(vel_label, color="tab:red")
-	ax2.tick_params(axis="y", labelcolor="tab:red")
-
-	ax1.legend(handles=[l1, l2], loc="best")
-	save_current_figure(output_dir, "divergence_vs_relative_motion.png")
-
-
-def plot_relative_motion_spectrum(
-	df: pd.DataFrame, t: np.ndarray, output_dir: str, expected_frequency_hz: float = None,
-):
-	"""
-	FFT of the closing-rate signal (relative_vz_m_s, falling back to
-	vehicle_vz_m_s), to check whether the vehicle's response actually shows
-	the commanded oscillation frequency or something else -- e.g. the thrust
-	loop's own underdamped natural mode ringing instead of tracking the
-	disturbance cycle-by-cycle. This is a real, observed failure mode, not
-	hypothetical: a 0.3m/0.2Hz platform test produced a clean, large ~0.043Hz
-	(~23s period) response with NO energy near the commanded 0.2Hz/5s
-	anywhere in vz, altitude, or divergence, while an equivalent stationary-
-	platform run showed no such mode at all -- so it was real and platform-
-	triggered, just not a 1:1 echo of the input. expected_frequency_hz (match
-	bee_platform.sdf's z_frequency, mind the Hz-vs-rad/s caveat in
-	platform_motion.py) draws a reference line so a mismatch like that is
-	visible at a glance. Needs roughly-evenly-sampled rows.
-	"""
-	if "relative_vz_m_s" in df.columns and not np.all(np.isnan(numeric_column(df, "relative_vz_m_s"))):
-		vel_col, used_relative = "relative_vz_m_s", True
-	elif "vehicle_vz_m_s" in df.columns:
-		vel_col, used_relative = "vehicle_vz_m_s", False
-	else:
-		print("Skipping relative motion spectrum. No relative_vz_m_s or vehicle_vz_m_s.")
-		return
-
-	sig = numeric_column(df, vel_col)
-	finite = np.isfinite(t) & np.isfinite(sig)
-	t_f, sig_f = t[finite], sig[finite]
-	if len(t_f) < 30:
-		print("Skipping relative motion spectrum. Not enough samples.")
-		return
-
-	dt = float(np.median(np.diff(t_f)))
-	if dt <= 1e-9:
-		print("Skipping relative motion spectrum. Non-increasing/degenerate time base.")
-		return
-
-	n = len(sig_f)
-	freqs = np.fft.rfftfreq(n, d=dt)
-	spec = np.abs(np.fft.rfft(sig_f - sig_f.mean()))
-
-	valid = freqs > (1.0 / (n * dt))
-	dominant_freq = float(freqs[valid][np.argmax(spec[valid])]) if valid.any() else 0.0
-
-	plt.figure(figsize=(10, 5))
-	source = "relative_vz" if used_relative else "vehicle_vz (no platform tracking logged)"
-	plt.title(f"Spectrum of closing-rate response ({source})")
-	plt.plot(freqs, spec, color="tab:blue")
-	plt.axvline(
-		dominant_freq, linestyle="--", color="tab:blue",
-		label=f"dominant: {dominant_freq:.4f} Hz ({1.0/dominant_freq:.1f}s)" if dominant_freq > 1e-9 else "dominant: DC",
-	)
-	if expected_frequency_hz is not None and expected_frequency_hz > 1e-9:
-		plt.axvline(
-			expected_frequency_hz, linestyle=":", color="tab:red",
-			label=f"commanded: {expected_frequency_hz:.4f} Hz ({1.0/expected_frequency_hz:.1f}s)",
-		)
-	plt.xlabel("frequency [Hz]")
-	plt.ylabel("|FFT|")
-	plt.grid(True)
-	plt.legend()
-
-	save_current_figure(output_dir, "relative_motion_spectrum.png")
-
-
-def plot_pipeline_latency(df: pd.DataFrame, t: np.ndarray, output_dir: str):
-	"""
-	How stale each subsystem's measurement was at the moment its row got
-	logged: t - <subsystem>_timestamp_sec. Both sides are normalized the
-	same way by diagnostics_writer.py, so this is a direct "data age in
-	seconds" reading, not just a relative comparison.
-	"""
-	columns = [
-		("target_timestamp_sec", "target age [s]"),
-		("flow_timestamp_sec", "flow age [s]"),
-		("command_timestamp_sec", "command age [s]"),
-		("vehicle_timestamp_sec", "vehicle age [s]"),
-	]
-
-	available = [(name, label) for name, label in columns if name in df.columns]
-
-	if not available:
-		print("Skipping pipeline latency plot. No *_timestamp_sec columns found.")
-		return
-
-	plt.figure(figsize=(10, 5))
-	plt.title("Data age at logging time")
-
-	for column_name, label in available:
-		subsystem_time = numeric_column(df, column_name)
-		age = t - subsystem_time
-		plt.plot(t, age, label=label)
-
-	plt.axhline(0.0, linestyle="--", linewidth=1)
-	plt.xlabel("time [s]")
-	plt.ylabel("age [s]")
-	plt.grid(True)
-	plt.legend()
-
-	save_current_figure(output_dir, "pipeline_latency.png")
+    required = [
+        "target_offset_x",
+        "target_offset_y",
+        "target_detection_width_px",
+        "target_detection_height_px",
+    ]
+    missing = [name for name in required if name not in df.columns]
+    if missing:
+        print(f"Skipping detection box plot. Missing columns: {missing}")
+        return
+
+    target_found = bool_column(df, "target_found", default=True)
+    offset_x = numeric_column(df, "target_offset_x")
+    offset_y = numeric_column(df, "target_offset_y")
+    box_w = numeric_column(df, "target_detection_width_px")
+    box_h = numeric_column(df, "target_detection_height_px")
+
+    valid = (
+        target_found
+        & np.isfinite(offset_x)
+        & np.isfinite(offset_y)
+        & np.isfinite(box_w)
+        & np.isfinite(box_h)
+        & (box_w > 0.0)
+        & (box_h > 0.0)
+    )
+    indices = np.where(valid)[0]
+    if len(indices) == 0:
+        print("Skipping detection box plot. No valid target detections.")
+        return
+    if len(indices) > max_boxes:
+        indices = np.linspace(indices[0], indices[-1], max_boxes).astype(int)
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.set_title("Detection boxes in camera FOV")
+    ax.set_xlabel("image x [px]")
+    ax.set_ylabel("image y [px]")
+    ax.set_xlim(0, image_width)
+    ax.set_ylim(image_height, 0)
+    ax.set_aspect("equal", adjustable="box")
+    ax.add_patch(Rectangle((0, 0), image_width, image_height, fill=False, linewidth=2))
+    ax.axvline(image_width / 2.0, linestyle="--", linewidth=1)
+    ax.axhline(image_height / 2.0, linestyle="--", linewidth=1)
+
+    cmap = plt.get_cmap("viridis")
+    centers_x, centers_y = [], []
+    for k, idx in enumerate(indices):
+        color = cmap(k / max(len(indices) - 1, 1))
+        alpha = 0.25 + 0.75 * k / max(len(indices) - 1, 1)
+        cx = (0.5 * offset_x[idx] + 0.5) * image_width
+        cy = (0.5 * offset_y[idx] + 0.5) * image_height
+        rect = Rectangle(
+            (cx - 0.5 * box_w[idx], cy - 0.5 * box_h[idx]),
+            box_w[idx],
+            box_h[idx],
+            fill=False,
+            linewidth=1.2,
+            edgecolor=(color[0], color[1], color[2], alpha),
+        )
+        ax.add_patch(rect)
+        centers_x.append(cx)
+        centers_y.append(cy)
+
+    ax.plot(centers_x, centers_y, marker=".", linewidth=1.2, label="detection center")
+    ax.legend(loc="best")
+    save_current_figure(output_dir, "detection_boxes_fov.png")
+
+
+def plot_multi_column(df: pd.DataFrame, t: np.ndarray, output_dir: str | Path, columns: Sequence[Tuple[str, str]], title: str, filename: str):
+    available = [(name, label) for name, label in columns if name in df.columns]
+    if not available:
+        print(f"Skipping {filename}. No required columns found.")
+        return
+
+    fig, axes = plt.subplots(len(available), 1, figsize=(11, 2.5 * len(available)), sharex=True)
+    if len(available) == 1:
+        axes = [axes]
+    fig.suptitle(title)
+
+    for ax, (name, label) in zip(axes, available):
+        y = numeric_column(df, name)
+        ax.plot(t, y, label=label)
+        ax.axhline(0.0, linestyle="--", linewidth=1)
+        ax.set_ylabel(label)
+        ax.grid(True)
+        ax.legend(loc="best")
+    axes[-1].set_xlabel("time [s]")
+    save_current_figure(output_dir, filename)
+
+
+def make_default_plots(df: pd.DataFrame, t: np.ndarray, output_dir: str | Path, args):
+    plot_target_detection_summary(df, t, output_dir)
+    plot_detection_boxes_fov(df, t, args.image_width, args.image_height, output_dir, args.max_boxes)
+    plot_lateral_control(df, t, output_dir)
+    plot_vertical_control(df, t, output_dir, divergence_setpoint=args.divergence_setpoint)
+    plot_platform_motion_frequency(df, t, output_dir, expected_frequency_hz=args.platform_frequency_hz)
+    plot_closing_rate_spectrum(df, t, output_dir, expected_frequency_hz=args.platform_frequency_hz)
+
+
+def make_full_plots(df: pd.DataFrame, t: np.ndarray, output_dir: str | Path, args):
+    plot_multi_column(
+        df,
+        t,
+        output_dir,
+        [("vehicle_x_m", "vehicle x [m]"), ("vehicle_y_m", "vehicle y [m]"), ("vehicle_z_m", "vehicle z [m]")],
+        "Vehicle position",
+        "vehicle_position_xyz.png",
+    )
+    plot_multi_column(
+        df,
+        t,
+        output_dir,
+        [("platform_x_m", "platform x [m]"), ("platform_y_m", "platform y [m]"), ("platform_z_m", "platform z [m]")],
+        "Platform position",
+        "platform_position_xyz.png",
+    )
+    plot_multi_column(
+        df,
+        t,
+        output_dir,
+        [("platform_vx_m_s", "platform vx [m/s]"), ("platform_vy_m_s", "platform vy [m/s]"), ("platform_vz_m_s", "platform vz [m/s]")],
+        "Platform velocity",
+        "platform_velocity_xyz.png",
+    )
+    plot_multi_column(
+        df,
+        t,
+        output_dir,
+        [
+            ("relative_x_m", "relative x [m]"),
+            ("relative_y_m", "relative y [m]"),
+            ("relative_z_m", "relative z [m]"),
+            ("relative_vx_m_s", "relative vx [m/s]"),
+            ("relative_vy_m_s", "relative vy [m/s]"),
+            ("relative_vz_m_s", "relative vz [m/s]"),
+        ],
+        "Relative motion",
+        "relative_motion_xyz.png",
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI and path handling
+# ---------------------------------------------------------------------------
 
 
 def _looks_like_csv_path(path_like: str) -> bool:
-	return Path(path_like).suffix.lower() == ".csv"
+    return Path(path_like).suffix.lower() == ".csv"
 
 
 def _path_contains_csv(path_like: str) -> bool:
-	path = Path(path_like)
-	return path.is_dir() and any(child.suffix.lower() == ".csv" for child in path.iterdir())
+    path = Path(path_like)
+    return path.is_dir() and any(child.suffix.lower() == ".csv" for child in path.iterdir())
 
 
 def _split_inputs_and_output_dir(raw_paths, output_dir_arg: str, default_output_dir: str):
-	"""
-	Accept both styles:
+    paths = [str(path) for path in raw_paths]
+    output_dir = output_dir_arg
 
-		python analyse_log.py logs/file.csv results/test9
-		python analyse_log.py logs --output-dir results
+    if output_dir_arg == default_output_dir and len(paths) >= 2:
+        last = paths[-1]
+        last_is_input = _looks_like_csv_path(last) or _path_contains_csv(last)
+        if not last_is_input:
+            output_dir = last
+            paths = paths[:-1]
 
-	If --output-dir was not explicitly changed and the last positional argument
-	looks like an output folder rather than a CSV/folder input, use it as the
-	output directory. This keeps the command line short while preserving
-	--output-dir for unambiguous multi-input calls.
-	"""
-	paths = [str(path) for path in raw_paths]
-	output_dir = output_dir_arg
-
-	# Detect: analyse_log.py <input.csv or input_folder> <output_folder>
-	if output_dir_arg == default_output_dir and len(paths) >= 2:
-		last = paths[-1]
-		last_path = Path(last)
-
-		last_is_input = (
-			_looks_like_csv_path(last)
-			or _path_contains_csv(last)
-		)
-
-		if not last_is_input:
-			output_dir = last
-			paths = paths[:-1]
-
-	if not paths:
-		raise ValueError("No CSV file or log folder was provided.")
-
-	return paths, output_dir
+    if not paths:
+        raise ValueError("No CSV file or log folder was provided.")
+    return paths, output_dir
 
 
-def collect_csv_paths(inputs):
-	"""Return sorted CSV paths from one or more files/folders."""
-	csv_paths = []
-
-	for item in inputs:
-		path = Path(item)
-
-		if path.is_dir():
-			csv_paths.extend(sorted(path.glob("*.csv")))
-		elif path.is_file() and path.suffix.lower() == ".csv":
-			csv_paths.append(path)
-		else:
-			raise FileNotFoundError(
-				f"Input is neither a CSV file nor a folder containing CSV logs: {item}"
-			)
-
-	if not csv_paths:
-		raise FileNotFoundError("No CSV files found in the provided input(s).")
-
-	return csv_paths
+def collect_csv_paths(inputs: Iterable[str]) -> list[Path]:
+    csv_paths = []
+    for item in inputs:
+        path = Path(item)
+        if path.is_dir():
+            csv_paths.extend(sorted(path.glob("*.csv")))
+        elif path.is_file() and path.suffix.lower() == ".csv":
+            csv_paths.append(path)
+        else:
+            raise FileNotFoundError(f"Input is neither a CSV file nor a folder containing CSV logs: {item}")
+    if not csv_paths:
+        raise FileNotFoundError("No CSV files found in the provided input(s).")
+    return csv_paths
 
 
 def output_dir_for_csv(csv_path: Path, output_root: Path, total_csv_count: int, index: int, explicit_positional_output: bool):
-	"""
-	Single CSV + explicit output folder:
-		results/test9/<plots>.png
+    if total_csv_count == 1 and explicit_positional_output:
+        return output_root
+    if total_csv_count == 1 and output_root.name.lower().startswith("test"):
+        return output_root
+    return output_root / f"test{index}"
 
-	Folder or multiple CSVs:
-		results/test1/<plots>.png
-		results/test2/<plots>.png
-	"""
-	if total_csv_count == 1 and explicit_positional_output:
-		return output_root
 
-	if total_csv_count == 1 and output_root.name.lower().startswith("test"):
-		return output_root
-
-	return output_root / f"test{index}"
+def parse_args():
+    parser = argparse.ArgumentParser(description="Analyse BEE_LAND diagnostics CSV with coherent timestamps.")
+    parser.add_argument(
+        "paths",
+        nargs="+",
+        help=(
+            "CSV file(s), folder(s) containing CSV logs, and optionally an output folder "
+            "as the final positional argument. Examples: analyse_log.py logs/file.csv results/test9 ; analyse_log.py logs"
+        ),
+    )
+    parser.add_argument("--image-width", type=int, default=640, help="Camera image width in pixels. Default: 640.")
+    parser.add_argument("--image-height", type=int, default=480, help="Camera image height in pixels. Default: 480.")
+    parser.add_argument("--max-boxes", type=int, default=120, help="Maximum detection boxes drawn in detection_boxes_fov.png.")
+    parser.add_argument("--output-dir", default="results", help="Directory where plots will be saved. Default: results.")
+    parser.add_argument(
+        "--time-base",
+        choices=["auto", "flow", "target", "command", "vehicle_px4", "vehicle", "wall", "t_sec"],
+        default="auto",
+        help="X-axis time base. Default: auto, preferring visual/flow timestamps.",
+    )
+    parser.add_argument(
+        "--platform-frequency-hz",
+        type=float,
+        default=0.2,
+        help="Expected platform frequency for reference/fitting. Default: 0.2 Hz. Pass 0 to disable reference fit.",
+    )
+    parser.add_argument(
+        "--divergence-setpoint",
+        type=float,
+        default=0.01,
+        help="Divergence setpoint drawn on vertical_control.png. Default: 0.01.",
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Generate optional detailed/legacy plots in addition to the concise default set.",
+    )
+    return parser.parse_args()
 
 
 def main():
-	parser = argparse.ArgumentParser(
-		description="Analyse bee landing diagnostics CSV."
-	)
+    args = parse_args()
+    default_output_dir = "results"
+    positional_output_requested = (
+        args.output_dir == default_output_dir
+        and len(args.paths) >= 2
+        and not _looks_like_csv_path(args.paths[-1])
+        and not _path_contains_csv(args.paths[-1])
+    )
 
-	parser.add_argument(
-		"paths",
-		nargs="+",
-		help=(
-			"CSV file(s), folder(s) containing CSV logs, and optionally an output "
-			"folder as the final positional argument. Examples: "
-			"analyse_log.py logs/file.csv results/test9 ; analyse_log.py logs"
-		),
-	)
+    input_paths, output_dir = _split_inputs_and_output_dir(args.paths, args.output_dir, default_output_dir)
+    csv_paths = collect_csv_paths(input_paths)
+    output_root = Path(output_dir)
+    ensure_output_dir(output_root)
 
-	parser.add_argument(
-		"--image-width",
-		type=int,
-		default=640,
-		help="Camera image width in pixels. Default: 640.",
-	)
+    expected_freq = args.platform_frequency_hz if args.platform_frequency_hz and args.platform_frequency_hz > 0.0 else None
 
-	parser.add_argument(
-		"--image-height",
-		type=int,
-		default=480,
-		help="Camera image height in pixels. Default: 480.",
-	)
+    for index, csv_path in enumerate(csv_paths, start=1):
+        df = read_log(csv_path)
+        t, time_column, time_description = choose_time_base(df, requested=args.time_base)
+        output_complete = output_dir_for_csv(csv_path, output_root, len(csv_paths), index, positional_output_requested)
+        ensure_output_dir(output_complete)
 
-	default_output_dir = "results"
-	parser.add_argument(
-		"--output-dir",
-		default=default_output_dir,
-		help="Directory where plots will be saved. Default: results.",
-	)
+        print(f"Loaded: {csv_path}")
+        print(f"Output directory: {output_complete}")
 
-	parser.add_argument(
-		"--max-boxes",
-		type=int,
-		default=150,
-		help="Maximum number of detection boxes drawn in field-of-view reconstruction.",
-	)
+        summary = compute_summary(df, t, time_column, time_description, expected_freq)
+        write_summary(output_complete, summary)
 
-	parser.add_argument(
-		"--divergence-setpoint",
-		type=float,
-		default=0.15,
-		help="ControlLaw's divergence_setpoint, drawn as a reference line on the divergence plot. Default: 0.15.",
-	)
+        make_default_plots(df, t, output_complete, args)
+        if args.full:
+            make_full_plots(df, t, output_complete, args)
 
-	parser.add_argument(
-		"--area-fraction-schedule",
-		default="0.05,0.30,0.60,0.80,0.95,1.0",
-		help=(
-			"Comma-separated area_fraction values to draw as reference lines "
-			"on the target quality plot (match ControlLaw's schedule_points). "
-			"Pass an empty string to disable."
-		),
-	)
-
-	parser.add_argument(
-		"--max-area-fraction",
-		type=float,
-		default=0.60,
-		help="TargetAcquisition's max_area_fraction, drawn as a reference line. Default: 0.60.",
-	)
-
-	parser.add_argument(
-		"--absolute-max-area-fraction",
-		type=float,
-		default=0.95,
-		help="TargetAcquisition's absolute_max_area_fraction, drawn as a reference line. Default: 0.95.",
-	)
-
-	parser.add_argument(
-		"--platform-frequency-hz",
-		type=float,
-		default=None,
-		help=(
-			"Commanded oscillating-platform frequency for this test (match "
-			"bee_platform.sdf's z_frequency, mind the Hz-vs-rad/s caveat in "
-			"platform_motion.py) -- drawn as a reference line on the relative "
-			"motion spectrum plot. Omit to skip that reference line."
-		),
-	)
-
-	args = parser.parse_args()
-
-	# True for commands such as:
-	#   py analyse_log.py logs/bee_diagnostics.csv results/test9
-	positional_output_requested = (
-		args.output_dir == default_output_dir
-		and len(args.paths) >= 2
-		and not _looks_like_csv_path(args.paths[-1])
-		and not _path_contains_csv(args.paths[-1])
-	)
-
-	input_paths, output_dir = _split_inputs_and_output_dir(
-		raw_paths=args.paths,
-		output_dir_arg=args.output_dir,
-		default_output_dir=default_output_dir,
-	)
-
-	csv_paths = collect_csv_paths(input_paths)
-	output_root = Path(output_dir)
-	ensure_output_dir(output_root)
-
-	schedule_points = (
-		[float(value) for value in args.area_fraction_schedule.split(",") if value.strip() != ""]
-		if args.area_fraction_schedule
-		else []
-	)
-
-	for index, csv_p in enumerate(csv_paths, start=1):
-		df = read_log(csv_p)
-		t = get_time(df)
-		output_complete = output_dir_for_csv(
-			csv_path=csv_p,
-			output_root=output_root,
-			total_csv_count=len(csv_paths),
-			index=index,
-			explicit_positional_output=positional_output_requested,
-		)
-		ensure_output_dir(output_complete)
-
-		print(f"Loaded: {csv_p}")
-		print(f"Rows: {len(df)}")
-		print(f"Time span: {np.nanmin(t):.3f} s to {np.nanmax(t):.3f} s")
-		print(f"Output directory: {output_complete}")
-
-		plot_detection_boxes_fov(
-			df=df,
-			t=t,
-			image_width=args.image_width,
-			image_height=args.image_height,
-			output_dir=output_complete,
-			max_boxes=args.max_boxes,
-		)
-
-		plot_target_position_offsets(
-			df=df,
-			t=t,
-			output_dir=output_complete,
-		)
-
-		plot_target_quality(
-			df=df,
-			t=t,
-			output_dir=output_complete,
-			schedule_points=schedule_points,
-			max_area_fraction=args.max_area_fraction,
-			absolute_max_area_fraction=args.absolute_max_area_fraction,
-		)
-
-		plot_vehicle_position(
-			df=df,
-			t=t,
-			output_dir=output_complete,
-		)
-
-		plot_vehicle_dynamics(
-			df=df,
-			t=t,
-			output_dir=output_complete,
-		)
-
-		plot_divergence(
-			df=df,
-			t=t,
-			output_dir=output_complete,
-			divergence_setpoint=args.divergence_setpoint,
-		)
-
-		plot_flow_velocity(
-			df=df,
-			t=t,
-			output_dir=output_complete,
-		)
-
-		plot_platform_position(
-			df=df,
-			t=t,
-			output_dir=output_complete,
-		)
-
-		plot_platform_velocity(
-			df=df,
-			t=t,
-			output_dir=output_complete,
-		)
-
-		plot_relative_motion(
-			df=df,
-			t=t,
-			output_dir=output_complete,
-		)
-
-		plot_divergence_vs_relative_motion(
-			df=df,
-			t=t,
-			output_dir=output_complete,
-		)
-
-		plot_relative_motion_spectrum(
-			df=df,
-			t=t,
-			output_dir=output_complete,
-			expected_frequency_hz=args.platform_frequency_hz,
-		)
-
-		plot_commands(
-			df=df,
-			t=t,
-			output_dir=output_complete,
-		)
-
-		plot_pipeline_latency(
-			df=df,
-			t=t,
-			output_dir=output_complete,
-		)
-
-		print("Done.")
+        print("Done.")
 
 
 if __name__ == "__main__":
-	main()
+    main()

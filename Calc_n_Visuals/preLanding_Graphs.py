@@ -2,7 +2,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 
 def main():
-	z0 = 1 ; paw = 0.1
+	z0 = 1 ; paw = 0.01
 	flux = -1
 
 	z = lambda t : z0*np.exp(flux*t) 
@@ -35,7 +35,7 @@ def main():
 		plt.plot(z_init, v_z(time), label = f"WT_set : {f}")
 	plt.grid()
 	plt.xlabel("Hauteur initial")
-	plt.ylabel("Vitesse contact")
+	plt.ylabel("Vitesse relative verticale au contact")
 	plt.legend()
 	plt.show()
 

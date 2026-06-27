@@ -174,6 +174,17 @@ class BeeLandNode(Node):
 		self._closed_loop_logged = False
 		self._lost_target_since = None
 
+		# Visual/control time bookkeeping. Target acquisition, optical flow, and
+		# control_law.compute() must use one clock family. The source of truth is
+		# the camera Image.header.stamp when ros_gz_bridge provides it. PX4 time is
+		# kept only as a fallback for missing image stamps and as diagnostics.
+		# Do NOT compare image/Gazebo timestamps and PX4 timestamps by absolute
+		# value: in this setup they can live in different epochs. Only deltas inside
+		# one clock family are meaningful.
+		self._prev_control_flow_timestamp = None
+		self._control_dt_fallback_logged = False
+		self._image_stamp_fallback_logged = False
+
 		self._mavsdk_thread = None
 		self._mavsdk_takeoff_started = False
 		self._mavsdk_takeoff_done = False
@@ -292,7 +303,7 @@ class BeeLandNode(Node):
 				cv2.imshow("Bee Land - Camera", frame)
 				cv2.waitKey(1)
 
-		stamp = time.time()
+		stamp = self._image_timestamp_sec(msg)
 		target = self.target_acquisition.update(frame, timestamp=stamp)
 		flow = self.optical_flow.update(frame, stamp, target=target)
 
@@ -393,6 +404,7 @@ class BeeLandNode(Node):
 			vy=msg.vy,
 			vz=msg.vz,
 			yaw=msg.heading,
+			px4_timestamp_sec=msg.timestamp / 1e6,
 		)
 
 	def on_mission_timer(self):
@@ -556,9 +568,87 @@ class BeeLandNode(Node):
 		self._latest_setpoint = self.control_law.compute(
 			self._latest_target,
 			self._latest_flow,
-			CONTROL_PERIOD_SEC,
+			self._control_dt_sec(),
 		)
 		self._write_diagnostics_row()
+
+	def _control_dt_sec(self) -> float:
+		"""Return the control step in the same clock as optical flow.
+
+		OpticalFlowEstimator converts px/frame into px/s using FlowResult.timestamp,
+		which comes from the camera image timestamp. Therefore the control law's
+		integral and slew-rate terms must use the delta between consecutive visual
+		timestamps, not a PX4 timestamp and not wall-clock time. This keeps the
+		units of flow/divergence [1/s] and controller dt [s] consistent.
+		"""
+		current = float(getattr(self._latest_flow, "timestamp", 0.0))
+		previous = self._prev_control_flow_timestamp
+		self._prev_control_flow_timestamp = current
+
+		if current <= 0.0 or previous is None:
+			return CONTROL_PERIOD_SEC
+
+		delta = current - previous
+
+		# Same frame / paused sim / duplicate image timestamp: do almost nothing,
+		# but keep control_law.compute() numerically happy.
+		if 0.0 <= delta <= 1e-6:
+			return 1e-3
+
+		# Reject true timestamp glitches without mixing in PX4/wall clocks.
+		if not (0.0 < delta <= 10.0 * CONTROL_PERIOD_SEC):
+			if not self._control_dt_fallback_logged:
+				self._control_dt_fallback_logged = True
+				self.get_logger().warning(
+					f"Implausible visual timestamp dt ({delta:.4f}s, nominal "
+					f"{CONTROL_PERIOD_SEC:.4f}s). Falling back to the fixed "
+					"control period for this tick."
+				)
+			return CONTROL_PERIOD_SEC
+
+		return delta
+
+	def _image_timestamp_sec(self, msg: Image) -> float:
+		"""Return the timestamp used by target acquisition and optical flow.
+
+		Preferred source: sensor_msgs/Image.header.stamp, normally filled by
+		ros_gz_bridge from Gazebo simulation time. If it is missing/zero, fall back
+		to PX4's simulated timestamp if available. Wall-clock is only a last-resort
+		startup fallback. The returned value is only compared to previous image
+		timestamps, never to PX4/wall timestamps by absolute value.
+		"""
+		stamp = getattr(getattr(msg, "header", None), "stamp", None)
+		stamp_sec = self._ros_stamp_to_sec(stamp)
+		if stamp_sec > 0.0:
+			return stamp_sec
+
+		px4_time = float(getattr(self._vehicle_state, "px4_timestamp_sec", 0.0))
+		if px4_time > 0.0:
+			if not self._image_stamp_fallback_logged:
+				self._image_stamp_fallback_logged = True
+				self.get_logger().warning(
+					"Camera Image.header.stamp is zero; using PX4 timestamp as the "
+					"vision timestamp. Prefer fixing the camera bridge so images carry "
+					"Gazebo sim time."
+				)
+			return px4_time
+
+		if not self._image_stamp_fallback_logged:
+			self._image_stamp_fallback_logged = True
+			self.get_logger().warning(
+				"Camera Image.header.stamp and PX4 timestamp are unavailable; "
+				"temporarily using wall-clock for vision timestamps."
+			)
+		return time.time()
+
+	@staticmethod
+	def _ros_stamp_to_sec(stamp) -> float:
+		if stamp is None:
+			return 0.0
+		try:
+			return float(stamp.sec) + 1e-9 * float(stamp.nanosec)
+		except AttributeError:
+			return 0.0
 
 	def _write_diagnostics_row(self):
 		self.diagnostics.write(
