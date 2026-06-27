@@ -574,8 +574,8 @@ def plot_drone_platform_position_xyz(df: pd.DataFrame, t: np.ndarray, output_dir
 	This keeps the bottom panel in one common vertical coordinate system.
 	"""
 	axis_specs = [
-		("x", "vehicle_x_m", "platform_x_m", lambda v: v + 1.5, "position x [m]"),
-		("y", "vehicle_y_m", "platform_y_m", lambda v: v + 1.5, "position y [m]"),
+		("x", "vehicle_x_m", "platform_y_m", lambda v: v + 1.5, "position x [m]"),
+		("y", "vehicle_y_m", "platform_x_m", lambda v: v + 1.5, "position y [m]"),
 		("z", "vehicle_z_m", "platform_z_m", lambda v: -v, "position z [m] (up-positive)"),
 	]
 

@@ -61,7 +61,10 @@ unreliable k_d. If the loop still oscillates after raising damping, relax
 command itself and reintroduces the lag the damping was meant to remove.
 
 Thrust uses the scalar divergence model d[k+1] = a d[k] + b (thrust - hover),
-with LQR feedback on the divergence error plus a visual-only integral term.
+with LQR feedback on a lead-compensated divergence error plus a small
+visual-only integral term. The lead branch is applied only to the fast
+proportional/LQR path; the integral still accumulates the true divergence
+error so it remains a slow bias corrector.
 
 Past target.fov_saturated (target exceeds the camera's FOV, not just fills
 it -- see target_acquisition.py), area_fraction/box geometry are clamped at
@@ -133,7 +136,7 @@ class ControlLaw:
 		self,
 		hover_thrust: float = 0.73,
 		yaw_setpoint: float = 0.0,
-		divergence_setpoint: float = 0.01,  # 0 = visual hover; raise slowly to descend.
+		divergence_setpoint: float = 0.0,  # 0 = visual hover; raise slowly to descend.
 
 		# --- Baseline LQR cost (gain SHAPE). Larger R -> smaller gains; the
 		#     second Q entry weights the flow/velocity state -> damping. ---
@@ -218,40 +221,51 @@ class ControlLaw:
 		# next axis to tune, via hover with the platform's own z oscillation
 		# turned on (see module docstring step 2), not yet exercised.
 		thrust_gain_scale = [
-			(0.10, 0.90),
-			(0.215, 0.75),
-			(0.45, 0.60),
-			(0.70, 0.42),
-			(0.85, 0.35),
+			(0.10, 1.00),
+			(0.215, 0.90),
+			(0.45, 0.75),
+			(0.70, 0.62),
+			(0.85, 0.55),
 		],
 		divergence_integral_gain = [
-			(0.10, 0.035),
-			(0.215, 0.030),
-			(0.45, 0.025),
-			(0.70, 0.020),
-			(0.85, 0.018),
+			(0.10, 0.020),
+			(0.215, 0.018),
+			(0.45, 0.015),
+			(0.70, 0.012),
+			(0.85, 0.010),
 		],
 
 		# --- Command limits [rad] / normalized thrust. ---
 		roll_limit: float = 0.035,
 		pitch_limit: float = 0.030,
-		thrust_min: float = 0.62,
-		thrust_max: float = 0.84,
+		thrust_min: float = 0.59,
+		thrust_max: float = 0.87,
 
 		# --- Command shaping. Slew rates relaxed vs the first run so the
 		#     damping command is not itself rate-limited away. ---
 		roll_slew_rate_rad_s: float = 0.070,
 		pitch_slew_rate_rad_s: float = 0.080,
-		thrust_slew_rate_per_s: float = 0.10,
-		command_filter_alpha: float = 0.60,
+		thrust_slew_rate_per_s: float = 0.18,
+		command_filter_alpha: float = 0.75,
 
 		# --- Visual thrust loop. Positive divergence = target expanding =
 		#     approach -> increase thrust. Stays purely visual. ---
 		enable_divergence_control: bool = True,
 		require_target_for_descent: bool = True,
-		max_visual_thrust_delta_from_hover: float = 0.10,
+		max_visual_thrust_delta_from_hover: float = 0.14,
 		divergence_integral_limit: float = 1.2,
-		raw_divergence_weight: float = 0.10,
+		raw_divergence_weight: float = 0.25,
+
+		# --- Phase lead for the vertical/divergence loop. ---
+		# The platform injects a periodic relative vertical motion. Pure P+I on
+		# divergence reacts after the oscillation appears; this lead branch adds a
+		# filtered derivative of the divergence error to the proportional/LQR path
+		# only. Keep the integral on the original error so it remains a slow bias
+		# corrector rather than a noise amplifier. divergence_lead_time accepts the
+		# same scalar-or-schedule format as the other trim knobs.
+		divergence_lead_time=0.25,
+		divergence_lead_filter_alpha: float = 0.65,
+		divergence_lead_rate_limit: float = 3.0,
 
 		# Sign convention confirmed by closed-loop tests.
 		roll_output_sign: float = -1.0,
@@ -300,6 +314,12 @@ class ControlLaw:
 		self._raw_divergence_weight = self._clamp(raw_divergence_weight, 0.0, 1.0)
 		self._divergence_integral = 0.0
 
+		self._divergence_lead_time = ScalarSchedule(divergence_lead_time)
+		self._divergence_lead_filter_alpha = self._clamp(divergence_lead_filter_alpha, 0.0, 1.0)
+		self._divergence_lead_rate_limit = abs(float(divergence_lead_rate_limit))
+		self._previous_divergence_error: Optional[float] = None
+		self._filtered_divergence_error_rate = 0.0
+
 		self._previous_roll_cmd = 0.0
 		self._previous_pitch_cmd = 0.0
 		self._previous_thrust_cmd = self._hover_thrust
@@ -324,6 +344,8 @@ class ControlLaw:
 
 	def reset_visual_integrators(self):
 		self._divergence_integral = 0.0
+		self._previous_divergence_error = None
+		self._filtered_divergence_error_rate = 0.0
 		self._previous_roll_cmd = 0.0
 		self._previous_pitch_cmd = 0.0
 		self._previous_thrust_cmd = self._hover_thrust
@@ -382,18 +404,25 @@ class ControlLaw:
 
 			thrust_gain_scale = self._thrust_gain_scale.value_at(scheduling_area_fraction)
 			integral_gain = self._divergence_integral_gain.value_at(scheduling_area_fraction)
+			lead_error = self._lead_compensated_divergence_error(
+				error, dt, scheduling_area_fraction
+			)
 
-			thrust_state = np.array([[error]])
 			baseline_thrust_gain = float(self._thrust_lqr.gain_at(scheduling_area_fraction)[0, 0])
-			lqr_delta = -(thrust_gain_scale * baseline_thrust_gain) * error
+			# Lead compensation is deliberately applied only to the fast LQR/P path.
+			# The integral below keeps using the true error accumulated above.
+			lqr_delta = -(thrust_gain_scale * baseline_thrust_gain) * lead_error
 			integral_delta = integral_gain * self._divergence_integral
 			visual_thrust_delta = self._soft_limit(
 				lqr_delta + integral_delta, self._max_visual_thrust_delta
 			)
 		else:
 			# No visual measurement: decay (don't hard-reset) so one dropped
-			# frame is not a discontinuity, while stale info is forgotten.
+			# frame is not a discontinuity, while stale info is forgotten. Reset
+			# the lead memory so a later reacquisition does not create a derivative spike.
 			self._divergence_integral *= 0.90
+			self._previous_divergence_error = None
+			self._filtered_divergence_error_rate *= 0.90
 
 		thrust_cmd = self._clamp(
 			self._hover_thrust + visual_thrust_delta, self._thrust_min, self._thrust_max
@@ -476,6 +505,43 @@ class ControlLaw:
 		self._previous_pitch_cmd = pitch_s
 		self._previous_thrust_cmd = thrust_s
 		return roll_s, pitch_s, thrust_s
+
+	def _lead_compensated_divergence_error(
+		self, error: float, dt: float, scheduling_area_fraction: float
+	) -> float:
+		"""Return e + T_lead * filtered(de/dt) for the thrust P/LQR path.
+
+		This is a bounded derivative / phase-lead branch, not an integral
+		replacement. On the first valid sample after reset/reacquisition, it
+		returns the raw error so the controller does not kick from an artificial
+		derivative.
+		"""
+		error = float(error)
+		dt = max(1e-3, float(dt))
+		lead_time = self._divergence_lead_time.value_at(scheduling_area_fraction)
+
+		if self._previous_divergence_error is None:
+			self._previous_divergence_error = error
+			self._filtered_divergence_error_rate = 0.0
+			return error
+
+		raw_rate = (error - self._previous_divergence_error) / dt
+		self._previous_divergence_error = error
+
+		if self._divergence_lead_rate_limit > 0.0:
+			raw_rate = self._clamp(
+				raw_rate,
+				-self._divergence_lead_rate_limit,
+				self._divergence_lead_rate_limit,
+			)
+
+		alpha = self._divergence_lead_filter_alpha
+		self._filtered_divergence_error_rate = (
+			alpha * self._filtered_divergence_error_rate
+			+ (1.0 - alpha) * raw_rate
+		)
+
+		return error + lead_time * self._filtered_divergence_error_rate
 
 	def _divergence_for_control(self, flow: FlowResult) -> float:
 		"""Blend filtered and raw divergence: (1-w) d_filt + w d_raw."""
