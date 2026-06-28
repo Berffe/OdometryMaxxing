@@ -28,7 +28,7 @@ except ImportError:
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Pose
 from std_msgs.msg import Bool
-from px4_msgs.msg import VehicleLocalPosition
+from px4_msgs.msg import VehicleLocalPosition, VehicleAttitude
 from cv_bridge import CvBridge, CvBridgeError
 
 from .state import VehicleState, PlatformState, AttitudeSetpoint, TargetEstimate
@@ -164,9 +164,12 @@ class BeeLandNode(Node):
 		self._latest_setpoint = AttitudeSetpoint(thrust=self.control_law.hover_thrust)
 
 		self._have_local_position = False
+		self._have_vehicle_attitude = False
+		self._vehicle_attitude_count = 0
 		self._image_count = 0
 		self._last_image_log_time = 0.0
 		self._last_position_log_time = 0.0
+		self._last_attitude_log_time = 0.0
 
 		self._mission_phase = PHASE_WAITING_FOR_STREAMS
 		self._phase_start_time = time.time()
@@ -234,6 +237,12 @@ class BeeLandNode(Node):
 			VehicleLocalPosition,
 			"/fmu/out/vehicle_local_position_v1",
 			self.on_local_position,
+			px4_qos,
+		)
+		self.create_subscription(
+			VehicleAttitude,
+			"/fmu/out/vehicle_attitude",
+			self.on_vehicle_attitude,
 			px4_qos,
 		)
 		self.create_subscription(Image, "/bee_x500/camera/image", self.on_camera, camera_qos)
@@ -388,6 +397,38 @@ class BeeLandNode(Node):
 		if self._mission_phase == PHASE_CLOSED_LOOP:
 			self._enter_landed_phase("touchdown contact event")
 
+	def on_vehicle_attitude(self, msg: VehicleAttitude):
+		"""PX4 attitude telemetry for diagnostics.
+
+		VehicleLocalPosition gives position, velocity, and heading, but not roll/pitch.
+		This callback merges roll/pitch/yaw from /fmu/out/vehicle_attitude into the
+		shared VehicleState object without feeding it to the visual control law.
+		"""
+		now = time.time()
+		self._have_vehicle_attitude = True
+		self._vehicle_attitude_count += 1
+
+		try:
+			roll, pitch, yaw = self._quat_wxyz_to_euler(msg.q)
+		except Exception as exc:
+			self.get_logger().warning(f"Could not decode vehicle attitude quaternion: {repr(exc)}")
+			return
+
+		# Mutate only the attitude fields so the latest local-position values remain
+		# intact. on_local_position() below preserves these fields when it rebuilds
+		# VehicleState from a new local-position message.
+		self._vehicle_state.attitude_timestamp = msg.timestamp / 1e6
+		self._vehicle_state.roll = roll
+		self._vehicle_state.pitch = pitch
+		self._vehicle_state.attitude_yaw = yaw
+		self._vehicle_state.attitude_source = "vehicle_attitude"
+
+		if VERBOSE_STREAM_LOGS and now - self._last_attitude_log_time >= 1.0:
+			self._last_attitude_log_time = now
+			self.get_logger().info(
+				f"vehicle attitude: roll={roll:.3f} rad, pitch={pitch:.3f} rad, yaw={yaw:.3f} rad"
+			)
+
 	def on_local_position(self, msg: VehicleLocalPosition):
 		now = time.time()
 		self._have_local_position = True
@@ -395,6 +436,7 @@ class BeeLandNode(Node):
 			self._last_position_log_time = now
 			self.get_logger().info(f"local position: x={msg.x:.2f} m, y={msg.y:.2f} m, z={msg.z:.2f} m")
 
+		previous = self._vehicle_state
 		self._vehicle_state = VehicleState(
 			timestamp=now,
 			x=msg.x,
@@ -405,6 +447,11 @@ class BeeLandNode(Node):
 			vz=msg.vz,
 			yaw=msg.heading,
 			px4_timestamp_sec=msg.timestamp / 1e6,
+			attitude_timestamp=getattr(previous, "attitude_timestamp", 0.0),
+			roll=getattr(previous, "roll", 0.0),
+			pitch=getattr(previous, "pitch", 0.0),
+			attitude_yaw=getattr(previous, "attitude_yaw", 0.0),
+			attitude_source=getattr(previous, "attitude_source", ""),
 		)
 
 	def on_mission_timer(self):
@@ -640,6 +687,36 @@ class BeeLandNode(Node):
 				"temporarily using wall-clock for vision timestamps."
 			)
 		return time.time()
+
+	@staticmethod
+	def _quat_wxyz_to_euler(q):
+		"""Convert a PX4 Hamilton quaternion [w, x, y, z] to roll/pitch/yaw [rad]."""
+		if len(q) != 4:
+			raise ValueError(f"expected 4 quaternion components, got {len(q)}")
+		w, x, y, z = [float(value) for value in q]
+
+		# Normalize defensively. PX4 should already publish a unit quaternion, but
+		# normalization avoids occasional startup/transport numerical weirdness.
+		norm = math.sqrt(w * w + x * x + y * y + z * z)
+		if norm <= 1e-12:
+			raise ValueError("zero-norm vehicle attitude quaternion")
+		w, x, y, z = w / norm, x / norm, y / norm, z / norm
+
+		sinr_cosp = 2.0 * (w * x + y * z)
+		cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+		roll = math.atan2(sinr_cosp, cosr_cosp)
+
+		sinp = 2.0 * (w * y - z * x)
+		if abs(sinp) >= 1.0:
+			pitch = math.copysign(math.pi / 2.0, sinp)
+		else:
+			pitch = math.asin(sinp)
+
+		siny_cosp = 2.0 * (w * z + x * y)
+		cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+		yaw = math.atan2(siny_cosp, cosy_cosp)
+
+		return roll, pitch, yaw
 
 	@staticmethod
 	def _ros_stamp_to_sec(stamp) -> float:

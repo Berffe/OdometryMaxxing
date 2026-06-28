@@ -16,6 +16,11 @@ optimal baseline gain K_lqr = [k_p, k_d] from that one measurement; the
 command is
 	u = sign * ( -(k_p_eff*offset + k_d_eff*flow) )
 with k_p_eff/k_d_eff derived from K_lqr via the manual trim knobs below.
+A small optional offset-prediction lead branch can be added on top of this
+PD-like visual feedback. It finite-differences the target-center offset, filters
+and bounds that trend, then adds k_lead*T_lead*d(offset)/dt to the same feedback
+sum. The optical-flow term is kept as the primary damping/velocity feedback;
+the lead branch is only a modest phase-advance/prediction correction.
 This single baseline is a STARTING POINT only -- it sets the gain SHAPE and
 sign/order-of-magnitude at one operating point, not the final numbers at
 every altitude.
@@ -59,6 +64,13 @@ deliberately set it instead, since it doesn't depend on the LQR's own
 unreliable k_d. If the loop still oscillates after raising damping, relax
 *_slew_rate/command_filter_alpha: a tight slew rate rate-limits the damping
 command itself and reintroduces the lag the damping was meant to remove.
+
+Lateral lead note: roll/pitch still keep the optical-flow term as the true
+visual damping path. The lateral lead branch is intentionally separate: it
+uses a filtered finite-difference of the target offset to predict the near-
+future offset and adds only a small fraction of k_p times that prediction.
+That makes it a phase-advance correction rather than a simple replacement for
+or duplicate of the optical-flow damping term.
 
 Thrust uses the scalar divergence model d[k+1] = a d[k] + b (thrust - hover),
 with LQR feedback on a lead-compensated divergence error plus a small
@@ -178,19 +190,19 @@ class ControlLaw:
 		# changing nothing here, just making the TODO visible in the code
 		# rather than only in a comment.
 		roll_prop_scale = [
-			(0.10, 1.40),
-			(0.215, 1.00),
-			(0.45, 0.70),
-			(0.70, 0.55),
-			(0.85, 0.50),
-		],
-		roll_damp_scale=1.5,            # inert while roll_damp_ratio is set; kept for the legacy path.
-		roll_damp_ratio = [
 			(0.10, 1.70),
 			(0.215, 1.20),
 			(0.45, 0.85),
-			(0.70, 0.65),
-			(0.85, 0.60),
+			(0.70, 0.95),
+			(0.85, 0.85),
+		],
+		roll_damp_scale=1.5,            # inert while roll_damp_ratio is set; kept for the legacy path.
+		roll_damp_ratio = [
+			(0.10, 3.00),
+			(0.215, 2.20),
+			(0.45, 1.55),
+			(0.70, 1.55),
+			(0.85, 1.35),
 		],
 		# Pitch: damp_ratio=10 confirmed in a long closed-loop hover/descent
 		# run (std(offset_y)~0.005, zero saturation) -- working well.
@@ -217,6 +229,31 @@ class ControlLaw:
 			(0.70, 1.4),
 			(0.85, 1.25),
 		],
+
+		# --- Lateral phase lead / short-horizon offset prediction. ---
+		# Keep the optical-flow term as the damping path. This branch uses the
+		# finite-differenced target offset, filtered and bounded, to add a small
+		# phase-advance correction: k_lead * T_lead * d(offset)/dt, where
+		# k_lead = lead_gain_ratio * k_p. Each lead_time/gain_ratio accepts the
+		# same scalar-or-schedule format as the other trim knobs.
+		roll_lead_time = [
+			(0.10, 0.35),
+			(0.45, 0.35),
+			(0.70, 0.40),
+			(0.85, 0.45),
+		],
+		roll_lead_gain_ratio = [
+			(0.10, 0.55),
+			(0.45, 0.55),
+			(0.70, 0.75),
+			(0.85, 0.85),
+		],
+		pitch_lead_time=0.35,
+		pitch_lead_gain_ratio=0.55,
+		lateral_lead_filter_alpha: float = 0.85,
+		lateral_lead_rate_limit: float = 1.5,
+		lateral_lead_correction_limit: float = 0.40,
+
 		# Thrust: still at its original conservative value -- this is the
 		# next axis to tune, via hover with the platform's own z oscillation
 		# turned on (see module docstring step 2), not yet exercised.
@@ -236,25 +273,25 @@ class ControlLaw:
 		],
 
 		# --- Command limits [rad] / normalized thrust. ---
-		roll_limit: float = 0.035,
-		pitch_limit: float = 0.030,
-		thrust_min: float = 0.59,
-		thrust_max: float = 0.87,
+		roll_limit: float = 0.16,
+		pitch_limit: float = 0.16,
+		thrust_min: float = 0.62,
+		thrust_max: float = 0.91,
 
 		# --- Command shaping. Slew rates relaxed vs the first run so the
 		#     damping command is not itself rate-limited away. ---
-		roll_slew_rate_rad_s: float = 0.070,
-		pitch_slew_rate_rad_s: float = 0.080,
-		thrust_slew_rate_per_s: float = 0.18,
-		command_filter_alpha: float = 0.75,
+		roll_slew_rate_rad_s: float = 0.35,
+		pitch_slew_rate_rad_s: float = 0.20,
+		thrust_slew_rate_per_s: float = 0.40,
+		command_filter_alpha: float = 0.85,
 
 		# --- Visual thrust loop. Positive divergence = target expanding =
 		#     approach -> increase thrust. Stays purely visual. ---
 		enable_divergence_control: bool = True,
 		require_target_for_descent: bool = True,
-		max_visual_thrust_delta_from_hover: float = 0.14,
+		max_visual_thrust_delta_from_hover: float = 0.18,
 		divergence_integral_limit: float = 1.2,
-		raw_divergence_weight: float = 0.25,
+		raw_divergence_weight: float = 0.15,
 
 		# --- Phase lead for the vertical/divergence loop. ---
 		# The platform injects a periodic relative vertical motion. Pure P+I on
@@ -264,8 +301,8 @@ class ControlLaw:
 		# corrector rather than a noise amplifier. divergence_lead_time accepts the
 		# same scalar-or-schedule format as the other trim knobs.
 		divergence_lead_time=0.25,
-		divergence_lead_filter_alpha: float = 0.65,
-		divergence_lead_rate_limit: float = 3.0,
+		divergence_lead_filter_alpha: float = 0.80,
+		divergence_lead_rate_limit: float = 2.0,
 
 		# Sign convention confirmed by closed-loop tests.
 		roll_output_sign: float = -1.0,
@@ -291,6 +328,17 @@ class ControlLaw:
 		self._roll_damp_scale = ScalarSchedule(roll_damp_scale)
 		self._pitch_prop_scale = ScalarSchedule(pitch_prop_scale)
 		self._pitch_damp_scale = ScalarSchedule(pitch_damp_scale)
+		self._roll_lead_time = ScalarSchedule(roll_lead_time)
+		self._roll_lead_gain_ratio = ScalarSchedule(roll_lead_gain_ratio)
+		self._pitch_lead_time = ScalarSchedule(pitch_lead_time)
+		self._pitch_lead_gain_ratio = ScalarSchedule(pitch_lead_gain_ratio)
+		self._lateral_lead_filter_alpha = self._clamp(lateral_lead_filter_alpha, 0.0, 1.0)
+		self._lateral_lead_rate_limit = abs(float(lateral_lead_rate_limit))
+		self._lateral_lead_correction_limit = abs(float(lateral_lead_correction_limit))
+		self._previous_roll_offset: Optional[float] = None
+		self._previous_pitch_offset: Optional[float] = None
+		self._filtered_roll_offset_rate = 0.0
+		self._filtered_pitch_offset_rate = 0.0
 		self._thrust_gain_scale = ScalarSchedule(thrust_gain_scale)
 
 		# Raw LQR baseline gains -- the manual trim knobs above are applied at
@@ -346,6 +394,10 @@ class ControlLaw:
 		self._divergence_integral = 0.0
 		self._previous_divergence_error = None
 		self._filtered_divergence_error_rate = 0.0
+		self._previous_roll_offset = None
+		self._previous_pitch_offset = None
+		self._filtered_roll_offset_rate = 0.0
+		self._filtered_pitch_offset_rate = 0.0
 		self._previous_roll_cmd = 0.0
 		self._previous_pitch_cmd = 0.0
 		self._previous_thrust_cmd = self._hover_thrust
@@ -366,27 +418,47 @@ class ControlLaw:
 
 		scheduling_area_fraction = self._scheduling_area_fraction(target, target_found, area_fraction)
 
-		# --- Lateral axes: u = sign * ( -(k_p_eff*offset + k_d_eff*flow) ). ---
+		# --- Lateral axes: u = sign * ( -(k_p_eff*offset + k_d_eff*flow + lead) ). ---
 		if target_found:
 			flow_x = float(getattr(flow, "mean_flow_x_norm", 0.0)) if flow_valid else 0.0
 			flow_y = float(getattr(flow, "mean_flow_y_norm", 0.0)) if flow_valid else 0.0
+			offset_x = float(target.offset_x)
+			offset_y = float(target.offset_y)
+
+			roll_lead_correction = self._lead_offset_correction(
+				"roll", offset_x, dt, scheduling_area_fraction
+			)
+			pitch_lead_correction = self._lead_offset_correction(
+				"pitch", offset_y, dt, scheduling_area_fraction
+			)
 
 			roll_u = self._axis_command(
-				self._roll_lqr.gain_at(scheduling_area_fraction), float(target.offset_x), flow_x,
+				self._roll_lqr.gain_at(scheduling_area_fraction), offset_x, flow_x,
 				self._roll_prop_scale.value_at(scheduling_area_fraction),
 				self._roll_damp_scale.value_at(scheduling_area_fraction),
 				self._roll_damp_ratio.value_at(scheduling_area_fraction) if self._roll_damp_ratio else None,
+				roll_lead_correction,
+				self._roll_lead_gain_ratio.value_at(scheduling_area_fraction),
 			)
 			pitch_u = self._axis_command(
-				self._pitch_lqr.gain_at(scheduling_area_fraction), float(target.offset_y), flow_y,
+				self._pitch_lqr.gain_at(scheduling_area_fraction), offset_y, flow_y,
 				self._pitch_prop_scale.value_at(scheduling_area_fraction),
 				self._pitch_damp_scale.value_at(scheduling_area_fraction),
 				self._pitch_damp_ratio.value_at(scheduling_area_fraction) if self._pitch_damp_ratio else None,
+				pitch_lead_correction,
+				self._pitch_lead_gain_ratio.value_at(scheduling_area_fraction),
 			)
 
 			# Smooth saturation toward the limit (not a hard clip).
 			roll_cmd = self._soft_limit(self._roll_output_sign * roll_u, self._roll_limit)
 			pitch_cmd = self._soft_limit(self._pitch_output_sign * pitch_u, self._pitch_limit)
+		else:
+			# No target center: reset the lateral prediction memory so reacquisition
+			# cannot create a finite-difference spike.
+			self._previous_roll_offset = None
+			self._previous_pitch_offset = None
+			self._filtered_roll_offset_rate *= 0.90
+			self._filtered_pitch_offset_rate *= 0.90
 
 		# --- Thrust axis: feedback on divergence error + visual integral. ---
 		can_use_divergence = self._enable_divergence_control and flow_valid
@@ -506,6 +578,67 @@ class ControlLaw:
 		self._previous_thrust_cmd = thrust_s
 		return roll_s, pitch_s, thrust_s
 
+	def _lead_offset_correction(
+		self, axis: str, offset: float, dt: float, scheduling_area_fraction: float
+	) -> float:
+		"""Return T_lead * filtered(d offset / dt) for roll/pitch prediction.
+
+		This branch is deliberately separate from the optical-flow damping term.
+		Optical flow remains the visual velocity feedback; this method uses the
+		target-center trend as a bounded short-horizon offset predictor. On the
+		first valid sample after reset/reacquisition, it returns zero so the
+		controller does not kick from an artificial derivative.
+		"""
+		offset = float(offset)
+		dt = max(1e-3, float(dt))
+
+		if axis == "roll":
+			previous = self._previous_roll_offset
+			lead_time = self._roll_lead_time.value_at(scheduling_area_fraction)
+			filtered_rate = self._filtered_roll_offset_rate
+		elif axis == "pitch":
+			previous = self._previous_pitch_offset
+			lead_time = self._pitch_lead_time.value_at(scheduling_area_fraction)
+			filtered_rate = self._filtered_pitch_offset_rate
+		else:
+			raise ValueError(f"unknown lateral lead axis: {axis!r}")
+
+		if previous is None:
+			if axis == "roll":
+				self._previous_roll_offset = offset
+				self._filtered_roll_offset_rate = 0.0
+			else:
+				self._previous_pitch_offset = offset
+				self._filtered_pitch_offset_rate = 0.0
+			return 0.0
+
+		raw_rate = (offset - previous) / dt
+		if self._lateral_lead_rate_limit > 0.0:
+			raw_rate = self._clamp(
+				raw_rate,
+				-self._lateral_lead_rate_limit,
+				self._lateral_lead_rate_limit,
+			)
+
+		alpha = self._lateral_lead_filter_alpha
+		filtered_rate = alpha * filtered_rate + (1.0 - alpha) * raw_rate
+		correction = lead_time * filtered_rate
+		if self._lateral_lead_correction_limit > 0.0:
+			correction = self._clamp(
+				correction,
+				-self._lateral_lead_correction_limit,
+				self._lateral_lead_correction_limit,
+			)
+
+		if axis == "roll":
+			self._previous_roll_offset = offset
+			self._filtered_roll_offset_rate = filtered_rate
+		else:
+			self._previous_pitch_offset = offset
+			self._filtered_pitch_offset_rate = filtered_rate
+
+		return correction
+
 	def _lead_compensated_divergence_error(
 		self, error: float, dt: float, scheduling_area_fraction: float
 	) -> float:
@@ -559,20 +692,22 @@ class ControlLaw:
 	def _axis_command(
 		baseline_gain: np.ndarray, offset: float, flow: float,
 		prop_scale: float, damp_scale: float, damp_ratio: Optional[float],
+		lead_correction: float = 0.0, lead_gain_ratio: float = 0.0,
 	) -> float:
 		"""
-		Lateral feedback u = -(k_p_eff*offset + k_d_eff*flow), with
-		k_p_eff = prop_scale * baseline_gain[0,0], and
-		k_d_eff = damp_ratio*k_p_eff if damp_ratio is set (consistent sign
-		across the schedule, since the LQR's own k_d is unreliable -- see
-		module docstring), else damp_scale * baseline_gain[0,1].
-		baseline_gain is the RAW LQR gain (unscaled); prop_scale/damp_scale/
-		damp_ratio are resolved by the caller at the current scheduling
-		area_fraction, so each can vary per altitude.
+		Lateral feedback
+			u = -(k_p_eff*offset + k_d_eff*flow + k_lead*lead_correction)
+		with k_p_eff = prop_scale * baseline_gain[0,0], k_d_eff synthesized
+		from damp_ratio when enabled, and k_lead = lead_gain_ratio*k_p_eff.
+
+		lead_correction has offset units: T_lead * filtered(d offset / dt).
+		It is a small prediction/phase-advance term, while flow remains the
+		primary visual damping signal.
 		"""
 		k_p = prop_scale * float(baseline_gain[0, 0])
 		k_d = damp_ratio * k_p if damp_ratio is not None else damp_scale * float(baseline_gain[0, 1])
-		return -(k_p * offset + k_d * flow)
+		k_lead = lead_gain_ratio * k_p
+		return -(k_p * offset + k_d * flow + k_lead * lead_correction)
 
 	@staticmethod
 	def _safe_area_fraction(target: TargetEstimate) -> float:
