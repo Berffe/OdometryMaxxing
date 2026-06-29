@@ -404,7 +404,7 @@ def parse_args():
 		description="Discrete python-control frequency diagnostic model for visual divergence landing."
 	)
 	parser.add_argument("--sample-periods", type=float, nargs="+", default=[0.5, 0.2, 0.1, 0.05])
-	parser.add_argument("--output-dir", type=Path, default=Path("frequency_diagnostics_discrete"))
+	parser.add_argument("--output-dir", type=Path, default=Path("results"))
 
 	parser.add_argument("--h0", type=float, default=ModelParams.h0)
 	parser.add_argument("--divergence-setpoint", type=float, default=ModelParams.divergence_setpoint)
