@@ -12,6 +12,14 @@ class VehicleState:
 
 	NED sign convention: z grows more negative when climbing, vz > 0 = descending.
 	Not used by the control law after visual handoff.
+
+	timestamp is the common simulation-time stamp for this state, in seconds.
+	In bee_node.py it is filled from VehicleLocalPosition.timestamp, converted
+	from PX4 microseconds to seconds. px4_timestamp_sec keeps the same raw PX4
+	time explicitly because it is useful for diagnostics and cross-checks. The
+	CSV writer still receives a separate wall_timestamp, so wall-clock logging
+	remains available without mixing clocks inside target/flow/control data.
+	Defaults to 0.0 when no PX4 timestamp has been received yet.
 	"""
 
 	timestamp: float = 0.0
@@ -22,11 +30,29 @@ class VehicleState:
 	vy: float = 0.0
 	vz: float = 0.0
 	yaw: float = 0.0  # VehicleLocalPosition.heading [rad]
+	px4_timestamp_sec: float = 0.0
+
+	# Actual attitude, merged in from a separate PX4 topic (VehicleAttitude or
+	# the VehicleOdometry fallback -- see calibration_node.py's
+	# VEHICLE_ATTITUDE_TOPICS/VEHICLE_ODOMETRY_TOPICS) on top of the
+	# local-position fields above, which arrive on their own topic and
+	# callback. attitude_timestamp <= 0.0 means none received yet -- checked
+	# before trusting roll/pitch/attitude_yaw for anything (e.g.
+	# REQUIRE_ATTITUDE_BEFORE_CALIBRATION, MAVSDK_HOLD_CURRENT_YAW).
+	attitude_timestamp: float = 0.0
+	roll: float = 0.0
+	pitch: float = 0.0
+	attitude_yaw: float = 0.0
+	attitude_source: str = ""  # "vehicle_attitude" or "vehicle_odometry"
 
 
 @dataclass
 class FlowResult:
 	"""Output of OpticalFlowEstimator.update().
+
+	timestamp uses the same simulation-time base as TargetEstimate and
+	VehicleState. In the ROS node it comes from the camera Image.header.stamp,
+	so mean flow and divergence are expressed per simulated second.
 
 	Control inputs (used by control_law.py):
 	    mean_flow_x_norm / mean_flow_y_norm : normalized image velocity [1/s], in
@@ -59,10 +85,16 @@ class FlowResult:
 	roi_x1: int = -1
 	roi_y1: int = -1
 
+	affine_inliers: int = 0
+	affine_inlier_fraction: float = 0.0
+	affine_residual_rms: float = 0.0
+
 
 @dataclass
 class TargetEstimate:
 	"""Output of TargetAcquisition.update() -- what the controller tracks.
+
+	timestamp uses the same simulation-time base as FlowResult.
 
 	offset_x/y : centroid offset from image center, normalized to [-1, 1].
 	area_fraction : detection area / frame area, in [0, 1]; the scheduling
@@ -89,6 +121,8 @@ class TargetEstimate:
 	confidence: float = 0.0
 	area_fraction: float = 0.0
 	fov_saturated: bool = False
+	is_held: bool = False
+	age_sec: float = 0.0
 
 
 @dataclass
@@ -117,7 +151,11 @@ class PlatformState:
 
 @dataclass
 class AttitudeSetpoint:
-	"""Desired attitude/thrust consumed by the MAVSDK/PX4 backend."""
+	"""Desired attitude/thrust consumed by the MAVSDK/PX4 backend.
+
+	timestamp follows the same simulation-time base as the visual measurement
+	that produced the command.
+	"""
 
 	timestamp: float = 0.0
 	roll: float = 0.0

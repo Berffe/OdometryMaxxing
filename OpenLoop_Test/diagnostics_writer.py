@@ -154,6 +154,8 @@ class DiagnosticsWriter:
 				getattr(target, "area_fraction", 0.0)
 			),
 			"target_fov_saturated": self._safe_bool(getattr(target, "fov_saturated", False)),
+			"target_is_held": self._safe_bool(getattr(target, "is_held", False)),
+			"target_age_sec": self._safe_float(getattr(target, "age_sec", 0.0)),
 
 			# --------------------------------------------------------
 			# Optical flow
@@ -176,6 +178,9 @@ class DiagnosticsWriter:
 			"flow_roi_y0": self._safe_int(getattr(flow, "roi_y0", -1)),
 			"flow_roi_x1": self._safe_int(getattr(flow, "roi_x1", -1)),
 			"flow_roi_y1": self._safe_int(getattr(flow, "roi_y1", -1)),
+			"flow_affine_inliers": self._safe_int(getattr(flow, "affine_inliers", 0)),
+			"flow_affine_inlier_fraction": self._safe_float(getattr(flow, "affine_inlier_fraction", 0.0)),
+			"flow_affine_residual_rms": self._safe_float(getattr(flow, "affine_residual_rms", 0.0)),
 
 			# --------------------------------------------------------
 			# Controller command
@@ -233,6 +238,8 @@ class DiagnosticsWriter:
 			# Calibration-only metadata (empty outside calibration_node.py)
 			# --------------------------------------------------------
 			"calibration_axis": calibration_axis if calibration_axis else "",
+			"calibration_altitude_m": self._optional_float(getattr(setpoint, "calibration_altitude_m", None)),
+			"calibration_altitude_index": self._optional_float(getattr(setpoint, "calibration_altitude_index", None)),
 		}
 
 		self._writer.writerow(row)
@@ -341,6 +348,8 @@ class DiagnosticsWriter:
 			"target_detection_height_px",
 			"target_area_fraction",
 			"target_fov_saturated",
+			"target_is_held",
+			"target_age_sec",
 
 			# Optical flow
 			"flow_timestamp_sec",
@@ -355,6 +364,9 @@ class DiagnosticsWriter:
 			"flow_roi_y0",
 			"flow_roi_x1",
 			"flow_roi_y1",
+			"flow_affine_inliers",
+			"flow_affine_inlier_fraction",
+			"flow_affine_residual_rms",
 
 			# Controller command
 			"command_timestamp_sec",
@@ -394,4 +406,6 @@ class DiagnosticsWriter:
 
 			# Calibration-only metadata
 			"calibration_axis",
+			"calibration_altitude_m",
+			"calibration_altitude_index",
 		]

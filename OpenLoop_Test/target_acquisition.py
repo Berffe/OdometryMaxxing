@@ -216,6 +216,8 @@ class TargetAcquisition:
 					self._last_found_target,
 					timestamp=timestamp,
 					confidence=self._last_found_target.confidence * decay,
+					is_held=True,
+					age_sec=float(elapsed),
 				)
 
 		return TargetEstimate(timestamp=timestamp, found=False)
@@ -380,6 +382,8 @@ class TargetAcquisition:
 			detection_height=float(detection_height),
 			area_fraction=float(area_fraction),
 			fov_saturated=fov_saturated,
+			is_held=False,
+			age_sec=0.0,
 		)
 
 	def _large_area_penalty(self, area_fraction: float) -> float:

@@ -380,6 +380,65 @@ def assess_file_quality(
 	return (len(reasons) == 0, reasons)
 
 
+
+def _row_time(row: Dict[str, str]) -> Optional[float]:
+	return _safe_float(row.get("t_sec"))
+
+
+def _bool_col(row: Dict[str, str], col: str) -> bool:
+	return str(row.get(col, "0")).strip() in ("1", "True", "true")
+
+
+def _row_passes_identification_quality(row: Dict[str, str], require_flow_quality: bool = False) -> bool:
+	"""Reject rows that are valid for control continuity but poor for identification."""
+	if row.get("target_is_held", "0") == "1":
+		return False
+	if row.get("target_fov_saturated", "0") == "1":
+		return False
+	conf = _safe_float(row.get("target_confidence"))
+	if conf is not None and conf < 0.25:
+		return False
+	if require_flow_quality:
+		frac = _safe_float(row.get("flow_affine_inlier_fraction"))
+		if frac is not None and frac > 0.0 and frac < 0.35:
+			return False
+		resid = _safe_float(row.get("flow_affine_residual_rms"))
+		if resid is not None and np.isfinite(resid) and resid > 2.0:
+			return False
+	return True
+
+
+def _axis_ok(row: Dict[str, str], axis: Optional[str]) -> bool:
+	return axis is None or row.get("calibration_axis") == axis
+
+
+def _find_row_near_time(
+	rows: List[Dict[str, str]],
+	target_time: float,
+	tolerance_sec: float,
+	axis: Optional[str],
+	valid_col: str,
+	require_flow_quality: bool,
+) -> Optional[Dict[str, str]]:
+	best = None
+	best_err = None
+	for row in rows:
+		if not _axis_ok(row, axis):
+			continue
+		if row.get(valid_col, "0") != "1":
+			continue
+		if not _row_passes_identification_quality(row, require_flow_quality=require_flow_quality):
+			continue
+		t = _row_time(row)
+		if t is None:
+			continue
+		err = abs(t - target_time)
+		if err <= tolerance_sec and (best_err is None or err < best_err):
+			best = row
+			best_err = err
+	return best
+
+
 def build_pairs(
 	rows: List[Dict[str, str]],
 	state_col: str,
@@ -390,52 +449,36 @@ def build_pairs(
 	restrict_to_axis: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 	"""
-	Build (e[k], u[k], e[k+1]) arrays from consecutive valid rows whose
-	time gap is within dt_tolerance (fraction) of dt_nominal.
+	Build (e[k], u[k], e[k+1]) arrays from rows separated by dt_nominal.
 
-	restrict_to_axis: if given, both endpoints of a pair must have a
-	matching `calibration_axis` field. This matters because thrust isn't
-	guaranteed open-loop outside its own test phase any more — newer
-	calibration_node.py versions actively damp thrust against vz drift
-	while roll/pitch are under test, so a row logged during the roll
-	phase has a command_thrust driven by feedback, not the open-loop
-	step train, and would re-introduce the exact cause/effect
-	entanglement this whole logging setup exists to avoid if it leaked
-	into the thrust fit. Rows without a calibration_axis field at all
-	(older logs) are not restricted — see fit_axis()'s fallback.
+	Rows no longer need to be adjacent in the CSV. This allows calibration_node.py
+	to log at 0.1 s while fitting a 0.5 s controller model by pairing samples whose
+	timestamps differ by dt_nominal.
 	"""
 	e_k, u_k, e_k1 = [], [], []
+	tol = abs(dt_tolerance * dt_nominal)
+	require_flow_quality = (valid_col == "flow_valid")
 
-	for i in range(len(rows) - 1):
-		row_a, row_b = rows[i], rows[i + 1]
-
-		if restrict_to_axis is not None:
-			if row_a.get("calibration_axis") != restrict_to_axis:
-				continue
-			if row_b.get("calibration_axis") != restrict_to_axis:
-				continue
-
-		if row_a.get(valid_col, "0") != "1" or row_b.get(valid_col, "0") != "1":
+	for row_a in rows:
+		if not _axis_ok(row_a, restrict_to_axis):
+			continue
+		if row_a.get(valid_col, "0") != "1":
+			continue
+		if not _row_passes_identification_quality(row_a, require_flow_quality=require_flow_quality):
 			continue
 
-		t_a = _safe_float(row_a.get("t_sec"))
-		t_b = _safe_float(row_b.get("t_sec"))
-
-		if t_a is None or t_b is None:
+		t_a = _row_time(row_a)
+		if t_a is None:
 			continue
-
-		dt = t_b - t_a
-
-		if dt <= 0.0:
-			continue
-
-		if abs(dt - dt_nominal) > dt_tolerance * dt_nominal:
+		row_b = _find_row_near_time(
+			rows, t_a + dt_nominal, tol, restrict_to_axis, valid_col, require_flow_quality
+		)
+		if row_b is None:
 			continue
 
 		e0 = _safe_float(row_a.get(state_col))
 		u0 = _safe_float(row_a.get(command_col))
 		e1 = _safe_float(row_b.get(state_col))
-
 		if e0 is None or u0 is None or e1 is None:
 			continue
 
@@ -445,6 +488,62 @@ def build_pairs(
 
 	return np.asarray(e_k), np.asarray(u_k), np.asarray(e_k1)
 
+
+def build_pairs_with_input_delays(
+	rows: List[Dict[str, str]],
+	state_col: str,
+	command_col: str,
+	valid_col: str,
+	dt_nominal: float,
+	dt_tolerance: float,
+	restrict_to_axis: Optional[str] = None,
+	input_delay_count: int = 2,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+	"""Build e[k], [u[k], u[k-1], ...], e[k+1] for delay-aware ARX fits."""
+	e_k, U, e_k1 = [], [], []
+	tol = abs(dt_tolerance * dt_nominal)
+	require_flow_quality = (valid_col == "flow_valid")
+
+	for row_a in rows:
+		if not _axis_ok(row_a, restrict_to_axis):
+			continue
+		if row_a.get(valid_col, "0") != "1":
+			continue
+		if not _row_passes_identification_quality(row_a, require_flow_quality=require_flow_quality):
+			continue
+		t_a = _row_time(row_a)
+		if t_a is None:
+			continue
+		row_b = _find_row_near_time(rows, t_a + dt_nominal, tol, restrict_to_axis, valid_col, require_flow_quality)
+		if row_b is None:
+			continue
+
+		u_values = []
+		ok = True
+		for lag in range(input_delay_count + 1):
+			row_u = row_a if lag == 0 else _find_row_near_time(
+				rows, t_a - lag * dt_nominal, tol, restrict_to_axis, valid_col, require_flow_quality
+			)
+			if row_u is None:
+				ok = False
+				break
+			u = _safe_float(row_u.get(command_col))
+			if u is None:
+				ok = False
+				break
+			u_values.append(u)
+		if not ok:
+			continue
+
+		e0 = _safe_float(row_a.get(state_col))
+		e1 = _safe_float(row_b.get(state_col))
+		if e0 is None or e1 is None:
+			continue
+		e_k.append(e0)
+		U.append(u_values)
+		e_k1.append(e1)
+
+	return np.asarray(e_k), np.asarray(U), np.asarray(e_k1)
 
 def _has_nonempty_column(rows: List[Dict[str, str]], col: str) -> bool:
 	return bool(rows) and col in rows[0] and any(row.get(col, "") != "" for row in rows)
@@ -492,13 +591,7 @@ def build_state_pairs(
 	dt_tolerance: float,
 	restrict_to_axis: Optional[str] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[str]]:
-	"""
-	Build x[k], u[k], x[k+1] for x=[target offset, image velocity].
-
-	The velocity state uses flow_mean_*_norm_s when present. Older logs only
-	have px/s flow; those are accepted as a fallback for diagnostics, but the
-	printed model will explicitly say which column was used.
-	"""
+	"""Build x[k], u[k], x[k+1] for x=[target offset, image velocity]."""
 	if axis not in AXIS_STATE_COLUMNS:
 		raise ValueError(f"state-pair model is only defined for roll/pitch, not {axis!r}")
 
@@ -507,35 +600,21 @@ def build_state_pairs(
 	velocity_col = _velocity_column_for_axis(rows, axis)
 	command_col = columns["command"]
 	valid_col = columns["valid"]
-
 	if velocity_col is None:
 		return np.empty((0, 2)), np.empty(0), np.empty((0, 2)), None
 
 	x_k, u_k, x_k1 = [], [], []
-
-	for i in range(len(rows) - 1):
-		row_a, row_b = rows[i], rows[i + 1]
-
-		if restrict_to_axis is not None:
-			if row_a.get("calibration_axis") != restrict_to_axis:
-				continue
-			if row_b.get("calibration_axis") != restrict_to_axis:
-				continue
-
-		if row_a.get(valid_col, "0") != "1" or row_b.get(valid_col, "0") != "1":
+	tol = abs(dt_tolerance * dt_nominal)
+	for row_a in rows:
+		if not _axis_ok(row_a, restrict_to_axis):
 			continue
-
-		t_a = _safe_float(row_a.get("t_sec"))
-		t_b = _safe_float(row_b.get("t_sec"))
-
-		if t_a is None or t_b is None:
+		if row_a.get(valid_col, "0") != "1" or not _row_passes_identification_quality(row_a):
 			continue
-
-		dt = t_b - t_a
-
-		if dt <= 0.0:
+		t_a = _row_time(row_a)
+		if t_a is None:
 			continue
-		if abs(dt - dt_nominal) > dt_tolerance * dt_nominal:
+		row_b = _find_row_near_time(rows, t_a + dt_nominal, tol, restrict_to_axis, valid_col, False)
+		if row_b is None:
 			continue
 
 		e0 = _safe_float(row_a.get(state_col))
@@ -543,16 +622,73 @@ def build_state_pairs(
 		u0 = _safe_float(row_a.get(command_col))
 		e1 = _safe_float(row_b.get(state_col))
 		v1 = _safe_float(row_b.get(velocity_col))
-
 		if None in (e0, v0, u0, e1, v1):
 			continue
 
 		x_k.append((e0, v0))
 		u_k.append(u0)
 		x_k1.append((e1, v1))
-
 	return np.asarray(x_k), np.asarray(u_k), np.asarray(x_k1), velocity_col
 
+
+def build_state_pairs_with_input_delays(
+	rows: List[Dict[str, str]],
+	axis: str,
+	dt_nominal: float,
+	dt_tolerance: float,
+	restrict_to_axis: Optional[str] = None,
+	input_delay_count: int = 2,
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, Optional[str]]:
+	"""Build x[k], [u[k],u[k-1],...], x[k+1] for delay-aware state fits."""
+	if axis not in AXIS_STATE_COLUMNS:
+		raise ValueError(f"state-pair model is only defined for roll/pitch, not {axis!r}")
+	columns = AXIS_STATE_COLUMNS[axis]
+	state_col = columns["state"]
+	velocity_col = _velocity_column_for_axis(rows, axis)
+	command_col = columns["command"]
+	valid_col = columns["valid"]
+	if velocity_col is None:
+		return np.empty((0, 2)), np.empty((0, input_delay_count + 1)), np.empty((0, 2)), None
+
+	x_k, U, x_k1 = [], [], []
+	tol = abs(dt_tolerance * dt_nominal)
+	for row_a in rows:
+		if not _axis_ok(row_a, restrict_to_axis):
+			continue
+		if row_a.get(valid_col, "0") != "1" or not _row_passes_identification_quality(row_a):
+			continue
+		t_a = _row_time(row_a)
+		if t_a is None:
+			continue
+		row_b = _find_row_near_time(rows, t_a + dt_nominal, tol, restrict_to_axis, valid_col, False)
+		if row_b is None:
+			continue
+
+		u_values = []
+		ok = True
+		for lag in range(input_delay_count + 1):
+			row_u = row_a if lag == 0 else _find_row_near_time(rows, t_a - lag * dt_nominal, tol, restrict_to_axis, valid_col, False)
+			if row_u is None:
+				ok = False
+				break
+			u = _safe_float(row_u.get(command_col))
+			if u is None:
+				ok = False
+				break
+			u_values.append(u)
+		if not ok:
+			continue
+
+		e0 = _safe_float(row_a.get(state_col))
+		v0 = _safe_float(row_a.get(velocity_col))
+		e1 = _safe_float(row_b.get(state_col))
+		v1 = _safe_float(row_b.get(velocity_col))
+		if None in (e0, v0, e1, v1):
+			continue
+		x_k.append((e0, v0))
+		U.append(u_values)
+		x_k1.append((e1, v1))
+	return np.asarray(x_k), np.asarray(U), np.asarray(x_k1), velocity_col
 
 def fit_axis_state(
 	rows: List[Dict[str, str]],
@@ -613,6 +749,54 @@ def fit_axis_state(
 		A=A, B=B, c=c, r_squared=np.asarray(r_squared),
 		n_samples=n, velocity_col=velocity_col, b_stderr=b_stderr,
 	)
+
+
+def fit_axis_state_delayed(rows, axis: str, dt_nominal: float, dt_tolerance: float, input_delay_count: int = 2):
+	if axis not in AXIS_STATE_COLUMNS or input_delay_count <= 0:
+		return None
+	has_axis_column = bool(rows) and "calibration_axis" in rows[0] and any(row.get("calibration_axis") for row in rows)
+	x_k, U, x_k1, velocity_col = build_state_pairs_with_input_delays(
+		rows, axis, dt_nominal, dt_tolerance,
+		restrict_to_axis=axis if has_axis_column else None,
+		input_delay_count=input_delay_count,
+	)
+	if velocity_col is None or len(x_k) < 8:
+		return None
+	design = np.column_stack([x_k[:, 0], x_k[:, 1], U, np.ones(len(x_k))])
+	coeffs, _, _, _ = np.linalg.lstsq(design, x_k1, rcond=None)
+	predicted = design @ coeffs
+	residual = x_k1 - predicted
+	r2 = []
+	for j in range(2):
+		ss_res = float(np.sum(residual[:, j] ** 2))
+		ss_tot = float(np.sum((x_k1[:, j] - np.mean(x_k1[:, j])) ** 2))
+		r2.append(1.0 - ss_res / ss_tot if ss_tot > 1e-12 else float("nan"))
+	A = np.array([[coeffs[0, 0], coeffs[1, 0]], [coeffs[0, 1], coeffs[1, 1]]])
+	B_delays = coeffs[2:2 + input_delay_count + 1, :].T
+	c = coeffs[-1, :]
+	return {"A": A, "B_delays": B_delays, "B_sum": B_delays.sum(axis=1), "c": c, "r_squared": np.asarray(r2), "n_samples": len(x_k), "velocity_col": velocity_col}
+
+
+def fit_axis_delayed(rows, axis: str, dt_nominal: float, dt_tolerance: float, input_delay_count: int = 2):
+	if input_delay_count <= 0:
+		return None
+	state_col, command_col, valid_col = AXIS_COLUMNS[axis]
+	has_axis_column = bool(rows) and "calibration_axis" in rows[0] and any(row.get("calibration_axis") for row in rows)
+	e_k, U, e_k1 = build_pairs_with_input_delays(
+		rows, state_col, command_col, valid_col, dt_nominal, dt_tolerance,
+		restrict_to_axis=axis if has_axis_column else None,
+		input_delay_count=input_delay_count,
+	)
+	if len(e_k) < 8:
+		return None
+	design = np.column_stack([e_k, U, np.ones(len(e_k))])
+	coeffs, _, _, _ = np.linalg.lstsq(design, e_k1, rcond=None)
+	predicted = design @ coeffs
+	residual = e_k1 - predicted
+	ss_res = float(np.sum(residual ** 2))
+	ss_tot = float(np.sum((e_k1 - np.mean(e_k1)) ** 2))
+	r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-12 else float("nan")
+	return {"a": float(coeffs[0]), "B_delays": np.asarray(coeffs[1:1 + input_delay_count + 1]), "B_sum": float(np.sum(coeffs[1:1 + input_delay_count + 1])), "c": float(coeffs[-1]), "r_squared": r2, "n_samples": len(e_k)}
 
 
 def _flow_columns_for_mimo(rows: List[Dict[str, str]]) -> Optional[Tuple[str, str]]:
@@ -1133,6 +1317,7 @@ def analyze_file(
 	path: str, dt_nominal: float, dt_tolerance: float, output_dir: str,
 	row_filter: Optional[RowFilter] = None, max_area_fraction_span: float = 0.15,
 	platform_frequency_hz: Optional[float] = None,
+	input_delay_count: int = 2,
 ) -> Tuple[Dict[str, Optional[AxisFit]], Optional[Tuple[float, float, float]], bool, List[str]]:
 	raw_rows = read_csv_rows(path)
 	rows = apply_row_filter(raw_rows, row_filter)
@@ -1238,6 +1423,15 @@ def analyze_file(
 			flag_str = "  <- " + "; ".join(flags) if flags else ""
 			print(f"  {axis:6s}: scalar {fit}{flag_str}")
 
+		delayed = fit_axis_delayed(rows, axis, dt_nominal, dt_tolerance, input_delay_count=input_delay_count)
+		if delayed is not None:
+			b_txt = ", ".join(f"B{j}={b:+.5f}" for j, b in enumerate(delayed["B_delays"]))
+			print(
+				f"          delay-aware scalar: a={delayed['a']:+.4f}, {b_txt}, "
+				f"Bsum={delayed['B_sum']:+.5f}, c={delayed['c']:+.5f}, "
+				f"R^2={delayed['r_squared']:.3f}, n={delayed['n_samples']}"
+			)
+
 		if axis in ("roll", "pitch"):
 			state_fit = fit_axis_state(rows, axis, dt_nominal, dt_tolerance)
 			fits[f"{axis}_state"] = state_fit
@@ -1250,6 +1444,21 @@ def analyze_file(
 						"flow_mean_*_norm_s before pasting gains into the controller."
 					)
 				print(f"          state {state_fit}")
+				state_delayed = fit_axis_state_delayed(
+					rows, axis, dt_nominal, dt_tolerance, input_delay_count=input_delay_count
+				)
+				if state_delayed is not None:
+					B = state_delayed["B_delays"]
+					parts = []
+					for j in range(B.shape[1]):
+						parts.append(f"B{j}=[{B[0,j]:+.5f}, {B[1,j]:+.5f}]")
+					bs = state_delayed["B_sum"]
+					print(
+						"          delay-aware state: " + "; ".join(parts) +
+						f"; Bsum=[{bs[0]:+.5f}, {bs[1]:+.5f}], "
+						f"R^2=[{state_delayed['r_squared'][0]:.3f}, {state_delayed['r_squared'][1]:.3f}], "
+						f"n={state_delayed['n_samples']}"
+					)
 
 	div_health = divergence_motion_report(rows)
 	if div_health is not None:
@@ -1510,6 +1719,55 @@ def expand_csv_paths(paths: List[str], pattern: str = "*.csv", recursive: bool =
 	return expanded
 
 
+
+def split_multi_altitude_csvs(csv_paths: List[str], output_dir: str) -> List[str]:
+	"""
+	Split a single multi-altitude calibration CSV into temporary per-altitude CSVs.
+
+	calibration_node.py now repeats the full roll/pitch/thrust sequence at several
+	altitude knots in one run. The model schedule, however, still needs one file-like
+	operating point per area_fraction. Splitting here lets the rest of this fitter
+	keep its per-file quality checks and ready-to-paste schedule logic unchanged.
+	"""
+	split_dir = os.path.join(output_dir, "altitude_splits")
+	os.makedirs(split_dir, exist_ok=True)
+	out_paths: List[str] = []
+
+	for path in csv_paths:
+		rows = read_csv_rows(path)
+		if not rows or "calibration_altitude_index" not in rows[0]:
+			out_paths.append(path)
+			continue
+
+		groups: Dict[str, List[Dict[str, str]]] = {}
+		for row in rows:
+			idx = row.get("calibration_altitude_index", "")
+			if idx == "":
+				continue
+			groups.setdefault(idx, []).append(row)
+
+		if len(groups) <= 1:
+			out_paths.append(path)
+			continue
+
+		fieldnames = list(rows[0].keys())
+		stem = os.path.splitext(os.path.basename(path))[0]
+		for idx, group in sorted(groups.items(), key=lambda kv: float(kv[0])):
+			alts = [_safe_float(r.get("calibration_altitude_m")) for r in group]
+			alts = [a for a in alts if a is not None]
+			alt_label = f"{float(np.mean(alts)):.2f}m" if alts else f"idx{idx}"
+			alt_label = alt_label.replace(".", "p")
+			out_path = os.path.join(split_dir, f"{stem}_alt{int(float(idx)):02d}_{alt_label}.csv")
+			with open(out_path, "w", newline="") as f:
+				writer = csv.DictWriter(f, fieldnames=fieldnames)
+				writer.writeheader()
+				writer.writerows(group)
+			out_paths.append(out_path)
+		print(f"Split multi-altitude CSV {path} into {len(groups)} per-altitude files in {split_dir}")
+
+	return out_paths
+
+
 def main():
 	parser = argparse.ArgumentParser(description=__doc__)
 	parser.add_argument(
@@ -1564,6 +1822,10 @@ def main():
 		help="reject a file whose area_fraction sweeps wider than this (not one operating point)",
 	)
 	parser.add_argument(
+		"--input-delay-count", type=int, default=2,
+		help="fit extra delayed input columns u[k-1]..u[k-d] for delay-aware diagnostics",
+	)
+	parser.add_argument(
 		"--platform-frequency-hz", type=float, default=None,
 		help="commanded oscillating-platform frequency for this test (match bee_platform.sdf's "
 		     "z_frequency, mind the Hz-vs-rad/s caveat in platform_motion.py) -- enables the "
@@ -1574,6 +1836,7 @@ def main():
 	ensure_output_dir(args.output_dir)
 
 	csv_paths = expand_csv_paths(args.csv_paths, pattern=args.pattern, recursive=args.recursive)
+	csv_paths = split_multi_altitude_csvs(csv_paths, args.output_dir)
 
 	if not csv_paths:
 		print("No CSV files found from the given path(s).")
@@ -1608,6 +1871,7 @@ def main():
 			path, args.dt, args.dt_tolerance, args.output_dir,
 			row_filter=row_filter, max_area_fraction_span=args.max_area_fraction_span,
 			platform_frequency_hz=args.platform_frequency_hz,
+			input_delay_count=args.input_delay_count,
 		)
 		per_file_fits.append((path, fits, stats, ok, reasons))
 

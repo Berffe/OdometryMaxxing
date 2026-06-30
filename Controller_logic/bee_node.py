@@ -19,11 +19,8 @@ from rclpy.qos import (
 
 try:
 	from mavsdk import System
-	from mavsdk.offboard import Attitude as MavsdkAttitude, OffboardError
 except ImportError:
 	System = None
-	MavsdkAttitude = None
-	OffboardError = Exception
 
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Pose
@@ -36,11 +33,13 @@ from .optical_flow import OpticalFlowEstimator
 from .target_acquisition import TargetAcquisition
 from .control_law import ControlLaw
 from .diagnostics_writer import DiagnosticsWriter
+from .px4_interface import PX4Interface
 
 
 CONTROL_PERIOD_SEC = 0.5
 MISSION_PERIOD_SEC = 0.1
-MAVSDK_OFFBOARD_PERIOD_SEC = 0.05
+PX4_SETPOINT_PERIOD_SEC = 0.05
+PX4_OFFBOARD_SWITCH_SETTLE_SEC = 0.5
 
 SHOW_CAMERA = True
 VERBOSE_STREAM_LOGS = False
@@ -51,7 +50,7 @@ TAKEOFF_ALTITUDE_M = 5.0
 EKF2_SETTLE_TIME = 5.0
 MAVSDK_SYSTEM_ADDRESS = "udpin://0.0.0.0:14540"
 MAVSDK_PORT_TO_FREE = 14540
-MAVSDK_HOLD_CURRENT_YAW = True
+PX4_HOLD_CURRENT_YAW = True
 
 MAVSDK_CONNECT_TIMEOUT_SEC = 15.0
 MAVSDK_HEALTH_TIMEOUT_SEC = 30.0
@@ -59,7 +58,7 @@ MAVSDK_TAKEOFF_ALTITUDE_TIMEOUT_SEC = 130.0
 OFFBOARD_PRESTREAM_SEC = 2.0
 OFFBOARD_START_TIMEOUT_SEC = 5.0
 
-# Runtime safety for the first closed-loop tests. After the MAVSDK handoff,
+# Runtime safety for the first closed-loop tests. After the ROS 2 offboard handoff,
 # nominal commands are visual-only. If the visual target/flow is lost, keep
 # streaming a neutral visual-hover setpoint instead of using PX4 velocity/altitude
 # feedback. PX4 local state remains diagnostics-only after handoff.
@@ -192,9 +191,10 @@ class BeeLandNode(Node):
 		self._mavsdk_takeoff_started = False
 		self._mavsdk_takeoff_done = False
 		self._mavsdk_takeoff_error = None
-		self._mavsdk_offboard_start_requested = False
-		self._mavsdk_offboard_started = False
-		self._mavsdk_offboard_error = None
+		self._px4_offboard_start_requested = False
+		self._px4_offboard_started = False
+		self._px4_offboard_error = None
+		self._px4_offboard_request_time = None
 		self._mavsdk_stop_requested = False
 
 		# Touchdown is a mission-level terminal event, not a visual-control input.
@@ -220,6 +220,7 @@ class BeeLandNode(Node):
 			history=QoSHistoryPolicy.KEEP_LAST,
 			depth=1,
 		)
+		self.px4_interface = PX4Interface(self, px4_qos)
 		camera_qos = QoSProfile(
 			reliability=QoSReliabilityPolicy.BEST_EFFORT,
 			durability=QoSDurabilityPolicy.VOLATILE,
@@ -284,6 +285,7 @@ class BeeLandNode(Node):
 
 		self.create_timer(MISSION_PERIOD_SEC, self.on_mission_timer)
 		self.create_timer(CONTROL_PERIOD_SEC, self.on_control_timer)
+		self.create_timer(PX4_SETPOINT_PERIOD_SEC, self.on_px4_setpoint_timer)
 
 		if SHOW_CAMERA:
 			with suppress_stderr_fd(True):
@@ -480,7 +482,7 @@ class BeeLandNode(Node):
 
 		if self._mission_phase == PHASE_LANDED:
 			# Keep the terminal state latched and keep publishing an explicit zero-
-			# thrust command until the MAVSDK worker confirms motor stop or the node
+			# thrust command until the MAVSDK takeoff worker confirms motor stop or the node
 			# is shut down by the user.
 			self._latest_setpoint = self._landed_zero_thrust_setpoint()
 			self._publish_touchdown_status(True)
@@ -488,7 +490,7 @@ class BeeLandNode(Node):
 
 		if self._mission_phase == PHASE_ABORTED:
 			# Keep streaming a safe inertial hold setpoint instead of simply
-			# stopping MAVSDK offboard. Stopping the stream can trigger a PX4
+			# stopping ROS 2 PX4 offboard. Stopping the stream can trigger a PX4
 			# offboard failsafe while the vehicle still has velocity.
 			self._latest_setpoint = self._neutral_visual_hold_setpoint()
 			return
@@ -504,12 +506,12 @@ class BeeLandNode(Node):
 				self._abort(f"MAVSDK takeoff failed: {self._mavsdk_takeoff_error}")
 				return
 			if self._mavsdk_takeoff_done:
-				self.get_logger().info("MAVSDK takeoff complete. Starting offboard prestream.")
+				self.get_logger().info("MAVSDK takeoff complete. Starting ROS 2 PX4 offboard prestream.")
 				self._enter_phase(PHASE_PRESTREAM)
 			return
 
 		if self._mission_phase == PHASE_PRESTREAM:
-			# Let the MAVSDK worker stream a stable hover setpoint before offboard.start().
+			# Let the direct ROS 2 PX4 publisher stream a stable hover setpoint before switching to offboard.
 			self._latest_setpoint = AttitudeSetpoint(
 				timestamp=getattr(self._latest_target, "timestamp", 0.0),
 				roll=0.0,
@@ -518,24 +520,31 @@ class BeeLandNode(Node):
 				thrust=self.control_law.hover_thrust,
 			)
 			if now - self._phase_start_time >= OFFBOARD_PRESTREAM_SEC:
-				self.get_logger().info("Requesting MAVSDK attitude offboard start.")
-				self._mavsdk_offboard_start_requested = True
+				self.get_logger().info("Requesting PX4 offboard mode through ROS 2/uXRCE-DDS.")
+				self.px4_interface.engage_offboard_mode()
+				self._px4_offboard_start_requested = True
+				self._px4_offboard_request_time = now
 				self._enter_phase(PHASE_WAIT_OFFBOARD)
 			return
 
 		if self._mission_phase == PHASE_WAIT_OFFBOARD:
-			if self._mavsdk_offboard_error is not None:
-				self._abort(f"MAVSDK offboard start failed: {self._mavsdk_offboard_error}")
+			if self._px4_offboard_error is not None:
+				self._abort(f"PX4 offboard start failed: {self._px4_offboard_error}")
 				return
-			if self._mavsdk_offboard_started:
+			if (
+				self._px4_offboard_start_requested
+				and self._px4_offboard_request_time is not None
+				and now - self._px4_offboard_request_time >= PX4_OFFBOARD_SWITCH_SETTLE_SEC
+			):
+				self._px4_offboard_started = True
 				self.control_law.reset_visual_integrators()
 				self.get_logger().info(
-					"MAVSDK attitude offboard started. Closed-loop visual controller is now active."
+					"ROS 2 PX4 attitude offboard stream is active. Closed-loop visual controller is now active."
 				)
 				self._enter_phase(PHASE_CLOSED_LOOP)
 				return
 			if now - self._phase_start_time >= OFFBOARD_START_TIMEOUT_SEC:
-				self._abort("timed out waiting for MAVSDK offboard.start()")
+				self._abort("timed out after requesting PX4 offboard mode")
 			return
 
 		if self._mission_phase == PHASE_CLOSED_LOOP:
@@ -547,6 +556,46 @@ class BeeLandNode(Node):
 				self._closed_loop_logged = True
 				self.get_logger().info("Closed-loop visual landing/hover attempt running.")
 			return
+
+	def on_px4_setpoint_timer(self):
+		"""Publish the latest attitude/thrust setpoint directly to PX4.
+
+		This is the zero-order-hold output of the visual controller: the
+		controller recomputes _latest_setpoint at CONTROL_PERIOD_SEC, while this
+		timer republishes the last value at PX4_SETPOINT_PERIOD_SEC so PX4
+		keeps receiving OffboardControlMode and VehicleAttitudeSetpoint through
+		the uXRCE-DDS bridge.
+		"""
+		if self._mission_phase not in (
+			PHASE_PRESTREAM,
+			PHASE_WAIT_OFFBOARD,
+			PHASE_CLOSED_LOOP,
+			PHASE_LANDED,
+			PHASE_ABORTED,
+		):
+			return
+
+		# If an early abort happens before the ROS 2 offboard handoff, do not
+		# inject external setpoints into PX4 while it is still in its previous mode.
+		if self._mission_phase == PHASE_ABORTED and not self._px4_offboard_started:
+			return
+
+		sp = self._latest_setpoint
+		yaw_rad = sp.yaw
+		if PX4_HOLD_CURRENT_YAW and self._vehicle_state.timestamp > 0.0:
+			yaw_rad = self._vehicle_state.yaw
+
+		try:
+			self.px4_interface.publish_heartbeat()
+			self.px4_interface.publish_attitude_setpoint(
+				sp.roll,
+				sp.pitch,
+				yaw_rad,
+				self._clamp(sp.thrust, 0.0, 1.0),
+			)
+		except Exception as exc:
+			self._px4_offboard_error = repr(exc)
+			self.get_logger().error(f"PX4 direct setpoint publication failed: {repr(exc)}")
 
 	def on_control_timer(self):
 		now = time.time()
@@ -750,12 +799,12 @@ class BeeLandNode(Node):
 	def _ensure_mavsdk_worker_started(self):
 		if self._mavsdk_takeoff_started:
 			return
-		if System is None or MavsdkAttitude is None:
-			self._mavsdk_takeoff_error = "mavsdk/offboard is not installed in this Python environment"
+		if System is None:
+			self._mavsdk_takeoff_error = "mavsdk is not installed in this Python environment"
 			return
 		self._mavsdk_takeoff_started = True
 		self.get_logger().info(f"Starting MAVSDK takeoff to {TAKEOFF_ALTITUDE_M:.2f} m.")
-		self._mavsdk_thread = threading.Thread(target=self._run_mavsdk_worker_thread, name="mavsdk_takeoff_offboard", daemon=True)
+		self._mavsdk_thread = threading.Thread(target=self._run_mavsdk_worker_thread, name="mavsdk_takeoff", daemon=True)
 		self._mavsdk_thread.start()
 
 	def _run_mavsdk_worker_thread(self):
@@ -765,7 +814,7 @@ class BeeLandNode(Node):
 			if not self._mavsdk_takeoff_done:
 				self._mavsdk_takeoff_error = repr(exc)
 			else:
-				self._mavsdk_offboard_error = repr(exc)
+				self._mavsdk_motor_stop_error = repr(exc)
 
 	async def _mavsdk_worker_async(self):
 		self._free_mavsdk_port(MAVSDK_PORT_TO_FREE)
@@ -822,30 +871,15 @@ class BeeLandNode(Node):
 		self.get_logger().info("MAVSDK: reached takeoff altitude; hovering.")
 		self._mavsdk_takeoff_done = True
 
-		while not self._mavsdk_offboard_start_requested and not self._mavsdk_stop_requested:
-			await asyncio.sleep(0.05)
-		if self._mavsdk_stop_requested:
-			return
-
-		for _ in range(10):
-			await self._send_mavsdk_attitude_setpoint(drone)
-			await asyncio.sleep(MAVSDK_OFFBOARD_PERIOD_SEC)
-
-		try:
-			await drone.offboard.start()
-		except OffboardError as exc:
-			self._mavsdk_offboard_error = repr(exc)
-			return
-
-		self._mavsdk_offboard_started = True
+		# MAVSDK is kept only for takeoff and terminal motor-stop actions.
+		# Closed-loop attitude/thrust setpoints are published directly to PX4 via
+		# ROS 2/uXRCE-DDS in on_px4_setpoint_timer().
 		while not self._mavsdk_stop_requested:
 			if self._mavsdk_motor_stop_requested and not self._mavsdk_motor_stop_done:
 				await self._try_mavsdk_motor_stop(drone)
 				if self._mavsdk_motor_stop_done:
 					break
-
-			await self._send_mavsdk_attitude_setpoint(drone)
-			await asyncio.sleep(MAVSDK_OFFBOARD_PERIOD_SEC)
+			await asyncio.sleep(0.05)
 
 	async def _try_mavsdk_motor_stop(self, drone):
 		"""Stop motors after confirmed Gazebo touchdown.
@@ -860,14 +894,6 @@ class BeeLandNode(Node):
 
 		self._mavsdk_motor_stop_attempted = True
 		self._latest_setpoint = self._landed_zero_thrust_setpoint()
-
-		# Push one zero-thrust setpoint before asking PX4 to stop the motors.
-		try:
-			await self._send_mavsdk_attitude_setpoint(drone)
-		except Exception as exc:
-			self.get_logger().warning(
-				f"MAVSDK: failed to send final zero-thrust setpoint before disarm: {repr(exc)}"
-			)
 
 		try:
 			self.get_logger().warning("MAVSDK: touchdown confirmed, requesting disarm.")
@@ -901,20 +927,6 @@ class BeeLandNode(Node):
 			self.get_logger().error(
 				f"MAVSDK: kill fallback failed: {self._mavsdk_motor_stop_error}"
 			)
-
-	async def _send_mavsdk_attitude_setpoint(self, drone):
-		sp = self._latest_setpoint
-		yaw_rad = sp.yaw
-		if MAVSDK_HOLD_CURRENT_YAW and self._vehicle_state.timestamp > 0.0:
-			yaw_rad = self._vehicle_state.yaw
-		await drone.offboard.set_attitude(
-			MavsdkAttitude(
-				math.degrees(sp.roll),
-				math.degrees(sp.pitch),
-				math.degrees(yaw_rad),
-				self._clamp(sp.thrust, 0.0, 1.0),
-			)
-		)
 
 	@staticmethod
 	async def _wait_for_condition(async_iterable, condition, timeout: float, label: str, progress_fn=None, progress_interval: float = 5.0):
@@ -987,7 +999,7 @@ class BeeLandNode(Node):
 
 		This deliberately does NOT use PX4 local position or velocity. After
 		handoff, PX4 state is diagnostics-only; this fallback simply keeps the
-		MAVSDK offboard stream alive with zero roll/pitch and nominal hover thrust
+		ROS 2 PX4 offboard stream alive with zero roll/pitch and nominal hover thrust
 		until the user stops the node.
 		"""
 		return AttitudeSetpoint(
@@ -1009,10 +1021,10 @@ class BeeLandNode(Node):
 		if self._mission_phase != PHASE_ABORTED:
 			self.get_logger().error(f"ABORTING bee_land_node: {reason}")
 		self._mission_phase = PHASE_ABORTED
-		# If offboard was never started, there is no stream to maintain.
-		# Once offboard is active, keep MAVSDK streaming _neutral_visual_hold_setpoint()
+		# If ROS 2 offboard was never started, there is no stream to maintain.
+		# Once offboard is active, keep publishing _neutral_visual_hold_setpoint()
 		# until the user stops the node.
-		if not self._mavsdk_offboard_started:
+		if not self._px4_offboard_started:
 			self._mavsdk_stop_requested = True
 
 	@staticmethod

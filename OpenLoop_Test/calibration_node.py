@@ -124,7 +124,11 @@ from .calibration_sequence import (
 
 HEARTBEAT_PERIOD_SEC = 0.1
 MISSION_PERIOD_SEC = 0.1
-CALIBRATION_LOG_PERIOD_SEC = 0.5  # keep fit_axis_models.py --dt default at 0.5 s
+# Log faster than the identification model period. fit_axis_models.py now builds
+# pairs by timestamp separation, so you can keep --dt 0.5 for the 2 Hz controller
+# model while retaining enough intermediate samples for quality checks, delay
+# sweeps, and offline resampling.
+CALIBRATION_LOG_PERIOD_SEC = 0.1
 
 # Keep the terminal readable during long tests. Turn this on only when
 # debugging raw streams. Phase changes, aborts, takeoff/offboard milestones,
@@ -209,6 +213,11 @@ MAVSDK_TAKEOFF_PHASE_TIMEOUT_SEC = 200.0
 # 6.0 still isn't enough clearance, re-solve the same way using whatever
 # area_fraction this value actually produces.
 TAKEOFF_ALTITUDE_M = 5
+# One calibration run now visits several altitude knots. Each knot executes the
+# same roll/pitch/thrust sequence, so fit_axis_models.py can emit schedules
+# versus area_fraction. Keep these conservative: avoid the near-FOV-saturated
+# regime where area_fraction stops being a range proxy.
+CALIBRATION_ALTITUDES_M = (5.0, 4.0, 3.5)
 OFFBOARD_PRESTREAM_SEC = 2.0
 OFFBOARD_CONFIRM_TIMEOUT_SEC = 5.0
 TAKEOFF_ALTITUDE_TOL_M = 0.15
@@ -339,9 +348,10 @@ THRUST_TEST_AMPLITUDE = 0.03
 # commands real altitude excursions, and lengthening it directly widens
 # the area_fraction range swept within one file (a separate problem;
 # see fit_axis_models.py's wide-range warning).
-ROLL_TEST_HOLD_SEC = 1.0
-PITCH_TEST_HOLD_SEC = 1.0
-THRUST_TEST_HOLD_SEC = 1.0
+ROLL_TEST_HOLD_SEC = 2.0
+PITCH_TEST_HOLD_SEC = 2.0
+# For thrust, this is the PRBS bit duration rather than a long step hold.
+THRUST_TEST_HOLD_SEC = 0.5
 
 ROLL_TEST_REPEATS = 8
 PITCH_TEST_REPEATS = 8
@@ -355,6 +365,8 @@ PITCH_TEST_REPEATS = 8
 # reset repeats means less time for the same residual error to
 # compound between corrections.
 THRUST_TEST_REPEATS = 4
+THRUST_TEST_PROFILE = "prbs"
+THRUST_PRBS_CYCLES = 48
 # Brief damped return-to-trim between thrust repeats (not within one --
 # see build_axis_step_train's docstring). Labeled "settle", not
 # "thrust", so the vertical damper activates for it and
@@ -615,6 +627,9 @@ class CalibrationNode(Node):
 
 		self._test_start_time = None
 		self._sequence_finished_logged = False
+		self._calibration_reference_z = None
+		self._current_altitude_index = 0
+		self._current_calibration_altitude_m = float(CALIBRATION_ALTITUDES_M[0]) if CALIBRATION_ALTITUDES_M else float(TAKEOFF_ALTITUDE_M)
 
 		self._damper = VerticalVelocityDamper(
 			hover_thrust=HOVER_THRUST,
@@ -668,6 +683,8 @@ class CalibrationNode(Node):
 			roll_reset_sec=ROLL_RESET_SEC,
 			pitch_reset_sec=PITCH_RESET_SEC,
 			thrust_reset_sec=THRUST_RESET_SEC,
+			thrust_profile=THRUST_TEST_PROFILE,
+			thrust_prbs_cycles=THRUST_PRBS_CYCLES,
 			settle_sec=TEST_SETTLE_SEC,
 			axes=TEST_AXES,
 		)
@@ -808,7 +825,7 @@ class CalibrationNode(Node):
 			cv2.imshow("Bee Calibration - Camera", frame)
 			cv2.waitKey(1)
 
-		stamp = time.time()
+		stamp = self._image_timestamp_sec(msg)
 
 		# Vision pipeline still runs as normal: this is what we're
 		# measuring the response of. Only the control law is skipped.
@@ -1063,14 +1080,10 @@ class CalibrationNode(Node):
 				return
 			if self._mavsdk_takeoff_done:
 				self.get_logger().info("MAVSDK takeoff complete. Starting attitude-offboard prestream.")
-				# Captured here, at the altitude PX4's own (already-working)
-				# takeoff just reached -- this is the reference our own
-				# thrust commands need to hold onto from here on, since
-				# they're about to take over control authority.
-				self._damper.set_altitude_target(self._vehicle_state.z)
-				self.get_logger().info(
-					f"Altitude-hold target set to current z={self._vehicle_state.z:.3f} m."
-				)
+				# Estimate the launch/zero-altitude reference from the altitude PX4 just
+				# reached. NED z decreases when climbing: target_z = z_ref - altitude_m.
+				self._calibration_reference_z = self._vehicle_state.z + float(TAKEOFF_ALTITUDE_M)
+				self._set_active_altitude_target(0, reason="after MAVSDK takeoff")
 				self._enter_phase(PHASE_PRESTREAM)
 			return
 
@@ -1228,13 +1241,12 @@ class CalibrationNode(Node):
 						f"Vertical velocity settled (|vz|<{SETTLE_VZ_THRESHOLD} m/s)."
 					)
 				self._enter_phase(PHASE_OPEN_LOOP)
-				self._test_start_time = now
-				self._last_calibration_log_time = None
-				self._thrust_recenter_active = False
-				self._thrust_recenter_since = None
-				self._test_paused_sec = 0.0
-				self._last_open_loop_now = None
-				self.get_logger().info("Open-loop calibration sequence started.")
+				self._reset_open_loop_sequence_clock(now)
+				self.get_logger().info(
+					f"Open-loop calibration sequence started at altitude "
+					f"{self._current_calibration_altitude_m:.2f} m "
+					f"({self._current_altitude_index + 1}/{len(CALIBRATION_ALTITUDES_M)})."
+				)
 			return
 
 		if self._mission_phase == PHASE_OPEN_LOOP:
@@ -1347,13 +1359,13 @@ class CalibrationNode(Node):
 		pitch = self._clamp(pitch, -PITCH_LIMIT_RAD, PITCH_LIMIT_RAD)
 		thrust = self._clamp(thrust, THRUST_MIN, THRUST_MAX)
 
-		self._latest_setpoint = AttitudeSetpoint(
+		self._latest_setpoint = self._tag_setpoint(AttitudeSetpoint(
 			timestamp=self._latest_target.timestamp,
 			roll=roll,
 			pitch=pitch,
 			yaw=0.0,
 			thrust=thrust,
-		)
+		))
 
 		should_log = (
 			self._last_calibration_log_time is None
@@ -1373,11 +1385,7 @@ class CalibrationNode(Node):
 
 		if self.sequence.is_finished(elapsed) and not self._sequence_finished_logged:
 			self._sequence_finished_logged = True
-			self._enter_phase(PHASE_FINISHED)
-			self.get_logger().info(
-				"Test sequence finished; holding at trim. "
-				"Stop the node and run fit_axis_models.py on the CSV above."
-			)
+			self._advance_to_next_altitude_or_finish()
 
 	def _should_stream_offboard(self) -> bool:
 		return self._mission_phase in (
@@ -1675,13 +1683,13 @@ class CalibrationNode(Node):
 		)
 
 	def _hold_trim(self):
-		self._latest_setpoint = AttitudeSetpoint(
+		self._latest_setpoint = self._tag_setpoint(AttitudeSetpoint(
 			timestamp=getattr(self._latest_target, "timestamp", 0.0),
 			roll=0.0,
 			pitch=0.0,
 			yaw=0.0,
 			thrust=HOVER_THRUST,
-		)
+		))
 
 	def _damped_hover_setpoint(
 		self, now: float, roll: float = 0.0, pitch: float = 0.0, apply_lateral_damping: bool = True
@@ -1714,12 +1722,81 @@ class CalibrationNode(Node):
 			roll = roll + lateral_roll
 			pitch = pitch + lateral_pitch
 
-		return AttitudeSetpoint(
+		return self._tag_setpoint(AttitudeSetpoint(
 			timestamp=getattr(self._latest_target, "timestamp", 0.0),
 			roll=roll,
 			pitch=pitch,
 			yaw=0.0,
 			thrust=thrust,
+		))
+
+
+	def _image_timestamp_sec(self, msg: Image) -> float:
+		"""Use the camera/ROS timestamp for vision dt, falling back to wall-clock only if absent."""
+		stamp = getattr(getattr(msg, "header", None), "stamp", None)
+		stamp_sec = self._ros_stamp_to_sec(stamp)
+		if stamp_sec > 0.0:
+			return stamp_sec
+		return time.time()
+
+	@staticmethod
+	def _ros_stamp_to_sec(stamp) -> float:
+		if stamp is None:
+			return 0.0
+		try:
+			return float(stamp.sec) + 1e-9 * float(stamp.nanosec)
+		except AttributeError:
+			return 0.0
+
+	def _tag_setpoint(self, setpoint: AttitudeSetpoint) -> AttitudeSetpoint:
+		setpoint.calibration_altitude_m = float(self._current_calibration_altitude_m)
+		setpoint.calibration_altitude_index = int(self._current_altitude_index)
+		return setpoint
+
+	def _target_z_for_altitude(self, altitude_m: float) -> float:
+		ref_z = self._calibration_reference_z
+		if ref_z is None:
+			# Fallback for the non-MAVSDK path before the reference is initialized.
+			ref_z = self._vehicle_state.z + float(TAKEOFF_ALTITUDE_M)
+		return float(ref_z) - float(altitude_m)
+
+	def _set_active_altitude_target(self, index: int, reason: str = ""):
+		self._current_altitude_index = int(index)
+		self._current_calibration_altitude_m = float(CALIBRATION_ALTITUDES_M[self._current_altitude_index])
+		target_z = self._target_z_for_altitude(self._current_calibration_altitude_m)
+		self._damper.set_altitude_target(target_z)
+		self._settler.reset()
+		self._open_loop_af_ref = None
+		self._thrust_recenter_active = False
+		self._thrust_recenter_since = None
+		self.get_logger().info(
+			f"Calibration altitude target {self._current_altitude_index + 1}/{len(CALIBRATION_ALTITUDES_M)}: "
+			f"{self._current_calibration_altitude_m:.2f} m -> NED z={target_z:.3f}. {reason}"
+		)
+
+	def _reset_open_loop_sequence_clock(self, now: float):
+		self._test_start_time = now
+		self._last_calibration_log_time = None
+		self._thrust_recenter_active = False
+		self._thrust_recenter_since = None
+		self._test_paused_sec = 0.0
+		self._last_open_loop_now = None
+		self._open_loop_af_ref = None
+
+	def _advance_to_next_altitude_or_finish(self):
+		next_index = self._current_altitude_index + 1
+		if next_index < len(CALIBRATION_ALTITUDES_M):
+			self._set_active_altitude_target(next_index, reason="moving to next calibration knot")
+			self._sequence_finished_logged = False
+			self._enter_phase(PHASE_ALTITUDE_SETTLE)
+			self.get_logger().info(
+				"Current altitude sequence finished; moving to the next calibration altitude."
+			)
+			return
+		self._enter_phase(PHASE_FINISHED)
+		self.get_logger().info(
+			"All calibration altitude sequences finished; holding at trim. "
+			"Stop the node and run fit_axis_models.py on the CSV above."
 		)
 
 	def _enter_phase(self, phase: str):

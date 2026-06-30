@@ -149,6 +149,53 @@ def build_axis_step_train(
 	return segments, labels
 
 
+def build_thrust_prbs_train(
+	hover_thrust: float,
+	amplitude: float,
+	bit_sec: float = 0.5,
+	cycles: int = 48,
+	reset_sec: float = 0.0,
+) -> Tuple[List[Segment], List[str]]:
+	"""
+	Small-amplitude pseudo-random binary thrust excitation around hover.
+
+	The purpose is different from the old long +/- step train: keep altitude and
+	area_fraction close to one operating point while accumulating many input
+	transitions for the regression. The deterministic LFSR-like pattern is
+	reproducible, balanced enough for calibration, and avoids requiring the random
+	module in tests.
+	"""
+	if cycles <= 0:
+		return [], []
+
+	# Maximum-length-ish 5-bit LFSR pattern, repeated/truncated to cycles.
+	state = 0b10011
+	segments: List[Segment] = []
+	labels: List[str] = []
+	last_value = None
+	for i in range(cycles):
+		bit = ((state >> 4) ^ (state >> 2)) & 1
+		state = ((state << 1) & 0b11111) | bit
+		value = amplitude if bit else -amplitude
+
+		# Avoid an excessively long accidental same-sign run by forcing a sign flip
+		# after two equal bits. This keeps altitude drift bounded without inserting
+		# closed-loop correction inside the active thrust-identification rows.
+		if last_value is not None and i >= 2:
+			prev_same = segments[-1][3] == hover_thrust + value and segments[-2][3] == hover_thrust + value
+			if prev_same:
+				value = -value
+		last_value = value
+
+		segments.append((bit_sec, 0.0, 0.0, hover_thrust + value))
+		labels.append("thrust")
+
+	if reset_sec > 0.0:
+		segments.append((reset_sec, 0.0, 0.0, hover_thrust))
+		labels.append("settle")
+	return segments, labels
+
+
 class VerticalVelocityDamper:
 	"""
 	PI(+optional PI on altitude) damper driving thrust to cancel vz and
@@ -415,6 +462,12 @@ class VerticalSettler:
 	def timed_out(self) -> bool:
 		return self._timed_out
 
+	def reset(self):
+		self._start_time = None
+		self._ok_since = None
+		self._settled = False
+		self._timed_out = False
+
 	def step(self, now: float, vz: float, z: Optional[float] = None) -> float:
 		"""
 		Advance the settle state machine by one tick and return the
@@ -469,7 +522,7 @@ def exceeds_safety_bounds(
 	"""
 	return (
 		abs(vz) > vz_limit
-		# or area_fraction > area_fraction_max
+		or area_fraction > area_fraction_max
 		or abs(vx) > lateral_velocity_limit
 		or abs(vy) > lateral_velocity_limit
 	)
@@ -489,6 +542,8 @@ def build_calibration_sequence(
 	roll_reset_sec: float = 0.0,
 	pitch_reset_sec: float = 0.0,
 	thrust_reset_sec: float = 0.0,
+	thrust_profile: str = "prbs",
+	thrust_prbs_cycles: int = 48,
 	settle_sec: float = 2.0,
 	axes: Tuple[str, ...] = ("roll", "pitch", "thrust"),
 ) -> StepSequence:
@@ -536,14 +591,23 @@ def build_calibration_sequence(
 	}
 
 	for axis in axes:
-		axis_segments, axis_labels = build_axis_step_train(
-			axis=axis,
-			amplitude=amplitudes[axis],
-			hover_thrust=hover_thrust,
-			hold_sec=hold_secs[axis],
-			repeats=repeats_map[axis],
-			reset_sec=reset_secs[axis],
-		)
+		if axis == "thrust" and thrust_profile == "prbs":
+			axis_segments, axis_labels = build_thrust_prbs_train(
+				hover_thrust=hover_thrust,
+				amplitude=amplitudes[axis],
+				bit_sec=hold_secs[axis],
+				cycles=thrust_prbs_cycles,
+				reset_sec=reset_secs[axis],
+			)
+		else:
+			axis_segments, axis_labels = build_axis_step_train(
+				axis=axis,
+				amplitude=amplitudes[axis],
+				hover_thrust=hover_thrust,
+				hold_sec=hold_secs[axis],
+				repeats=repeats_map[axis],
+				reset_sec=reset_secs[axis],
+			)
 		segments.extend(axis_segments)
 		labels.extend(axis_labels)
 

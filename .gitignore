@@ -2,3 +2,5 @@ Brainstorm.md
 results
 logs
 .vscode
+
+__pycache__

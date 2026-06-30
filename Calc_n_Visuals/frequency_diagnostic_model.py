@@ -6,14 +6,8 @@ It models the vertical/divergence channel as a continuous drone plant controlled
 an explicitly discrete visual controller with ZOH-discretized command-to-motion
 behavior.
 
-Install dependencies:
-	pip install control numpy matplotlib
-
-Run:
-	python frequency_diagnostic_model_discrete.py
-
 Example:
-	python frequency_diagnostic_model_discrete.py --sample-periods 0.5 0.2 0.1 0.05 --h0 2.0
+	python frequency_diagnostic_model.py --sample-periods 0.5 0.2 0.1 0.05 --h0 2.0
 
 Model summary
 -------------
@@ -72,7 +66,7 @@ class ModelParams:
 	tau_T: float = 0.12                 # actuator/PX4 vertical lag [s]
 
 	# Visual delay and divergence smoothing
-	tau_vis: float = 0.04               # camera + transport + optical-flow computation delay [s]
+	tau_vis: float = 0.001               # camera + transport + optical-flow computation delay [s]
 	pade_order: int = 3                 # order for Padé delay approximation before discretization
 	divergence_smoothing_alpha: float = 0.60  # d_f[k] = alpha d_f[k-1] + (1-alpha) d_raw[k]
 	raw_divergence_weight: float = 0.15        # d_control = w*d_raw + (1-w)*d_filtered

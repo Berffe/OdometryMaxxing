@@ -223,7 +223,7 @@ class OpticalFlowEstimator:
 			image_height=image_height,
 		)
 
-		raw_divergence, n_inliers = self._fit_divergence_affine(
+		raw_divergence, n_inliers, inlier_fraction, residual_rms = self._fit_divergence_affine(
 			flow_px_s=flow_px_s,
 			image_width=image_width,
 			image_height=image_height,
@@ -243,6 +243,9 @@ class OpticalFlowEstimator:
 			roi_y0=int(y0),
 			roi_x1=int(x1),
 			roi_y1=int(y1),
+			affine_inliers=int(n_inliers),
+			affine_inlier_fraction=float(inlier_fraction),
+			affine_residual_rms=float(residual_rms),
 		)
 
 		self._save_debug(
@@ -268,7 +271,7 @@ class OpticalFlowEstimator:
 		flow_px_s: np.ndarray,
 		image_width: int,
 		image_height: int,
-	) -> Tuple[float, int]:
+	) -> Tuple[float, int, float, float]:
 		"""
 		Divergence via a global affine fit, not a per-pixel median.
 
@@ -294,7 +297,7 @@ class OpticalFlowEstimator:
 		"""
 		roi_height, roi_width = flow_px_s.shape[:2]
 		if roi_width < 3 or roi_height < 3:
-			return 0.0, 0
+			return 0.0, 0, 0.0, float("inf")
 
 		u = flow_px_s[:, :, 0] / max(0.5 * image_width, 1.0)
 		v = flow_px_s[:, :, 1] / max(0.5 * image_height, 1.0)
@@ -312,7 +315,7 @@ class OpticalFlowEstimator:
 		n_finite = int(np.count_nonzero(finite))
 		if n_finite < self._min_points_for_affine_fit:
 			field = self._estimate_divergence_field(flow_px_s, image_width, image_height)
-			return self._scalar_from_divergence_field(field), n_finite
+			return self._scalar_from_divergence_field(field), n_finite, 0.0, float("inf")
 
 		x, y, u_flat, v_flat = x[finite], y[finite], u_flat[finite], v_flat[finite]
 		design = np.column_stack([np.ones_like(x), x, y])
@@ -324,14 +327,18 @@ class OpticalFlowEstimator:
 		inliers = residual <= threshold
 
 		if np.count_nonzero(inliers) >= self._min_points_for_affine_fit:
-			_, divergence = self._affine_least_squares(
+			coeffs, divergence = self._affine_least_squares(
 				design[inliers], u_flat[inliers], v_flat[inliers]
 			)
 			n_used = int(np.count_nonzero(inliers))
+			residual_used = (u_flat[inliers] - design[inliers] @ coeffs[0]) ** 2 + (v_flat[inliers] - design[inliers] @ coeffs[1]) ** 2
 		else:
 			n_used = n_finite
+			residual_used = residual
 
-		return float(divergence), n_used
+		inlier_fraction = float(n_used) / max(float(n_finite), 1.0)
+		residual_rms = float(np.sqrt(np.mean(residual_used))) if residual_used.size else float("inf")
+		return float(divergence), n_used, inlier_fraction, residual_rms
 
 	@staticmethod
 	def _affine_least_squares(
