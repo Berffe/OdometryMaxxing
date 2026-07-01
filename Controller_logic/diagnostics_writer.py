@@ -64,6 +64,12 @@ class DiagnosticsWriter:
 		vehicle_state: Optional[VehicleState],
 		platform_state: Optional[PlatformState] = None,
 		calibration_axis: str = "",
+		px4_wall_offset_sec: Optional[float] = None,
+		sim_wall_offset_sec: Optional[float] = None,
+		mission: Optional[dict] = None,
+		px4_nav_state: Optional[int] = None,
+		px4_arming_state: Optional[int] = None,
+		px4_failsafe: Optional[bool] = None,
 		**_: Any,
 	):
 		wall_timestamp = float(wall_timestamp)
@@ -155,6 +161,40 @@ class DiagnosticsWriter:
 
 		row["calibration_axis"] = calibration_axis or ""
 
+		# Mission routine telemetry (probe -> gate -> scheduled-gain descent).
+		# All blank on pre-closed-loop rows where mission is None. These are the
+		# fields needed to tune/diagnose the Herisse/de Croon bounds mechanism:
+		# the scheduled thrust gain k(t) and lateral scale, the probe-derived
+		# bounds (k_min/k_explore/h_crit), the feasibility verdict, the probe's
+		# measured peak platform acceleration, and the OPEN-LOOP predicted height
+		# h_pred (compare against relative_z to see prediction drift).
+		if mission is not None:
+			row.update({
+				"mission_substate": mission.get("substate", "") or "",
+				"mission_divergence_setpoint_1_s": self._num(mission.get("divergence_setpoint")),
+				"mission_thrust_gain_k": self._num(mission.get("thrust_gain_k")),
+				"mission_lateral_gain_scale": self._num(mission.get("lateral_gain_scale")),
+				"mission_k_min": self._num(mission.get("k_min")),
+				"mission_k_explore": self._num(mission.get("k_explore")),
+				"mission_h_crit_m": self._num(mission.get("h_crit")),
+				"mission_h_pred_m": self._num(mission.get("h_pred")),
+				"mission_peak_accel_m_s2": self._num(mission.get("peak_accel")),
+				"mission_feasible": self._bool_int(mission.get("feasible", False)),
+			})
+
+		# PX4 mode/arming: the ground truth for whether offboard is actually
+		# active. If commands look ignored, check px4_nav_state == 14 (OFFBOARD).
+		row["px4_nav_state"] = px4_nav_state if px4_nav_state is not None else ""
+		row["px4_arming_state"] = px4_arming_state if px4_arming_state is not None else ""
+		row["px4_failsafe"] = self._bool_int(px4_failsafe) if px4_failsafe is not None else ""
+
+		# Clock-family offsets (WALL - PX4) and (WALL - SIM), in seconds. These
+		# are diagnostics-only desync monitors: in healthy SITL they sit near a
+		# constant; visible drift means the uXRCE-DDS timesync or the sim clock
+		# is wandering relative to the wall clock the PX4 stream is stamped on.
+		row["px4_wall_offset_sec"] = self._num(px4_wall_offset_sec) if px4_wall_offset_sec is not None else ""
+		row["sim_wall_offset_sec"] = self._num(sim_wall_offset_sec) if sim_wall_offset_sec is not None else ""
+
 		self._writer.writerow(row)
 		if self._flush_every_row:
 			self._file.flush()
@@ -222,6 +262,21 @@ class DiagnosticsWriter:
 			"relative_vy_m_s",
 			"relative_vz_m_s",
 			"calibration_axis",
+			"mission_substate",
+			"mission_divergence_setpoint_1_s",
+			"mission_thrust_gain_k",
+			"mission_lateral_gain_scale",
+			"mission_k_min",
+			"mission_k_explore",
+			"mission_h_crit_m",
+			"mission_h_pred_m",
+			"mission_peak_accel_m_s2",
+			"mission_feasible",
+			"px4_nav_state",
+			"px4_arming_state",
+			"px4_failsafe",
+			"px4_wall_offset_sec",
+			"sim_wall_offset_sec",
 		]
 
 	@staticmethod

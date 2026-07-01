@@ -13,13 +13,14 @@ class VehicleState:
 	NED sign convention: z grows more negative when climbing, vz > 0 = descending.
 	Not used by the control law after visual handoff.
 
-	timestamp is the common simulation-time stamp for this state, in seconds.
-	In bee_node.py it is filled from VehicleLocalPosition.timestamp, converted
-	from PX4 microseconds to seconds. px4_timestamp_sec keeps the same raw PX4
-	time explicitly because it is useful for diagnostics and cross-checks. The
-	CSV writer still receives a separate wall_timestamp, so wall-clock logging
-	remains available without mixing clocks inside target/flow/control data.
-	Defaults to 0.0 when no PX4 timestamp has been received yet.
+	timestamp is the WALL-clock receipt time of this state, in seconds (from
+	TimeManager.wall_sec() in bee_node.py's on_local_position) -- i.e. when the
+	node received the estimate, not a sim/PX4 stamp. It shares the WALL family
+	with the diagnostics t_sec origin. The raw PX4 time for this estimate is
+	kept separately in px4_timestamp_sec (converted from PX4 microseconds), so
+	the two clocks are never conflated; cross-family alignment goes through
+	TimeManager's measured offsets (see clock.py), never raw subtraction.
+	Defaults to 0.0 when no estimate has been received yet.
 	"""
 
 	timestamp: float = 0.0

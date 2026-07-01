@@ -142,6 +142,14 @@ THRUST_DIVERGENCE_MODELS = (
 	(0.133, [[0.9302]], [[-0.1294]]),
 )
 
+# Standard gravity, used only to convert between normalized collective thrust
+# and world-vertical acceleration for the optional Herisse/de Croon gain
+# override path below (compute()'s thrust_gain_override). Kept as a local
+# constant rather than importing from mission_routine/estimators so this file
+# stays ROS-free and dependency-free on its own, per its visual-only-by-design
+# constraint.
+G_ACCEL = 9.80665
+
 
 class ControlLaw:
 	def __init__(
@@ -190,14 +198,16 @@ class ControlLaw:
 		# changing nothing here, just making the TODO visible in the code
 		# rather than only in a comment.
 		roll_prop_scale = [
-			(0.10, 1.70),
-			(0.215, 1.20),
+			(0.05, 2.10),
+			(0.10, 1.90),
+			(0.215, 1.30),
 			(0.45, 0.85),
 			(0.70, 0.95),
 			(0.85, 0.85),
 		],
 		roll_damp_scale=1.5,            # inert while roll_damp_ratio is set; kept for the legacy path.
 		roll_damp_ratio = [
+			(0.05, 3.20),
 			(0.10, 3.00),
 			(0.215, 2.20),
 			(0.45, 1.55),
@@ -215,18 +225,20 @@ class ControlLaw:
 		# essentially no damping at ANY area_fraction, not just locally --
 		# do not disable without replacing the baseline model's own (A,B).
 		pitch_prop_scale = [
-			(0.10, 0.24),
-			(0.215, 0.20),
-			(0.45, 0.14),
-			(0.70, 0.11),
-			(0.85, 0.10),
+			(0.05, 0.78),
+			(0.10, 0.62),
+			(0.215, 0.42),
+			(0.45, 0.22),
+			(0.70, 0.14),
+			(0.85, 0.12),
 		],
 		pitch_damp_scale=10.0,          # inert while pitch_damp_ratio is set.
 		pitch_damp_ratio = [
-			(0.10, 2.0),
-			(0.215, 2.3),
-			(0.45, 1.8),
-			(0.70, 1.4),
+			(0.05, 2.60),
+			(0.10, 2.40),
+			(0.215, 2.10),
+			(0.45, 1.80),
+			(0.70, 1.40),
 			(0.85, 1.25),
 		],
 
@@ -273,8 +285,8 @@ class ControlLaw:
 		],
 
 		# --- Command limits [rad] / normalized thrust. ---
-		roll_limit: float = 0.16,
-		pitch_limit: float = 0.16,
+		roll_limit: float = 0.10,
+		pitch_limit: float = 0.10,
 		thrust_min: float = 0.62,
 		thrust_max: float = 0.91,
 
@@ -291,7 +303,7 @@ class ControlLaw:
 		require_target_for_descent: bool = True,
 		max_visual_thrust_delta_from_hover: float = 0.18,
 		divergence_integral_limit: float = 1.2,
-		raw_divergence_weight: float = 0.15,
+		raw_divergence_weight: float = 0.10,
 
 		# --- Phase lead for the vertical/divergence loop. ---
 		# The platform injects a periodic relative vertical motion. Pure P+I on
@@ -305,8 +317,44 @@ class ControlLaw:
 		divergence_lead_rate_limit: float = 2.0,
 
 		# Sign convention confirmed by closed-loop tests.
-		roll_output_sign: float = -1.0,
-		pitch_output_sign: float = -1.0,
+		roll_output_sign: float = 1.0,
+		pitch_output_sign: float = 1.0,
+
+		# Master switch for ALL phase-lead / offset-prediction branches (both
+		# the lateral offset-lead and the divergence-error lead). False ->
+		# lateral becomes pure PD (offset P + optical-flow D) and thrust becomes
+		# pure PI (divergence P + I), with no derivative/prediction terms at all.
+		# Use False to test the Herisse/de Croon gain-bound idea against the
+		# simplest possible feedback law; the lead code paths are left intact and
+		# merely forced to contribute zero, so this is fully reversible.
+		enable_lead_branches: bool = False,
+
+		# --- Simplified constant-gain path (the live path for the bounds test) ---
+		# When use_constant_pd is True (default), the lateral axes use ONE fixed
+		# PD gain set per axis, NOT the LQR/area_fraction schedule below, and the
+		# thrust integral uses one constant gain. The LQR machinery, the
+		# identified (A,B) state models, the per-area_fraction ScalarSchedules,
+		# and _scheduling_area_fraction() are all left in the file but are no
+		# longer in the live path -- kept only as a dormant fallback (set
+		# use_constant_pd=False to fall back to them). Rationale: area_fraction
+		# saturates at the FOV near touchdown (so a schedule keyed on it goes
+		# undefined exactly at the deck), and the previously calibrated gains
+		# were tuned at a different platform frequency and are not worth
+		# preserving as the schedule shape.
+		#
+		# UNTUNED PLACEHOLDERS. These four numbers are NOT validated at the probe
+		# frequency -- they are order-of-magnitude starting points only. Tune
+		# them in hover (HOVER_PROBE_ONLY) before trusting any descent. k_d is
+		# the optical-flow (velocity) damping gain; k_p the offset gain.
+		use_constant_pd: bool = True,
+		roll_kp: float = 0.30,
+		roll_kd: float = 0.30,
+		pitch_kp: float = 0.30,
+		pitch_kd: float = 0.30,
+		# Constant thrust integral gain used by the override (probe-driven)
+		# thrust path, replacing the per-area_fraction divergence_integral_gain
+		# schedule. Slow bias corrector only; keep small.
+		thrust_integral_gain_const: float = 0.015,
 	):
 		self._hover_thrust = float(hover_thrust)
 		self._yaw_setpoint = float(yaw_setpoint)
@@ -319,6 +367,15 @@ class ControlLaw:
 
 		self._roll_output_sign = 1.0 if roll_output_sign >= 0.0 else -1.0
 		self._pitch_output_sign = 1.0 if pitch_output_sign >= 0.0 else -1.0
+		self._enable_lead = bool(enable_lead_branches)
+
+		# Simplified constant-gain live path (see the constructor docstring).
+		self._use_constant_pd = bool(use_constant_pd)
+		self._roll_kp = float(roll_kp)
+		self._roll_kd = float(roll_kd)
+		self._pitch_kp = float(pitch_kp)
+		self._pitch_kd = float(pitch_kd)
+		self._thrust_integral_gain_const = float(thrust_integral_gain_const)
 
 		# Damp-ratio mode: k_d is synthesized from k_p in compute(), bypassing
 		# the unreliable LQR k_d entirely. Otherwise k_d = damp_scale * LQR k_d.
@@ -404,8 +461,48 @@ class ControlLaw:
 		self._has_previous_command = False
 		self._frozen_area_fraction = None
 
-	def compute(self, target: TargetEstimate, flow: FlowResult, dt: float) -> AttitudeSetpoint:
-		"""Desired roll/pitch/yaw/thrust from visual data only."""
+	def compute(
+		self,
+		target: TargetEstimate,
+		flow: FlowResult,
+		dt: float,
+		*,
+		divergence_setpoint: Optional[float] = None,
+		thrust_gain_override: Optional[float] = None,
+		lateral_gain_scale: float = 1.0,
+	) -> AttitudeSetpoint:
+		"""Desired roll/pitch/yaw/thrust from visual data only.
+
+		divergence_setpoint: if given, overrides the constructor's D* for THIS
+		    call only (the constructor value is left untouched, so a caller that
+		    never passes this argument sees no behavior change at all). Used by
+		    the mission routine to switch between the D*=0 probe hold and the
+		    constant-divergence descent without re-constructing ControlLaw.
+
+		thrust_gain_override: if given, REPLACES the baseline-LQR thrust path
+		    (thrust_gain_scale * baseline LQR gain) with a direct Herisse
+		    (2012, eq. 32)/de Croon-style proportional law in ACCELERATION
+		    units:
+		        a_cmd = -thrust_gain_override * lead_error      [m/s^2]
+		        thrust_delta = hover_thrust * a_cmd / G_ACCEL    [normalized]
+		    i.e. thrust_gain_override is "k" in m/s, exactly the quantity
+		    Herisse's floor (eq. 33) and de Croon's ceiling (eq. 25, K_cr=2Z/dt)
+		    both bound -- the mission routine computes k once from a probe and
+		    schedules it down through descent, and this is the injection point.
+		    The lead-compensated proportional path is replaced; the divergence
+		    INTEGRAL term (and its own schedule/limit) is untouched and still
+		    adds on top, exactly as in the legacy path, so the override only
+		    replaces the fast term, not the slow bias corrector.
+		    None (default) -> identical to the old behavior: the baseline LQR
+		    thrust gain (LQR * thrust_gain_scale schedule) is used, unchanged.
+
+		lateral_gain_scale: multiplies the constant lateral PD gains this call
+		    (only when use_constant_pd is True). The mission routine sets this to
+		    k(t)/k_explore so the lateral axes ride the SAME height ramp as the
+		    thrust gain (de Croon 2016 App. B: the ventral-flow loop has the same
+		    2Z/dt ceiling as the divergence loop, so the same schedule shape is
+		    the correct one for both). 1.0 (default) -> full lateral gains.
+		"""
 		dt = max(1e-3, float(dt))
 
 		roll_cmd = 0.0
@@ -418,36 +515,45 @@ class ControlLaw:
 
 		scheduling_area_fraction = self._scheduling_area_fraction(target, target_found, area_fraction)
 
-		# --- Lateral axes: u = sign * ( -(k_p_eff*offset + k_d_eff*flow + lead) ). ---
+		# --- Lateral axes. ---
 		if target_found:
 			flow_x = float(getattr(flow, "mean_flow_x_norm", 0.0)) if flow_valid else 0.0
 			flow_y = float(getattr(flow, "mean_flow_y_norm", 0.0)) if flow_valid else 0.0
 			offset_x = float(target.offset_x)
 			offset_y = float(target.offset_y)
 
-			roll_lead_correction = self._lead_offset_correction(
-				"roll", offset_x, dt, scheduling_area_fraction
-			)
-			pitch_lead_correction = self._lead_offset_correction(
-				"pitch", offset_y, dt, scheduling_area_fraction
-			)
-
-			roll_u = self._axis_command(
-				self._roll_lqr.gain_at(scheduling_area_fraction), offset_x, flow_x,
-				self._roll_prop_scale.value_at(scheduling_area_fraction),
-				self._roll_damp_scale.value_at(scheduling_area_fraction),
-				self._roll_damp_ratio.value_at(scheduling_area_fraction) if self._roll_damp_ratio else None,
-				roll_lead_correction,
-				self._roll_lead_gain_ratio.value_at(scheduling_area_fraction),
-			)
-			pitch_u = self._axis_command(
-				self._pitch_lqr.gain_at(scheduling_area_fraction), offset_y, flow_y,
-				self._pitch_prop_scale.value_at(scheduling_area_fraction),
-				self._pitch_damp_scale.value_at(scheduling_area_fraction),
-				self._pitch_damp_ratio.value_at(scheduling_area_fraction) if self._pitch_damp_ratio else None,
-				pitch_lead_correction,
-				self._pitch_lead_gain_ratio.value_at(scheduling_area_fraction),
-			)
+			if self._use_constant_pd:
+				# Live path: one constant PD gain set per axis (offset P +
+				# optical-flow D), scaled by lateral_gain_scale so the lateral
+				# gains ride the same height ramp as the thrust gain. No LQR, no
+				# area_fraction, no lead term. K_eff = lateral_gain_scale * K_0.
+				s = max(0.0, float(lateral_gain_scale))
+				roll_u = -(self._roll_kp * offset_x + self._roll_kd * flow_x) * s
+				pitch_u = -(self._pitch_kp * offset_y + self._pitch_kd * flow_y) * s
+			else:
+				# Dormant fallback: the original LQR + per-area_fraction schedule.
+				roll_lead_correction = self._lead_offset_correction(
+					"roll", offset_x, dt, scheduling_area_fraction
+				)
+				pitch_lead_correction = self._lead_offset_correction(
+					"pitch", offset_y, dt, scheduling_area_fraction
+				)
+				roll_u = self._axis_command(
+					self._roll_lqr.gain_at(scheduling_area_fraction), offset_x, flow_x,
+					self._roll_prop_scale.value_at(scheduling_area_fraction),
+					self._roll_damp_scale.value_at(scheduling_area_fraction),
+					self._roll_damp_ratio.value_at(scheduling_area_fraction) if self._roll_damp_ratio else None,
+					roll_lead_correction,
+					self._roll_lead_gain_ratio.value_at(scheduling_area_fraction),
+				)
+				pitch_u = self._axis_command(
+					self._pitch_lqr.gain_at(scheduling_area_fraction), offset_y, flow_y,
+					self._pitch_prop_scale.value_at(scheduling_area_fraction),
+					self._pitch_damp_scale.value_at(scheduling_area_fraction),
+					self._pitch_damp_ratio.value_at(scheduling_area_fraction) if self._pitch_damp_ratio else None,
+					pitch_lead_correction,
+					self._pitch_lead_gain_ratio.value_at(scheduling_area_fraction),
+				)
 
 			# Smooth saturation toward the limit (not a hard clip).
 			roll_cmd = self._soft_limit(self._roll_output_sign * roll_u, self._roll_limit)
@@ -465,8 +571,13 @@ class ControlLaw:
 		if self._require_target_for_descent:
 			can_use_divergence = can_use_divergence and target_found
 
+		effective_divergence_setpoint = (
+			self._divergence_setpoint if divergence_setpoint is None
+			else float(divergence_setpoint)
+		)
+
 		if can_use_divergence:
-			error = self._divergence_for_control(flow) - self._divergence_setpoint
+			error = self._divergence_for_control(flow) - effective_divergence_setpoint
 
 			self._divergence_integral = self._clamp(
 				self._divergence_integral + error * dt,
@@ -474,16 +585,32 @@ class ControlLaw:
 				self._divergence_integral_limit,
 			)
 
-			thrust_gain_scale = self._thrust_gain_scale.value_at(scheduling_area_fraction)
-			integral_gain = self._divergence_integral_gain.value_at(scheduling_area_fraction)
 			lead_error = self._lead_compensated_divergence_error(
 				error, dt, scheduling_area_fraction
 			)
 
-			baseline_thrust_gain = float(self._thrust_lqr.gain_at(scheduling_area_fraction)[0, 0])
-			# Lead compensation is deliberately applied only to the fast LQR/P path.
-			# The integral below keeps using the true error accumulated above.
-			lqr_delta = -(thrust_gain_scale * baseline_thrust_gain) * lead_error
+			if thrust_gain_override is not None:
+				# Direct Herisse/de Croon accel-domain law:
+				#     a_cmd = k * (D - D*)   (Herisse eq. 32: thrust rises with
+				#                              positive divergence error).
+				# The sign is POSITIVE, not the naive regulator -k*e, because the
+				# identified plant has B<0 (more thrust REDUCES divergence), so
+				# arresting an approach (D>D*, sinking) requires MORE thrust. The
+				# legacy LQR path reaches the same +sign via a negative LQR gain
+				# (K<0 since B<0); this override must match it explicitly. A
+				# negative sign here inverts the vertical loop into positive
+				# feedback on sink -- the drone descends when it should hold.
+				accel_cmd = float(thrust_gain_override) * lead_error
+				lqr_delta = self._hover_thrust * accel_cmd / G_ACCEL
+				integral_gain = self._thrust_integral_gain_const
+			else:
+				thrust_gain_scale = self._thrust_gain_scale.value_at(scheduling_area_fraction)
+				baseline_thrust_gain = float(self._thrust_lqr.gain_at(scheduling_area_fraction)[0, 0])
+				# Lead compensation is deliberately applied only to the fast LQR/P path.
+				# The integral below keeps using the true error accumulated above.
+				lqr_delta = -(thrust_gain_scale * baseline_thrust_gain) * lead_error
+				integral_gain = self._divergence_integral_gain.value_at(scheduling_area_fraction)
+
 			integral_delta = integral_gain * self._divergence_integral
 			visual_thrust_delta = self._soft_limit(
 				lqr_delta + integral_delta, self._max_visual_thrust_delta
@@ -592,6 +719,12 @@ class ControlLaw:
 		offset = float(offset)
 		dt = max(1e-3, float(dt))
 
+		# Lead disabled: contribute nothing, so the lateral law is pure PD
+		# (offset P + optical-flow D). Memory is left untouched; it simply is
+		# not consulted while disabled.
+		if not self._enable_lead:
+			return 0.0
+
 		if axis == "roll":
 			previous = self._previous_roll_offset
 			lead_time = self._roll_lead_time.value_at(scheduling_area_fraction)
@@ -651,6 +784,12 @@ class ControlLaw:
 		"""
 		error = float(error)
 		dt = max(1e-3, float(dt))
+
+		# Lead disabled: return the raw error so the thrust path is pure P+I
+		# (the override's a_cmd = +k*(D-D*), plus the unchanged integral term).
+		if not self._enable_lead:
+			return error
+
 		lead_time = self._divergence_lead_time.value_at(scheduling_area_fraction)
 
 		if self._previous_divergence_error is None:

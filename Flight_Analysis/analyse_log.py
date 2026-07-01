@@ -363,7 +363,75 @@ def compute_summary(
 				f"RMSE={fit['rmse']:.5f} m"
 			)
 
+	_append_mission_summary(df, t, lines)
+
 	return "\n".join(lines) + "\n"
+
+
+def _last_finite(df: pd.DataFrame, col: str) -> Optional[float]:
+	if col not in df.columns:
+		return None
+	y = numeric_column(df, col)
+	y = y[np.isfinite(y)]
+	return float(y[-1]) if len(y) else None
+
+
+def _append_mission_summary(df: pd.DataFrame, t: np.ndarray, lines: list):
+	"""Mission routine: bounds, feasibility verdict, phase durations, and the
+	open-loop height-prediction error -- the numbers needed to tune the bounds."""
+	if "mission_substate" not in df.columns:
+		return
+	sub = df["mission_substate"].astype(str).fillna("").to_numpy()
+	if not np.any((sub != "") & (sub != "nan")):
+		return
+
+	lines.append("")
+	lines.append("Mission (probe -> gate -> scheduled-gain descent)")
+	lines.append("-------------------------------------------------")
+
+	peak = _last_finite(df, "mission_peak_accel_m_s2")
+	k_min = _last_finite(df, "mission_k_min")
+	k_explore = _last_finite(df, "mission_k_explore")
+	h_crit = _last_finite(df, "mission_h_crit_m")
+	feasible = _last_finite(df, "mission_feasible")
+	if peak is not None:
+		lines.append(f"Probe peak platform accel: {peak:.4f} m/s^2")
+	if k_min is not None and k_explore is not None:
+		lines.append(f"k_min (Herisse floor): {k_min:.4f}   k_explore (de Croon ceiling @ h0): {k_explore:.4f}")
+	if h_crit is not None:
+		lines.append(f"h_crit (gain hits floor): {h_crit:.4f} m")
+	if feasible is not None:
+		lines.append(f"Feasibility verdict: {'FEASIBLE' if feasible >= 0.5 else 'INFEASIBLE'}")
+
+	spans = _mission_phase_spans(df, t)
+	if spans:
+		durations: dict = {}
+		for t0, t1, s in spans:
+			durations[s] = durations.get(s, 0.0) + max(0.0, float(t1 - t0))
+		dur_str = ", ".join(f"{s}={d:.1f}s" for s, d in durations.items())
+		lines.append(f"Phase durations: {dur_str}")
+
+	if "mission_thrust_gain_k" in df.columns:
+		k = numeric_column(df, "mission_thrust_gain_k")
+		kf = k[np.isfinite(k)]
+		if len(kf):
+			lines.append(f"Commanded thrust gain k(t) range: {np.min(kf):.4f} -> {np.max(kf):.4f}")
+
+	if "mission_h_pred_m" in df.columns and "relative_z_m" in df.columns:
+		h_pred = numeric_column(df, "mission_h_pred_m")
+		truth = np.abs(numeric_column(df, "relative_z_m"))
+		mask = np.isfinite(h_pred) & np.isfinite(truth)
+		if np.count_nonzero(mask) >= 3:
+			err = h_pred[mask] - truth[mask]
+			lines.append(
+				f"Open-loop height prediction error (h_pred - |relative_z|): "
+				f"median={np.median(err):+.3f} m, RMS={np.sqrt(np.mean(err**2)):.3f} m, "
+				f"max|err|={np.max(np.abs(err)):.3f} m"
+			)
+			lines.append(
+				"  (large/growing error here means the gain is scheduled at the "
+				"wrong height -- use a more pessimistic descent or a live estimator)"
+			)
 
 
 def write_summary(output_dir: str | Path, summary: str):
@@ -433,6 +501,7 @@ def plot_lateral_control(df: pd.DataFrame, t: np.ndarray, output_dir: str):
 	fig, axes = plt.subplots(2, 1, figsize=(11, 6.5), sharex=True)
 	fig.suptitle("Lateral visual control")
 
+	shade_mission_phases(axes[0], df, t)
 	if "target_offset_x" in df.columns:
 		axes[0].plot(t, numeric_column(df, "target_offset_x"), label="target_offset_x")
 	if "target_offset_y" in df.columns:
@@ -446,6 +515,7 @@ def plot_lateral_control(df: pd.DataFrame, t: np.ndarray, output_dir: str):
 		axes[1].plot(t, numeric_column(df, "command_roll_rad"), label="roll command")
 	if "command_pitch_rad" in df.columns:
 		axes[1].plot(t, numeric_column(df, "command_pitch_rad"), label="pitch command")
+	shade_mission_phases(axes[1], df, t)
 	axes[1].axhline(0.0, linestyle="--", linewidth=1)
 	axes[1].set_ylabel("command [rad]")
 	axes[1].set_xlabel("time [s]")
@@ -468,8 +538,16 @@ def plot_vertical_control(df: pd.DataFrame, t: np.ndarray, output_dir: str, dive
 		axes[0].plot(t, numeric_column(df, "flow_divergence_1_s"), label="filtered divergence")
 	if "flow_raw_divergence_1_s" in df.columns:
 		axes[0].plot(t, numeric_column(df, "flow_raw_divergence_1_s"), label="raw divergence", alpha=0.75)
-	if divergence_setpoint is not None:
+	# Prefer the actual per-tick commanded setpoint (probe D*=0 -> descent D*),
+	# falling back to the static CLI value for old logs.
+	if "mission_divergence_setpoint_1_s" in df.columns and np.any(
+		np.isfinite(numeric_column(df, "mission_divergence_setpoint_1_s"))
+	):
+		axes[0].plot(t, numeric_column(df, "mission_divergence_setpoint_1_s"),
+		             linestyle=":", linewidth=1.6, label="commanded D* (logged)")
+	elif divergence_setpoint is not None:
 		axes[0].axhline(divergence_setpoint, linestyle=":", linewidth=1.4, label=f"setpoint {divergence_setpoint:g}")
+	shade_mission_phases(axes[0], df, t)
 	axes[0].axhline(0.0, linestyle="--", linewidth=1)
 	axes[0].set_ylabel("divergence [1/s]")
 	axes[0].grid(True)
@@ -733,6 +811,176 @@ def plot_detection_boxes_fov(
 	save_current_figure(output_dir, "detection_boxes_fov.png")
 
 
+def _mission_phase_spans(df: pd.DataFrame, t: np.ndarray):
+	"""Yield (t_start, t_end, substate) spans of contiguous mission substate.
+
+	Used to shade probe / descend / infeasible regions on time-axis plots so
+	the probe->descend handover (and any abort) is visible on every figure.
+	"""
+	if "mission_substate" not in df.columns:
+		return []
+	sub = df["mission_substate"].astype(str).fillna("").to_numpy()
+	spans = []
+	start_idx = None
+	for i in range(len(sub)):
+		s = sub[i]
+		if s in ("", "nan"):
+			if start_idx is not None:
+				spans.append((t[start_idx], t[i - 1], sub[start_idx]))
+				start_idx = None
+			continue
+		if start_idx is None:
+			start_idx = i
+		elif sub[i] != sub[start_idx]:
+			spans.append((t[start_idx], t[i - 1], sub[start_idx]))
+			start_idx = i
+	if start_idx is not None:
+		spans.append((t[start_idx], t[len(sub) - 1], sub[start_idx]))
+	return spans
+
+
+_PHASE_COLORS = {
+	"probe": ("tab:blue", 0.06),
+	"probe_hold": ("tab:cyan", 0.08),
+	"descend": ("tab:green", 0.06),
+	"infeasible": ("tab:red", 0.10),
+}
+
+
+def shade_mission_phases(ax, df: pd.DataFrame, t: np.ndarray, label_once: bool = True):
+	"""Shade mission substate spans on a time-axis Axes; mark handovers."""
+	seen = set()
+	for t0, t1, sub in _mission_phase_spans(df, t):
+		color, alpha = _PHASE_COLORS.get(sub, ("tab:gray", 0.06))
+		lbl = None
+		if label_once and sub not in seen:
+			lbl = f"phase: {sub}"
+			seen.add(sub)
+		ax.axvspan(t0, t1, color=color, alpha=alpha, label=lbl, zorder=0)
+
+
+def plot_gain_schedule(df: pd.DataFrame, t: np.ndarray, output_dir: str):
+	"""The probe-driven gain schedule: thrust k(t), lateral scale, and bounds.
+
+	This is the figure that shows the Ho/de Croon profile directly -- k(t)
+	should trace an exponential decay in time (== linear in height) clamped
+	between k_explore (top) and k_min (floor), and the lateral scale should be
+	the same curve normalized to [k_min/k_explore, 1].
+	"""
+	have = [c for c in ("mission_thrust_gain_k", "mission_lateral_gain_scale") if c in df.columns]
+	if not have:
+		print("Skipping gain schedule plot. No mission_* gain columns (old log?).")
+		return
+
+	fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
+	fig.suptitle("Probe-driven gain schedule (Herisse floor / de Croon ceiling)")
+
+	# --- thrust gain k(t) with k_min / k_explore reference bands ---
+	ax = axes[0]
+	shade_mission_phases(ax, df, t)
+	if "mission_thrust_gain_k" in df.columns:
+		ax.plot(t, numeric_column(df, "mission_thrust_gain_k"), label="k(t) thrust gain", linewidth=1.8)
+	for col, style, lbl in (
+		("mission_k_explore", (0, (4, 3)), "k_explore (ceiling @ h0)"),
+		("mission_k_min", (0, (1, 2)), "k_min (Herisse floor)"),
+	):
+		if col in df.columns:
+			y = numeric_column(df, col)
+			finite = y[np.isfinite(y)]
+			if len(finite):
+				ax.axhline(float(np.nanmedian(finite)), linestyle=style, linewidth=1.3, label=lbl)
+	ax.set_ylabel("thrust gain k [m/s]")
+	ax.grid(True)
+	ax.legend(loc="best", fontsize=8)
+
+	# --- lateral scale (should be k(t)/k_explore) ---
+	ax = axes[1]
+	shade_mission_phases(ax, df, t)
+	if "mission_lateral_gain_scale" in df.columns:
+		ax.plot(t, numeric_column(df, "mission_lateral_gain_scale"), label="lateral gain scale", linewidth=1.8)
+	# overlay normalized thrust gain as a cross-check that both ride one ramp
+	if {"mission_thrust_gain_k", "mission_k_explore"}.issubset(df.columns):
+		k = numeric_column(df, "mission_thrust_gain_k")
+		ke = numeric_column(df, "mission_k_explore")
+		with np.errstate(divide="ignore", invalid="ignore"):
+			norm = np.where(ke > 1e-9, k / ke, np.nan)
+		ax.plot(t, norm, linestyle="--", alpha=0.7, label="k(t)/k_explore (cross-check)")
+	ax.set_ylabel("lateral scale [-]")
+	ax.set_xlabel("time [s]")
+	ax.grid(True)
+	ax.legend(loc="best", fontsize=8)
+
+	save_current_figure(output_dir, "gain_schedule.png")
+
+
+def plot_height_prediction(df: pd.DataFrame, t: np.ndarray, output_dir: str):
+	"""Open-loop predicted height h_pred vs measured relative_z.
+
+	The descent schedules the gain against the OPEN-LOOP prediction
+	h(t)=h0*exp(-D* t), not a live height estimate. This plot is the single
+	most important tuning diagnostic: if h_pred and the true relative height
+	(here relative_z, from logged ground truth) diverge, the gain is being
+	evaluated at the wrong height and the schedule needs a more pessimistic
+	descent assumption (or a live estimator). h_crit is drawn for reference.
+	"""
+	if "mission_h_pred_m" not in df.columns:
+		print("Skipping height prediction plot. No mission_h_pred_m (old log?).")
+		return
+
+	h_pred = numeric_column(df, "mission_h_pred_m")
+	if np.count_nonzero(np.isfinite(h_pred)) < 3:
+		print("Skipping height prediction plot. No descent rows with h_pred.")
+		return
+
+	# True relative height: prefer relative_z_m (ground truth), else |vehicle_z|.
+	truth = None
+	truth_label = None
+	if "relative_z_m" in df.columns and np.any(np.isfinite(numeric_column(df, "relative_z_m"))):
+		truth = np.abs(numeric_column(df, "relative_z_m"))
+		truth_label = "|relative_z| (ground truth)"
+	elif "vehicle_z_m" in df.columns:
+		truth = np.abs(numeric_column(df, "vehicle_z_m"))
+		truth_label = "|vehicle_z| (NED)"
+
+	fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
+	fig.suptitle("Open-loop height prediction vs measured")
+
+	ax = axes[0]
+	shade_mission_phases(ax, df, t)
+	ax.plot(t, h_pred, label="h_pred = h0*exp(-D* t)", linewidth=1.8)
+	if truth is not None:
+		ax.plot(t, truth, alpha=0.8, label=truth_label)
+	if "mission_h_crit_m" in df.columns:
+		hc = numeric_column(df, "mission_h_crit_m")
+		finite = hc[np.isfinite(hc)]
+		if len(finite):
+			ax.axhline(float(np.nanmedian(finite)), linestyle=":", linewidth=1.4, label="h_crit")
+	ax.set_ylabel("height [m]")
+	ax.grid(True)
+	ax.legend(loc="best", fontsize=8)
+
+	# prediction error, where both exist
+	ax = axes[1]
+	shade_mission_phases(ax, df, t)
+	if truth is not None:
+		err = h_pred - truth
+		ax.plot(t, err, label="h_pred - truth", color="tab:red")
+		ax.axhline(0.0, linestyle="--", linewidth=1)
+		finite = err[np.isfinite(err)]
+		if len(finite):
+			ax.set_title(f"prediction error: median={np.nanmedian(finite):+.3f} m, "
+			             f"RMS={np.sqrt(np.nanmean(finite**2)):.3f} m", fontsize=9)
+	else:
+		ax.text(0.5, 0.5, "no ground-truth height column to compare against",
+		        ha="center", va="center", transform=ax.transAxes)
+	ax.set_ylabel("error [m]")
+	ax.set_xlabel("time [s]")
+	ax.grid(True)
+	ax.legend(loc="best", fontsize=8)
+
+	save_current_figure(output_dir, "height_prediction.png")
+
+
 def plot_multi_column(df: pd.DataFrame, t: np.ndarray, output_dir: str | Path, columns: Sequence[Tuple[str, str]], title: str, filename: str):
 	available = [(name, label) for name, label in columns if name in df.columns]
 	if not available:
@@ -760,6 +1008,8 @@ def make_default_plots(df: pd.DataFrame, t: np.ndarray, output_dir: str | Path, 
 	plot_detection_boxes_fov(df, t, args.image_width, args.image_height, output_dir, args.max_boxes)
 	plot_lateral_control(df, t, output_dir)
 	plot_vertical_control(df, t, output_dir, divergence_setpoint=args.divergence_setpoint)
+	plot_gain_schedule(df, t, output_dir)
+	plot_height_prediction(df, t, output_dir)
 	plot_platform_motion_frequency(df, t, output_dir, expected_frequency_hz=args.platform_frequency_hz)
 	plot_drone_platform_position_xyz(df, t, output_dir)
 	plot_closing_rate_spectrum(df, t, output_dir, expected_frequency_hz=args.platform_frequency_hz)

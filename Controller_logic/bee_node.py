@@ -25,21 +25,57 @@ except ImportError:
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Pose
 from std_msgs.msg import Bool
-from px4_msgs.msg import VehicleLocalPosition, VehicleAttitude
+from px4_msgs.msg import VehicleLocalPosition, VehicleAttitude, VehicleStatus
 from cv_bridge import CvBridge, CvBridgeError
 
 from .state import VehicleState, PlatformState, AttitudeSetpoint, TargetEstimate
 from .optical_flow import OpticalFlowEstimator
 from .target_acquisition import TargetAcquisition
 from .control_law import ControlLaw
+from .mission_routine import MissionRoutine, INFEASIBLE as MISSION_INFEASIBLE
 from .diagnostics_writer import DiagnosticsWriter
 from .px4_interface import PX4Interface
+from .clock import TimeManager
 
 
 CONTROL_PERIOD_SEC = 0.5
 MISSION_PERIOD_SEC = 0.1
 PX4_SETPOINT_PERIOD_SEC = 0.05
 PX4_OFFBOARD_SWITCH_SETTLE_SEC = 0.5
+
+# --- Moving-platform landing: probe -> gate -> scheduled-gain descent ---
+# (see mission_routine.py's module docstring for the full derivation).
+# DESCENT_DIVERGENCE_SETPOINT is both the D* commanded during descent AND the
+# omega* in the Herisse floor k_min=peak_accel/D* -- the same value plays both
+# roles by construction, so changing it changes descent speed AND the
+# feasibility gate together; faster descent (larger D*) makes k_min SMALLER
+# (and so h_crit smaller / more likely feasible), at the cost of less time to
+# react to vision dropouts. 0.15 1/s is a starting point, not tuned.
+DESCENT_DIVERGENCE_SETPOINT = 0.15
+# How long to hold the D*=0 probe before computing peak_accel/k_min/h_crit.
+# No periodicity assumption is needed (unlike the dropped mode-estimator
+# design) -- this only needs to be long enough to see the platform swing
+# through a representative excursion. 15s is a generous starting guess with no
+# real-platform validation yet; tighten or extend once logged against an
+# actual oscillating deck.
+PROBE_MIN_DURATION_SEC = 15.0
+# Vehicle's own ground/landing-gear clearance, in meters -- the feasibility
+# gate's threshold for h_crit. PLACEHOLDER: set this from the actual airframe
+# geometry before flying for real; 0.20 m is not derived from anything here.
+LEG_CLEARANCE_M = 0.20
+
+# FIRST-BRINGUP KNOB. True -> the mission runs the D*=0 probe, computes and logs
+# k_min / h_crit / feasibility, then HOLDS hover indefinitely without ever
+# descending or aborting. Use this to validate the hover loop and the probe /
+# bounds in isolation before trusting the descent. Set False only once the
+# probe numbers look right on a real log.
+HOVER_PROBE_ONLY = True
+
+# Pure-PI-thrust / pure-PD-lateral for the bounds test: disable ALL phase-lead
+# and offset-prediction branches in the control law. True restores the original
+# lead-compensated behavior. Keep False while testing the Herisse/de Croon gain
+# bounds against the simplest feedback law.
+ENABLE_LEAD_BRANCHES = False
 
 SHOW_CAMERA = True
 VERBOSE_STREAM_LOGS = False
@@ -56,6 +92,32 @@ MAVSDK_CONNECT_TIMEOUT_SEC = 15.0
 MAVSDK_HEALTH_TIMEOUT_SEC = 30.0
 MAVSDK_TAKEOFF_ALTITUDE_TIMEOUT_SEC = 130.0
 OFFBOARD_PRESTREAM_SEC = 2.0
+
+# PX4 VehicleStatus enums (px4_msgs). Verify against your px4_msgs version with:
+#   ros2 interface show px4_msgs/msg/VehicleStatus
+PX4_NAV_STATE_OFFBOARD = 14
+PX4_ARMING_STATE_ARMED = 2
+# How long to keep re-commanding offboard while waiting for VehicleStatus to
+# confirm it, before giving up. PX4 will only accept the switch once it has seen
+# a few OffboardControlMode heartbeats, so a single command can be missed.
+PX4_OFFBOARD_CONFIRM_TIMEOUT_SEC = 5.0
+PX4_OFFBOARD_REENGAGE_INTERVAL_SEC = 0.5
+
+_PX4_NAV_STATE_NAMES = {
+	0: "MANUAL", 1: "ALTCTL", 2: "POSCTL", 3: "AUTO_MISSION", 4: "AUTO_LOITER",
+	5: "AUTO_RTL", 10: "ACRO", 12: "DESCEND", 13: "TERMINATION",
+	14: "OFFBOARD", 15: "STAB", 17: "AUTO_TAKEOFF", 18: "AUTO_LAND",
+	20: "AUTO_PRECLAND", 21: "ORBIT",
+}
+_PX4_ARMING_STATE_NAMES = {1: "DISARMED", 2: "ARMED"}
+
+
+def _nav_state_name(v):
+	return f"{_PX4_NAV_STATE_NAMES.get(v, 'UNKNOWN')}({v})"
+
+
+def _arming_state_name(v):
+	return f"{_PX4_ARMING_STATE_NAMES.get(v, 'UNKNOWN')}({v})"
 OFFBOARD_START_TIMEOUT_SEC = 5.0
 
 # Runtime safety for the first closed-loop tests. After the ROS 2 offboard handoff,
@@ -87,6 +149,19 @@ SAFETY_LATERAL_VELOCITY_LIMIT = 2.0
 # to disable (e.g. a stationary-platform run); diagnostics rows just get
 # empty platform_*/relative_* fields either way.
 PLATFORM_POSE_TOPIC = "/platform/pose"
+
+# uXRCE-DDS exposes VehicleStatus under different names across PX4 versions:
+# newer versioned builds use "/fmu/out/vehicle_status_v1", older ones
+# "/fmu/out/vehicle_status". We subscribe to BOTH (same callback); whichever the
+# bridge actually publishes delivers, the other stays silently empty. If NEITHER
+# delivers (px4_nav_state stays blank in the log), vehicle_status is not in your
+# dds_topics.yaml publication list -- add it there and rebuild the agent. Verify
+# the live name with:  ros2 topic list | grep -i vehicle_status
+VEHICLE_STATUS_TOPICS = (
+	"/fmu/out/vehicle_status_v4",
+	# "/fmu/out/vehicle_status_v1",
+	# "/fmu/out/vehicle_status",
+)
 
 # Real pose telemetry is noisy/jittery sample-to-sample; smooth the finite-
 # differenced velocity the same way OpticalFlowEstimator smooths divergence
@@ -138,7 +213,11 @@ class BeeLandNode(Node):
 	def __init__(self):
 		super().__init__("bee_land_node")
 
-		self._node_start_time = time.time()
+		# Single source of "now" for the whole node. Created first so every
+		# subsystem (px4_interface included) shares one definition of each
+		# clock family -- see clock.py.
+		self.time = TimeManager(self)
+		self._node_start_time = self.time.wall_sec()
 		self.bridge = CvBridge()
 		self._vehicle_state = VehicleState()
 
@@ -159,8 +238,25 @@ class BeeLandNode(Node):
 		self._latest_frame = None
 		self._latest_target = TargetEstimate()
 
-		self.control_law = ControlLaw()
+		self.control_law = ControlLaw(enable_lead_branches=ENABLE_LEAD_BRANCHES)
 		self._latest_setpoint = AttitudeSetpoint(thrust=self.control_law.hover_thrust)
+
+		# Probe -> gate -> scheduled-gain descent for the moving-platform
+		# landing -- see mission_routine.py's module docstring. Parameterizes
+		# control_law.compute() each tick (divergence_setpoint,
+		# thrust_gain_override) without forming any commands itself;
+		# control_law remains the sole, visual-only command former.
+		self.mission = MissionRoutine(
+			hover_thrust=self.control_law.hover_thrust,
+			control_period_sec=CONTROL_PERIOD_SEC,
+			descent_divergence_setpoint=DESCENT_DIVERGENCE_SETPOINT,
+			probe_min_duration_sec=PROBE_MIN_DURATION_SEC,
+			leg_clearance_m=LEG_CLEARANCE_M,
+			probe_only=HOVER_PROBE_ONLY,
+		)
+		self._mission_infeasible_logged = False
+		self._last_mission_log_time = 0.0
+		self._latest_mission_control = None
 
 		self._have_local_position = False
 		self._have_vehicle_attitude = False
@@ -171,7 +267,7 @@ class BeeLandNode(Node):
 		self._last_attitude_log_time = 0.0
 
 		self._mission_phase = PHASE_WAITING_FOR_STREAMS
-		self._phase_start_time = time.time()
+		self._phase_start_time = self.time.wall_sec()
 		self._streams_ready_logged = False
 		self._closed_loop_logged = False
 		self._lost_target_since = None
@@ -195,6 +291,15 @@ class BeeLandNode(Node):
 		self._px4_offboard_started = False
 		self._px4_offboard_error = None
 		self._px4_offboard_request_time = None
+		# Latest PX4 VehicleStatus, for offboard-handoff confirmation + logging.
+		# NAV_STATE_OFFBOARD is 14 in PX4; ARMING_STATE_ARMED is 2. None until
+		# the first VehicleStatus arrives.
+		self._px4_nav_state = None
+		self._px4_arming_state = None
+		self._px4_failsafe = None
+		self._px4_offboard_confirmed = False
+		self._px4_offboard_reengage_count = 0
+		self._last_nav_state_logged = None
 		self._mavsdk_stop_requested = False
 
 		# Touchdown is a mission-level terminal event, not a visual-control input.
@@ -220,7 +325,7 @@ class BeeLandNode(Node):
 			history=QoSHistoryPolicy.KEEP_LAST,
 			depth=1,
 		)
-		self.px4_interface = PX4Interface(self, px4_qos)
+		self.px4_interface = PX4Interface(self, px4_qos, time_manager=self.time)
 		camera_qos = QoSProfile(
 			reliability=QoSReliabilityPolicy.BEST_EFFORT,
 			durability=QoSDurabilityPolicy.VOLATILE,
@@ -246,6 +351,21 @@ class BeeLandNode(Node):
 			self.on_vehicle_attitude,
 			px4_qos,
 		)
+		# VehicleStatus carries nav_state (is PX4 ACTUALLY in offboard?),
+		# arming_state, and failsafe. Without this the offboard handoff is
+		# open-loop: the node commands the mode switch and assumes it worked.
+		# Subscribing lets us CONFIRM offboard engaged and detect if PX4 later
+		# drops it (the classic cause of "commands ignored, vehicle holds level
+		# and sinks"). Subscribe to every candidate topic name (see
+		# VEHICLE_STATUS_TOPICS) so PX4 version differences don't silently leave
+		# us blind.
+		for status_topic in VEHICLE_STATUS_TOPICS:
+			self.create_subscription(
+				VehicleStatus,
+				status_topic,
+				self.on_vehicle_status,
+				px4_qos,
+			)
 		self.create_subscription(Image, "/bee_x500/camera/image", self.on_camera, camera_qos)
 
 		if PLATFORM_POSE_TOPIC:
@@ -296,7 +416,7 @@ class BeeLandNode(Node):
 
 	def on_camera(self, msg: Image):
 		self._image_count += 1
-		now = time.time()
+		now = self.time.wall_sec()
 		if VERBOSE_STREAM_LOGS and now - self._last_image_log_time >= 1.0:
 			self._last_image_log_time = now
 			self.get_logger().info(f"image #{self._image_count}: {msg.width}x{msg.height}, encoding={msg.encoding}")
@@ -315,6 +435,7 @@ class BeeLandNode(Node):
 				cv2.waitKey(1)
 
 		stamp = self._image_timestamp_sec(msg)
+		self.time.observe_sim_timestamp(stamp)
 		target = self.target_acquisition.update(frame, timestamp=stamp)
 		flow = self.optical_flow.update(frame, stamp, target=target)
 
@@ -339,7 +460,7 @@ class BeeLandNode(Node):
 		handles the NED conversion when this is logged alongside
 		vehicle_state. Diagnostics-only -- never read by control_law.
 		"""
-		now = time.time()
+		now = self.time.wall_sec()
 		x, y, z = msg.position.x, msg.position.y, msg.position.z
 
 		self._platform_pose_count += 1
@@ -390,7 +511,7 @@ class BeeLandNode(Node):
 			return
 
 		self._touchdown_detected = True
-		self._touchdown_time = time.time()
+		self._touchdown_time = self.time.wall_sec()
 		self.get_logger().warning(
 			"Gazebo touchdown detected: platform contact is stable."
 		)
@@ -406,7 +527,8 @@ class BeeLandNode(Node):
 		This callback merges roll/pitch/yaw from /fmu/out/vehicle_attitude into the
 		shared VehicleState object without feeding it to the visual control law.
 		"""
-		now = time.time()
+		now = self.time.wall_sec()
+		self.time.observe_px4_timestamp(msg.timestamp)
 		self._have_vehicle_attitude = True
 		self._vehicle_attitude_count += 1
 
@@ -431,8 +553,44 @@ class BeeLandNode(Node):
 				f"vehicle attitude: roll={roll:.3f} rad, pitch={pitch:.3f} rad, yaw={yaw:.3f} rad"
 			)
 
+	def on_vehicle_status(self, msg: VehicleStatus):
+		"""PX4 VehicleStatus: the authority on whether we are ACTUALLY in
+		offboard. Tracks nav_state/arming_state/failsafe, logs every nav_state
+		transition, and warns loudly if offboard is lost after being achieved
+		(the classic 'commands ignored, vehicle holds level and sinks' failure).
+		"""
+		self._px4_nav_state = int(getattr(msg, "nav_state", -1))
+		self._px4_arming_state = int(getattr(msg, "arming_state", -1))
+		self._px4_failsafe = bool(getattr(msg, "failsafe", False))
+
+		in_offboard = self._px4_nav_state == PX4_NAV_STATE_OFFBOARD
+
+		if self._px4_nav_state != self._last_nav_state_logged:
+			self._last_nav_state_logged = self._px4_nav_state
+			self.get_logger().info(
+				f"PX4 nav_state -> {_nav_state_name(self._px4_nav_state)} "
+				f"(arming={_arming_state_name(self._px4_arming_state)}, "
+				f"failsafe={self._px4_failsafe})"
+			)
+
+		if in_offboard:
+			if not self._px4_offboard_confirmed:
+				self._px4_offboard_confirmed = True
+				self.get_logger().info("PX4 OFFBOARD confirmed active by VehicleStatus.")
+		else:
+			# Lost/never-entered offboard while we believe we are flying it.
+			if self._px4_offboard_confirmed and self._mission_phase == PHASE_CLOSED_LOOP:
+				self.get_logger().error(
+					"PX4 DROPPED OFFBOARD during closed-loop control "
+					f"(now {_nav_state_name(self._px4_nav_state)}, "
+					f"failsafe={self._px4_failsafe}). Attitude/thrust setpoints are "
+					"no longer being applied -- this is the 'commands ignored' failure."
+				)
+				self._px4_offboard_confirmed = False
+
 	def on_local_position(self, msg: VehicleLocalPosition):
-		now = time.time()
+		now = self.time.wall_sec()
+		self.time.observe_px4_timestamp(msg.timestamp)
 		self._have_local_position = True
 		if VERBOSE_STREAM_LOGS and now - self._last_position_log_time >= 1.0:
 			self._last_position_log_time = now
@@ -457,7 +615,7 @@ class BeeLandNode(Node):
 		)
 
 	def on_mission_timer(self):
-		now = time.time()
+		now = self.time.wall_sec()
 
 		if (
 			PLATFORM_POSE_TOPIC
@@ -531,20 +689,67 @@ class BeeLandNode(Node):
 			if self._px4_offboard_error is not None:
 				self._abort(f"PX4 offboard start failed: {self._px4_offboard_error}")
 				return
-			if (
-				self._px4_offboard_start_requested
-				and self._px4_offboard_request_time is not None
-				and now - self._px4_offboard_request_time >= PX4_OFFBOARD_SWITCH_SETTLE_SEC
-			):
+
+			waited = (
+				now - self._px4_offboard_request_time
+				if self._px4_offboard_request_time is not None else 0.0
+			)
+
+			# Preferred path: proceed only once VehicleStatus CONFIRMS offboard.
+			if self._px4_nav_state == PX4_NAV_STATE_OFFBOARD:
 				self._px4_offboard_started = True
 				self.control_law.reset_visual_integrators()
+				self.mission.start(
+					t=float(getattr(self._latest_flow, "timestamp", now)),
+					start_height_m=TAKEOFF_ALTITUDE_M-2,
+				)
 				self.get_logger().info(
-					"ROS 2 PX4 attitude offboard stream is active. Closed-loop visual controller is now active."
+					"ROS 2 PX4 attitude offboard stream is active and CONFIRMED in "
+					f"offboard. Closed-loop visual controller is now active. "
+					f"Mission probe starting (h0={TAKEOFF_ALTITUDE_M:.2f} m seed)."
 				)
 				self._enter_phase(PHASE_CLOSED_LOOP)
 				return
-			if now - self._phase_start_time >= OFFBOARD_START_TIMEOUT_SEC:
-				self._abort("timed out after requesting PX4 offboard mode")
+
+			# Not yet confirmed: keep re-commanding offboard. PX4 only accepts the
+			# switch after it has seen a few heartbeats, so the first command can
+			# be too early; re-issuing every interval is harmless and robust.
+			if waited - self._px4_offboard_reengage_count * PX4_OFFBOARD_REENGAGE_INTERVAL_SEC \
+					>= PX4_OFFBOARD_REENGAGE_INTERVAL_SEC:
+				self._px4_offboard_reengage_count += 1
+				self.px4_interface.engage_offboard_mode()
+
+			if waited >= PX4_OFFBOARD_CONFIRM_TIMEOUT_SEC:
+				if self._px4_nav_state is None:
+					# Never received VehicleStatus -- topic name/bridge mismatch.
+					# Fall back to the old optimistic behavior so we don't hard-
+					# block, but warn loudly: offboard is UNCONFIRMED.
+					self.get_logger().warning(
+						"No VehicleStatus received after "
+						f"{PX4_OFFBOARD_CONFIRM_TIMEOUT_SEC:.1f}s -- cannot confirm "
+						"offboard. Check the vehicle_status topic name/bridge (see "
+						"on_vehicle_status). Proceeding UNCONFIRMED; if the vehicle "
+						"holds level and ignores commands, offboard did not engage."
+					)
+					self._px4_offboard_started = True
+					self.control_law.reset_visual_integrators()
+					self.mission.start(
+						t=float(getattr(self._latest_flow, "timestamp", now)),
+						start_height_m=TAKEOFF_ALTITUDE_M,
+					)
+					self._enter_phase(PHASE_CLOSED_LOOP)
+					return
+				# We DO see status, but it never became offboard -> PX4 rejected it.
+				self._abort(
+					"PX4 rejected offboard: nav_state stuck at "
+					f"{_nav_state_name(self._px4_nav_state)} after "
+					f"{PX4_OFFBOARD_CONFIRM_TIMEOUT_SEC:.1f}s "
+					f"(arming={_arming_state_name(self._px4_arming_state)}, "
+					f"failsafe={self._px4_failsafe}). Common causes: setpoint stream "
+					"gap/timestamp-clock mismatch (see clock.py), not armed, or a "
+					"failsafe blocking the mode switch."
+				)
+				return
 			return
 
 		if self._mission_phase == PHASE_CLOSED_LOOP:
@@ -586,19 +791,23 @@ class BeeLandNode(Node):
 			yaw_rad = self._vehicle_state.yaw
 
 		try:
-			self.px4_interface.publish_heartbeat()
+			# One wall-clock instant for the whole cycle, shared by the
+			# heartbeat and the setpoint so PX4 sees them as one coherent pair.
+			tx_us = self.time.px4_tx_timestamp_us()
+			self.px4_interface.publish_heartbeat(tx_us)
 			self.px4_interface.publish_attitude_setpoint(
 				sp.roll,
 				sp.pitch,
 				yaw_rad,
 				self._clamp(sp.thrust, 0.0, 1.0),
+				timestamp_us=tx_us,
 			)
 		except Exception as exc:
 			self._px4_offboard_error = repr(exc)
 			self.get_logger().error(f"PX4 direct setpoint publication failed: {repr(exc)}")
 
 	def on_control_timer(self):
-		now = time.time()
+		now = self.time.wall_sec()
 
 		if self._latest_flow is None or self._latest_frame is None:
 			return
@@ -661,10 +870,48 @@ class BeeLandNode(Node):
 		else:
 			self._lost_target_since = None
 
+		# Mission routine: probe -> gate -> scheduled-gain descent. Feed it
+		# last cycle's ACTUAL commanded thrust (the efference copy of what has
+		# really been acting on the vehicle since the previous tick) before
+		# that field gets overwritten below by this tick's new setpoint.
+		t_vision = float(getattr(self._latest_flow, "timestamp", now))
+		dt = self._control_dt_sec()
+		previous_thrust = float(getattr(self._latest_setpoint, "thrust", self.control_law.hover_thrust))
+
+		previous_substate = self.mission.substate
+		mc = self.mission.update(t_vision, dt, previous_thrust)
+		self._latest_mission_control = mc
+
+		if mc.substate != previous_substate:
+			self.get_logger().info(f"Mission substate: {previous_substate} -> {mc.substate}")
+		if now - self._last_mission_log_time >= 2.0:
+			self._last_mission_log_time = now
+			self.get_logger().info(self.mission.status_line())
+
+		if mc.substate == MISSION_INFEASIBLE:
+			if not self._mission_infeasible_logged:
+				self._mission_infeasible_logged = True
+				self.get_logger().error(
+					"Mission gate: INFEASIBLE -- "
+					f"h_crit={self.mission.gate.h_crit:.2f} m exceeds leg clearance "
+					f"({LEG_CLEARANCE_M:.2f} m) at the current control rate "
+					f"({CONTROL_PERIOD_SEC:.2f} s period). No constant gain can both "
+					"reject this platform's motion and stay below the de Croon "
+					"self-induced-oscillation ceiling down to touchdown. Aborting "
+					"descent; holding visual hover."
+				)
+			self._abort("mission gate infeasible: platform motion exceeds achievable gain band")
+			self._latest_setpoint = self._neutral_visual_hold_setpoint()
+			self._write_diagnostics_row()
+			return
+
 		self._latest_setpoint = self.control_law.compute(
 			self._latest_target,
 			self._latest_flow,
-			self._control_dt_sec(),
+			dt,
+			divergence_setpoint=mc.divergence_setpoint,
+			thrust_gain_override=mc.thrust_gain_override,
+			lateral_gain_scale=mc.lateral_gain_scale,
 		)
 		self._write_diagnostics_row()
 
@@ -735,7 +982,7 @@ class BeeLandNode(Node):
 				"Camera Image.header.stamp and PX4 timestamp are unavailable; "
 				"temporarily using wall-clock for vision timestamps."
 			)
-		return time.time()
+		return self.time.wall_sec()
 
 	@staticmethod
 	def _quat_wxyz_to_euler(q):
@@ -778,13 +1025,42 @@ class BeeLandNode(Node):
 
 	def _write_diagnostics_row(self):
 		self.diagnostics.write(
-			wall_timestamp=time.time(),
+			wall_timestamp=self.time.wall_sec(),
 			target=self._latest_target,
 			flow=self._latest_flow,
 			setpoint=self._latest_setpoint,
 			vehicle_state=self._vehicle_state,
 			platform_state=self._platform_state,
+			px4_wall_offset_sec=self.time.px4_wall_offset_sec(),
+			sim_wall_offset_sec=self.time.sim_wall_offset_sec(),
+			mission=self._mission_telemetry(),
+			px4_nav_state=self._px4_nav_state,
+			px4_arming_state=self._px4_arming_state,
+			px4_failsafe=self._px4_failsafe,
 		)
+
+	def _mission_telemetry(self):
+		"""Flatten the latest MissionControl + mission bounds into a plain dict
+		for the diagnostics CSV. None before closed-loop (mission not started),
+		so those rows leave the mission_* columns blank."""
+		mc = self._latest_mission_control
+		if mc is None:
+			return None
+		info = getattr(mc, "info", {}) or {}
+		gate = self.mission.gate
+		return {
+			"substate": mc.substate,
+			"divergence_setpoint": mc.divergence_setpoint,
+			"thrust_gain_k": mc.thrust_gain_override,
+			"lateral_gain_scale": mc.lateral_gain_scale,
+			"k_min": gate.k_min,
+			"k_explore": gate.k_explore,
+			"h_crit": gate.h_crit,
+			# h_pred only exists during descent; blank otherwise.
+			"h_pred": info.get("h_pred"),
+			"peak_accel": self.mission.probe_result.peak_accel,
+			"feasible": gate.feasible,
+		}
 
 	def _ready_to_start(self) -> bool:
 		if not self._have_local_position:
@@ -1015,7 +1291,7 @@ class BeeLandNode(Node):
 		if phase != self._mission_phase:
 			self.get_logger().info(f"Mission phase: {self._mission_phase} -> {phase}")
 		self._mission_phase = phase
-		self._phase_start_time = time.time()
+		self._phase_start_time = self.time.wall_sec()
 
 	def _abort(self, reason: str):
 		if self._mission_phase != PHASE_ABORTED:
