@@ -285,10 +285,10 @@ class ControlLaw:
 		],
 
 		# --- Command limits [rad] / normalized thrust. ---
-		roll_limit: float = 0.10,
-		pitch_limit: float = 0.10,
+		roll_limit: float = 0.20,
+		pitch_limit: float = 0.20,
 		thrust_min: float = 0.62,
-		thrust_max: float = 0.91,
+		thrust_max: float = 0.84,
 
 		# --- Command shaping. Slew rates relaxed vs the first run so the
 		#     damping command is not itself rate-limited away. ---
@@ -347,14 +347,14 @@ class ControlLaw:
 		# them in hover (HOVER_PROBE_ONLY) before trusting any descent. k_d is
 		# the optical-flow (velocity) damping gain; k_p the offset gain.
 		use_constant_pd: bool = True,
-		roll_kp: float = 0.30,
-		roll_kd: float = 0.30,
-		pitch_kp: float = 0.30,
-		pitch_kd: float = 0.30,
+		roll_kp: float = 0.22,
+		roll_kd: float = 0.11,
+		pitch_kp: float = 0.18,
+		pitch_kd: float = 0.075,
 		# Constant thrust integral gain used by the override (probe-driven)
 		# thrust path, replacing the per-area_fraction divergence_integral_gain
 		# schedule. Slow bias corrector only; keep small.
-		thrust_integral_gain_const: float = 0.015,
+		thrust_integral_gain_const: float = 0.00,
 	):
 		self._hover_thrust = float(hover_thrust)
 		self._yaw_setpoint = float(yaw_setpoint)

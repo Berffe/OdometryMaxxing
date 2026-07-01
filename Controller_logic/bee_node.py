@@ -1,10 +1,6 @@
-import asyncio
 import contextlib
 import math
 import os
-import signal
-import subprocess
-import threading
 import time
 
 import cv2
@@ -35,11 +31,12 @@ from .control_law import ControlLaw
 from .mission_routine import MissionRoutine, INFEASIBLE as MISSION_INFEASIBLE
 from .diagnostics_writer import DiagnosticsWriter
 from .px4_interface import PX4Interface
+from .mavsdk_worker import MavsdkWorker
 from .clock import TimeManager
 
 
-CONTROL_PERIOD_SEC = 0.5
-MISSION_PERIOD_SEC = 0.1
+CONTROL_PERIOD_SEC = 0.05
+MISSION_PERIOD_SEC = 0.05
 PX4_SETPOINT_PERIOD_SEC = 0.05
 PX4_OFFBOARD_SWITCH_SETTLE_SEC = 0.5
 
@@ -150,17 +147,18 @@ SAFETY_LATERAL_VELOCITY_LIMIT = 2.0
 # empty platform_*/relative_* fields either way.
 PLATFORM_POSE_TOPIC = "/platform/pose"
 
-# uXRCE-DDS exposes VehicleStatus under different names across PX4 versions:
-# newer versioned builds use "/fmu/out/vehicle_status_v1", older ones
-# "/fmu/out/vehicle_status". We subscribe to BOTH (same callback); whichever the
-# bridge actually publishes delivers, the other stays silently empty. If NEITHER
-# delivers (px4_nav_state stays blank in the log), vehicle_status is not in your
-# dds_topics.yaml publication list -- add it there and rebuild the agent. Verify
-# the live name with:  ros2 topic list | grep -i vehicle_status
+# uXRCE-DDS exposes VehicleStatus under a version-suffixed name that varies by
+# PX4 build. This build publishes "/fmu/out/vehicle_status_v4" (confirmed: it
+# echoes nav_state, the others had no publisher). We subscribe to every known
+# candidate (same callback); whichever the bridge actually publishes delivers,
+# the rest stay silently empty. NOTE: subscribing to a name makes it appear in
+# `ros2 topic list` even with no publisher, so to find the REAL one, list topics
+# with the node STOPPED, or check which one echoes:
+#   ros2 topic echo /fmu/out/vehicle_status_v4 --field nav_state --once
 VEHICLE_STATUS_TOPICS = (
 	"/fmu/out/vehicle_status_v4",
-	# "/fmu/out/vehicle_status_v1",
-	# "/fmu/out/vehicle_status",
+	"/fmu/out/vehicle_status_v1",
+	"/fmu/out/vehicle_status",
 )
 
 # Real pose telemetry is noisy/jittery sample-to-sample; smooth the finite-
@@ -283,10 +281,23 @@ class BeeLandNode(Node):
 		self._control_dt_fallback_logged = False
 		self._image_stamp_fallback_logged = False
 
-		self._mavsdk_thread = None
-		self._mavsdk_takeoff_started = False
-		self._mavsdk_takeoff_done = False
-		self._mavsdk_takeoff_error = None
+		# MAVSDK subsystem (takeoff + terminal motor-stop), extracted into its own
+		# thread/event-loop module. The node reads worker.takeoff_done/error and
+		# calls worker.request_motor_stop()/request_stop(); the worker calls back
+		# via on_pre_motor_stop to latch our outgoing setpoint to a zero-thrust
+		# hold just before disarm.
+		self.mavsdk = MavsdkWorker(
+			logger=self.get_logger(),
+			on_pre_motor_stop=self._latch_zero_thrust_hold,
+			system_address=MAVSDK_SYSTEM_ADDRESS,
+			port_to_free=MAVSDK_PORT_TO_FREE,
+			takeoff_altitude_m=TAKEOFF_ALTITUDE_M,
+			connect_timeout_sec=MAVSDK_CONNECT_TIMEOUT_SEC,
+			health_timeout_sec=MAVSDK_HEALTH_TIMEOUT_SEC,
+			takeoff_altitude_timeout_sec=MAVSDK_TAKEOFF_ALTITUDE_TIMEOUT_SEC,
+			ekf2_settle_time_sec=EKF2_SETTLE_TIME,
+			enable_kill_fallback=ENABLE_TOUCHDOWN_KILL_FALLBACK,
+		)
 		self._px4_offboard_start_requested = False
 		self._px4_offboard_started = False
 		self._px4_offboard_error = None
@@ -300,18 +311,12 @@ class BeeLandNode(Node):
 		self._px4_offboard_confirmed = False
 		self._px4_offboard_reengage_count = 0
 		self._last_nav_state_logged = None
-		self._mavsdk_stop_requested = False
 
 		# Touchdown is a mission-level terminal event, not a visual-control input.
 		# The contact signal comes from Gazebo/TouchPlugin through ros_gz_bridge.
 		self._touchdown_detected = False
 		self._touchdown_time = None
 		self._touchdown_message_count = 0
-
-		self._mavsdk_motor_stop_requested = False
-		self._mavsdk_motor_stop_attempted = False
-		self._mavsdk_motor_stop_done = False
-		self._mavsdk_motor_stop_error = None
 
 		self.optical_flow = OpticalFlowEstimator()
 		self.target_acquisition = TargetAcquisition()
@@ -659,11 +664,11 @@ class BeeLandNode(Node):
 			return
 
 		if self._mission_phase == PHASE_MAVSDK_TAKEOFF:
-			self._ensure_mavsdk_worker_started()
-			if self._mavsdk_takeoff_error is not None:
-				self._abort(f"MAVSDK takeoff failed: {self._mavsdk_takeoff_error}")
+			self.mavsdk.start()
+			if self.mavsdk.takeoff_error is not None:
+				self._abort(f"MAVSDK takeoff failed: {self.mavsdk.takeoff_error}")
 				return
-			if self._mavsdk_takeoff_done:
+			if self.mavsdk.takeoff_done:
 				self.get_logger().info("MAVSDK takeoff complete. Starting ROS 2 PX4 offboard prestream.")
 				self._enter_phase(PHASE_PRESTREAM)
 			return
@@ -706,7 +711,7 @@ class BeeLandNode(Node):
 				self.get_logger().info(
 					"ROS 2 PX4 attitude offboard stream is active and CONFIRMED in "
 					f"offboard. Closed-loop visual controller is now active. "
-					f"Mission probe starting (h0={TAKEOFF_ALTITUDE_M:.2f} m seed)."
+					f"Mission probe starting (h0={TAKEOFF_ALTITUDE_M-2:.2f} m seed)."
 				)
 				self._enter_phase(PHASE_CLOSED_LOOP)
 				return
@@ -879,7 +884,13 @@ class BeeLandNode(Node):
 		previous_thrust = float(getattr(self._latest_setpoint, "thrust", self.control_law.hover_thrust))
 
 		previous_substate = self.mission.substate
-		mc = self.mission.update(t_vision, dt, previous_thrust)
+		tgt = self._latest_target
+		mc = self.mission.update(
+			t_vision, dt, previous_thrust,
+			offset_x=float(getattr(tgt, "offset_x", 0.0)),
+			offset_y=float(getattr(tgt, "offset_y", 0.0)),
+			target_found=bool(getattr(tgt, "found", False)),
+		)
 		self._latest_mission_control = mc
 
 		if mc.substate != previous_substate:
@@ -1072,173 +1083,16 @@ class BeeLandNode(Node):
 			self.get_logger().info("Required streams are available; starting automatic climb.")
 		return True
 
-	def _ensure_mavsdk_worker_started(self):
-		if self._mavsdk_takeoff_started:
-			return
-		if System is None:
-			self._mavsdk_takeoff_error = "mavsdk is not installed in this Python environment"
-			return
-		self._mavsdk_takeoff_started = True
-		self.get_logger().info(f"Starting MAVSDK takeoff to {TAKEOFF_ALTITUDE_M:.2f} m.")
-		self._mavsdk_thread = threading.Thread(target=self._run_mavsdk_worker_thread, name="mavsdk_takeoff", daemon=True)
-		self._mavsdk_thread.start()
-
-	def _run_mavsdk_worker_thread(self):
-		try:
-			asyncio.run(self._mavsdk_worker_async())
-		except Exception as exc:
-			if not self._mavsdk_takeoff_done:
-				self._mavsdk_takeoff_error = repr(exc)
-			else:
-				self._mavsdk_motor_stop_error = repr(exc)
-
-	async def _mavsdk_worker_async(self):
-		self._free_mavsdk_port(MAVSDK_PORT_TO_FREE)
-		drone = System()
-		await drone.connect(system_address=MAVSDK_SYSTEM_ADDRESS)
-
-		self.get_logger().info("MAVSDK: waiting for drone connection...")
-		await self._wait_for_condition(
-			drone.core.connection_state(),
-			lambda state: state.is_connected,
-			MAVSDK_CONNECT_TIMEOUT_SEC,
-			"MAVSDK connection",
-		)
-		self.get_logger().info("MAVSDK: connected.")
-
-		self.get_logger().info("MAVSDK: waiting for global/home/local position estimates...")
-		await self._wait_for_condition(
-			drone.telemetry.health(),
-			lambda h: h.is_global_position_ok and h.is_home_position_ok and h.is_local_position_ok,
-			MAVSDK_HEALTH_TIMEOUT_SEC,
-			"global/home/local position health",
-		)
-		self.get_logger().info("MAVSDK: all position estimates OK.")
-
-		await asyncio.sleep(EKF2_SETTLE_TIME)
-		home_position = await self._wait_for_condition(
-			drone.telemetry.position(),
-			lambda position: True,
-			MAVSDK_CONNECT_TIMEOUT_SEC,
-			"initial position reading",
-		)
-		home_baro_offset = home_position.relative_altitude_m
-		self.get_logger().info(f"MAVSDK: home altitude offset {home_baro_offset:.2f} m.")
-
-		self.get_logger().info(f"MAVSDK: setting MIS_TAKEOFF_ALT={TAKEOFF_ALTITUDE_M:.2f} m.")
-		await drone.param.set_param_float("MIS_TAKEOFF_ALT", float(TAKEOFF_ALTITUDE_M))
-		await asyncio.sleep(0.5)
-
-		self.get_logger().info("MAVSDK: arming.")
-		await drone.action.arm()
-		self.get_logger().info("MAVSDK: takeoff command.")
-		await drone.action.takeoff()
-
-		await self._wait_for_condition(
-			drone.telemetry.position(),
-			lambda p: (p.relative_altitude_m - home_baro_offset) >= TAKEOFF_ALTITUDE_M - 0.20,
-			MAVSDK_TAKEOFF_ALTITUDE_TIMEOUT_SEC,
-			"takeoff altitude reached",
-			progress_fn=lambda p, elapsed: self.get_logger().info(
-				f"MAVSDK: still climbing after {elapsed:.0f}s -- altitude={p.relative_altitude_m - home_baro_offset:.2f} m"
-			),
-			progress_interval=5.0,
-		)
-		self.get_logger().info("MAVSDK: reached takeoff altitude; hovering.")
-		self._mavsdk_takeoff_done = True
-
-		# MAVSDK is kept only for takeoff and terminal motor-stop actions.
-		# Closed-loop attitude/thrust setpoints are published directly to PX4 via
-		# ROS 2/uXRCE-DDS in on_px4_setpoint_timer().
-		while not self._mavsdk_stop_requested:
-			if self._mavsdk_motor_stop_requested and not self._mavsdk_motor_stop_done:
-				await self._try_mavsdk_motor_stop(drone)
-				if self._mavsdk_motor_stop_done:
-					break
-			await asyncio.sleep(0.05)
-
-	async def _try_mavsdk_motor_stop(self, drone):
-		"""Stop motors after confirmed Gazebo touchdown.
-
-		Normal disarm is tried first. In SITL, kill() is used as a fallback when PX4's
-		internal land detector refuses the disarm on the moving platform. This method
-		attempts motor stop only once to avoid spamming MAVSDK/PX4 with repeated
-		commands if both methods fail.
-		"""
-		if self._mavsdk_motor_stop_attempted:
-			return
-
-		self._mavsdk_motor_stop_attempted = True
-		self._latest_setpoint = self._landed_zero_thrust_setpoint()
-
-		try:
-			self.get_logger().warning("MAVSDK: touchdown confirmed, requesting disarm.")
-			await drone.action.disarm()
-			self.get_logger().warning("MAVSDK: disarm accepted after touchdown.")
-			self._mavsdk_motor_stop_done = True
-			self._mavsdk_stop_requested = True
-			return
-		except Exception as exc:
-			self._mavsdk_motor_stop_error = repr(exc)
-			self.get_logger().error(
-				f"MAVSDK: disarm failed after touchdown: {self._mavsdk_motor_stop_error}"
-			)
-
-		if not ENABLE_TOUCHDOWN_KILL_FALLBACK:
-			self.get_logger().error(
-				"MAVSDK: kill fallback disabled; keeping zero-thrust offboard stream alive."
-			)
-			return
-
-		try:
-			self.get_logger().error(
-				"MAVSDK: using kill fallback after confirmed Gazebo contact. SITL only."
-			)
-			await drone.action.kill()
-			self.get_logger().warning("MAVSDK: kill accepted after touchdown.")
-			self._mavsdk_motor_stop_done = True
-			self._mavsdk_stop_requested = True
-		except Exception as kill_exc:
-			self._mavsdk_motor_stop_error = repr(kill_exc)
-			self.get_logger().error(
-				f"MAVSDK: kill fallback failed: {self._mavsdk_motor_stop_error}"
-			)
-
-	@staticmethod
-	async def _wait_for_condition(async_iterable, condition, timeout: float, label: str, progress_fn=None, progress_interval: float = 5.0):
-		async def _inner():
-			loop = asyncio.get_event_loop()
-			start = loop.time()
-			last_progress = start
-			async for item in async_iterable:
-				if condition(item):
-					return item
-				if progress_fn is not None:
-					now = loop.time()
-					if now - last_progress >= progress_interval:
-						last_progress = now
-						progress_fn(item, now - start)
-		try:
-			return await asyncio.wait_for(_inner(), timeout=timeout)
-		except asyncio.TimeoutError:
-			raise TimeoutError(f"timed out after {timeout:.0f}s waiting for {label}")
-
-	@staticmethod
-	def _free_mavsdk_port(port: int):
-		try:
-			result = subprocess.run(["lsof", "-t", f"-i:UDP:{port}"], capture_output=True, text=True, check=False)
-		except FileNotFoundError:
-			return
-		for pid in result.stdout.strip().split():
-			try:
-				os.kill(int(pid), signal.SIGKILL)
-			except ProcessLookupError:
-				pass
-
 	def _publish_touchdown_status(self, value: bool):
 		msg = Bool()
 		msg.data = bool(value)
 		self._touchdown_status_pub.publish(msg)
+
+	def _latch_zero_thrust_hold(self):
+		"""Invoked by MavsdkWorker (on the worker thread) just before disarm, so
+		our outgoing setpoint is a zero-thrust hold and nothing fights the stop.
+		A single attribute assignment -- safe to call cross-thread."""
+		self._latest_setpoint = self._landed_zero_thrust_setpoint()
 
 	def _landed_zero_thrust_setpoint(self) -> AttitudeSetpoint:
 		"""Terminal setpoint after confirmed touchdown.
@@ -1263,7 +1117,7 @@ class BeeLandNode(Node):
 		self._latest_setpoint = self._landed_zero_thrust_setpoint()
 		self._publish_touchdown_status(True)
 		if ENABLE_TOUCHDOWN_MOTOR_STOP:
-			self._mavsdk_motor_stop_requested = True
+			self.mavsdk.request_motor_stop()
 		else:
 			self.get_logger().warning(
 				"Touchdown motor stop disabled; landed phase will only stream zero thrust."
@@ -1301,7 +1155,7 @@ class BeeLandNode(Node):
 		# Once offboard is active, keep publishing _neutral_visual_hold_setpoint()
 		# until the user stops the node.
 		if not self._px4_offboard_started:
-			self._mavsdk_stop_requested = True
+			self.mavsdk.request_stop()
 
 	@staticmethod
 	def _clamp(value: float, lower: float, upper: float) -> float:
@@ -1316,7 +1170,7 @@ def main(args=None):
 	except KeyboardInterrupt:
 		pass
 	finally:
-		node._mavsdk_stop_requested = True
+		node.mavsdk.request_stop()
 		node.diagnostics.close()
 		node.destroy_node()
 		if SHOW_CAMERA:

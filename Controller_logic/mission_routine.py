@@ -104,6 +104,7 @@ from typing import Deque, Optional
 
 G_ACCEL = 9.80665
 
+CENTER = "center"
 PROBE = "probe"
 PROBE_HOLD = "probe_hold"
 DESCEND = "descend"
@@ -150,7 +151,15 @@ class PlatformProbe:
 	"infeasible" calls.
 	"""
 
-	def __init__(self, thrust_model: ThrustModel, highpass_tau_sec: float = 4.0):
+	def __init__(self, thrust_model: ThrustModel, highpass_tau_sec: float = 15.0):
+		# highpass_tau_sec sets the EMA time constant used to subtract the
+		# slow mean before tracking peak |accel|. It must be long enough to
+		# remove the thrust loop's own slow resonance (documented ~23s ring in
+		# platform_motion.py) while short enough to pass the platform's actual
+		# oscillation. 4s was too short: the 23s ring aliased into peak_accel,
+		# inflating k_min and making the gate falsely infeasible on a stationary
+		# platform. 15s sits between the two periods and removes the ring.
+		# If the real platform oscillates slower than ~5s, raise this further.
 		self._tm = thrust_model
 		self._tau = float(highpass_tau_sec)
 		self._mean = 0.0
@@ -320,6 +329,17 @@ class MissionRoutine:
 		enable_descent: bool = True,
 		probe_only: bool = False,
 		ceiling_safety_factor: float = 0.5,
+		# --- CENTER phase (runs BEFORE probe) ---
+		# Center the drone over the target first, then probe. Probing while the
+		# lateral loop is still banking contaminates the thrust->accel reading
+		# (ThrustModel ignores tilt: vertical thrust is u*cos(roll)cos(pitch),
+		# not u), so peak_accel would pick up the lateral maneuver, not the
+		# deck. We hold D*=0 while centering and only start the probe once the
+		# target is centered AND that has held for a debounce dwell.
+		center_offset_threshold: float = 0.10,   # |offset_x|,|offset_y| both under this
+		center_dwell_sec: float = 2.0,           # sustained-centered debounce
+		center_timeout_sec: float = 20.0,        # fallback if never centers
+		enable_center: bool = True,
 	):
 		self._dt = float(control_period_sec)
 		self._d_star = float(descent_divergence_setpoint)
@@ -327,6 +347,10 @@ class MissionRoutine:
 		self._leg_clearance = float(leg_clearance_m)
 		self._enable_descent = bool(enable_descent)
 		self._probe_only = bool(probe_only)
+		self._enable_center = bool(enable_center)
+		self._center_offset_thr = float(center_offset_threshold)
+		self._center_dwell = float(center_dwell_sec)
+		self._center_timeout = float(center_timeout_sec)
 		# Hold the live gain this fraction below the hard de Croon ceiling 2h/dt.
 		# 0.5 is "really conservative" per the design discussion; raise toward
 		# 1.0 for more aggressive (closer-to-ceiling) gains once validated.
@@ -335,19 +359,23 @@ class MissionRoutine:
 		self._tm = ThrustModel(hover_thrust)
 		self._probe = PlatformProbe(self._tm)
 
-		self._substate = PROBE
+		self._substate = CENTER if self._enable_center else PROBE
 		self._t0: Optional[float] = None
 		self._h0: Optional[float] = None
 		self._t_descend_start: Optional[float] = None
+		self._centered_since: Optional[float] = None   # dwell timer start
+		self._center_start_t: Optional[float] = None    # for timeout
 
 		self.gate: GateResult = GateResult()
 		self.probe_result: ProbeResult = ProbeResult()
 
 	def reset(self) -> None:
 		self._probe.reset()
-		self._substate = PROBE
+		self._substate = CENTER if self._enable_center else PROBE
 		self._t0 = None
 		self._t_descend_start = None
+		self._centered_since = None
+		self._center_start_t = None
 		self._k_explore = 0.0
 		self.gate = GateResult()
 		self.probe_result = ProbeResult()
@@ -361,7 +389,7 @@ class MissionRoutine:
 		# Conservative exploration gain: the safety-scaled ceiling at h0. Known
 		# from h0 alone (no probe needed), so the probe hover already runs the
 		# new accel-domain thrust law at this gain rather than the dormant LQR.
-		self._k_explore = self._safety * ceiling_gain(self._h0, self._dt)
+		self._k_explore = self._safety * ceiling_gain(self._h0, self._dt)/12
 
 	@property
 	def substate(self) -> str:
@@ -371,7 +399,15 @@ class MissionRoutine:
 	def feasible(self) -> bool:
 		return self.gate.feasible
 
-	def update(self, t: float, dt: float, last_thrust_cmd: float) -> MissionControl:
+	def update(
+		self,
+		t: float,
+		dt: float,
+		last_thrust_cmd: float,
+		offset_x: float = 0.0,
+		offset_y: float = 0.0,
+		target_found: bool = False,
+	) -> MissionControl:
 		t = float(t)
 		dt = max(1e-3, float(dt))
 		if self._t0 is None:
@@ -379,6 +415,8 @@ class MissionRoutine:
 		if self._h0 is None:
 			self._h0 = 5.0  # defensive fallback; start() should always set this.
 
+		if self._substate == CENTER:
+			return self._do_center(t, offset_x, offset_y, target_found)
 		if self._substate == PROBE:
 			return self._do_probe(t, dt, last_thrust_cmd)
 		if self._substate == PROBE_HOLD:
@@ -386,6 +424,70 @@ class MissionRoutine:
 		if self._substate == INFEASIBLE:
 			return self._do_infeasible(t)
 		return self._do_descend(t)
+
+	def _do_center(
+		self, t: float, offset_x: float, offset_y: float, target_found: bool
+	) -> MissionControl:
+		"""Station-keep (D*=0) at full lateral authority until the target is
+		centered and has stayed centered for a debounce dwell, THEN hand off to
+		the probe. Probing is deliberately NOT run here -- see the CENTER config
+		note. On handoff the probe is reset so its slow-baseline high-pass
+		starts fresh from the settled hover, not from the centering transient."""
+		if self._center_start_t is None:
+			self._center_start_t = t
+
+		centered = (
+			target_found
+			and abs(float(offset_x)) <= self._center_offset_thr
+			and abs(float(offset_y)) <= self._center_offset_thr
+		)
+		if centered:
+			if self._centered_since is None:
+				self._centered_since = t
+			dwell = t - self._centered_since
+		else:
+			self._centered_since = None
+			dwell = 0.0
+
+		elapsed = t - self._center_start_t
+		settled = centered and dwell >= self._center_dwell
+		timed_out = elapsed >= self._center_timeout
+
+		if settled or timed_out:
+			self._probe.reset()          # fresh high-pass baseline for the probe
+			self._substate = PROBE
+			# Do NOT run a probe sample this frame -- we don't have the real
+			# last_thrust_cmd here, and a fake one would corrupt peak_accel.
+			# Emit a clean station-keep hold; the next tick dispatches to
+			# _do_probe with the true thrust.
+			return MissionControl(
+				divergence_setpoint=0.0,
+				thrust_gain_override=self._k_explore,
+				lateral_gain_scale=1.0,
+				substate=PROBE,
+				info={
+					"event": "center_done",
+					"centered_ok": bool(settled),
+					"center_timed_out": bool(timed_out),
+					"center_elapsed_sec": elapsed,
+				},
+			)
+
+		# still centering: hold altitude, full lateral authority to center.
+		return MissionControl(
+			divergence_setpoint=0.0,
+			thrust_gain_override=self._k_explore,
+			lateral_gain_scale=1.0,
+			substate=CENTER,
+			info={
+				"offset_x": offset_x,
+				"offset_y": offset_y,
+				"target_found": target_found,
+				"centered": centered,
+				"center_dwell_sec": dwell,
+				"center_elapsed_sec": elapsed,
+			},
+		)
 
 	def _do_probe(self, t: float, dt: float, last_thrust_cmd: float) -> MissionControl:
 		self._probe.update(last_thrust_cmd, dt)
@@ -504,6 +606,9 @@ class MissionRoutine:
 		)
 
 	def status_line(self) -> str:
+		if self._substate == CENTER:
+			return (f"[center] waiting for target within +/-{self._center_offset_thr:.2f} "
+					f"for {self._center_dwell:.1f}s (timeout {self._center_timeout:.0f}s)")
 		if self._substate == PROBE:
 			return (f"[probe] elapsed={self.probe_result.duration_sec:.1f}s/"
 					f"{self._probe_min:.0f}s peak_accel={self.probe_result.peak_accel:.3f} m/s^2")

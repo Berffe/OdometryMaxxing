@@ -62,7 +62,7 @@ class OpticalFlowEstimator:
 		require_target_roi: bool = True,
 		roi_margin_fraction: float = 0.05,
 		min_roi_size_px: int = 32,
-		divergence_smoothing: float = 0.6,
+		divergence_smoothing: float = 0.7,
 		min_points_for_affine_fit: int = 30,
 		affine_inlier_quantile: float = 0.85,
 		store_debug: bool = False,
