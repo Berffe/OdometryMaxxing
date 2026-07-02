@@ -27,6 +27,7 @@ cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Controller_logic/*.p
 
 cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/OpenLoop_Test/*.py ~/PX4-Autopilot/BEE_LAND/openloop/
 ```
+cp -r ~/PX4-Autopilot/BEE_LAND/logs/* /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Flight_Analysis/logs_new/
 
 Parfois il faut rebuild l'environnement :
 

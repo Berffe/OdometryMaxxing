@@ -223,27 +223,31 @@ def critical_height(k_min: float, control_period_sec: float, safety: float = 1.0
 	return k_min * float(control_period_sec) / (2.0 * s)
 
 
-def ceiling_gain(height: float, control_period_sec: float) -> float:
-	"""de Croon 2016 eq. 25: K_cr(h) = 2h/dt (the hard ceiling, unscaled)."""
-	return 2.0 * max(0.0, float(height)) / float(control_period_sec)
-
-
 def compute_gate(
 	peak_accel: float,
 	descent_divergence_setpoint: float,
-	start_height_m: float,
+	initial_thrust_gain: float,
 	control_period_sec: float,
 	leg_clearance_m: float,
 	ceiling_safety_factor: float = 0.5,
 	min_divergence_setpoint: float = 0.01,
 ) -> GateResult:
 	"""Herisse floor -> k_min; de Croon ceiling (safety-scaled), inverted ->
-	h_crit; gate against leg clearance."""
+	h_crit; gate against leg clearance.
+
+	k_explore is now the HAND-TUNED initial thrust gain (initial_thrust_gain),
+	NOT the height-derived de Croon ceiling. Rationale: the ATTITUDE_HOLD height
+	reference is relative to the ground while the platform sits ~2 m above it, so
+	h0 (takeoff altitude) is not the true height above the deck and the
+	ceiling-at-h0 gain was wrong -- it needed an ad-hoc divisor to fly. The
+	exploration/descent-start gain is therefore set by hand like the lateral PD
+	gains. The probe still sets the k_min FLOOR and the h_crit feasibility gate;
+	only the START gain is decoupled from height."""
 	d_star = max(float(min_divergence_setpoint), float(descent_divergence_setpoint))
 	s = max(1e-3, float(ceiling_safety_factor))
 	k_min = max(0.0, float(peak_accel)) / d_star
 	h_crit = critical_height(k_min, control_period_sec, s)
-	k_explore = s * ceiling_gain(start_height_m, control_period_sec)
+	k_explore = max(0.0, float(initial_thrust_gain))
 	feasible = h_crit <= float(leg_clearance_m)
 	return GateResult(k_min=k_min, h_crit=h_crit, k_explore=k_explore, feasible=feasible)
 
@@ -329,6 +333,14 @@ class MissionRoutine:
 		enable_descent: bool = True,
 		probe_only: bool = False,
 		ceiling_safety_factor: float = 0.5,
+		# HAND-TUNED initial/exploration thrust gain "k" (m/s), set like the
+		# lateral PD gains rather than derived from height + Ho's ceiling. This
+		# is the gain the CENTER/PROBE/HOLD hover runs at and the value the
+		# descent schedule decays from. Decoupled from h0 because the
+		# ATTITUDE_HOLD height reference is ground-relative while the platform
+		# sits ~2 m up, so the height-derived ceiling gain was wrong. Default
+		# preserves the validated hover (old safety*ceiling_gain(h0)/12 = 0.833).
+		initial_thrust_gain: float = 6.5,
 		# --- CENTER phase (runs BEFORE probe) ---
 		# Center the drone over the target first, then probe. Probing while the
 		# lateral loop is still banking contaminates the thrust->accel reading
@@ -355,6 +367,7 @@ class MissionRoutine:
 		# 0.5 is "really conservative" per the design discussion; raise toward
 		# 1.0 for more aggressive (closer-to-ceiling) gains once validated.
 		self._safety = max(1e-3, min(1.0, float(ceiling_safety_factor)))
+		self._initial_thrust_gain = max(0.0, float(initial_thrust_gain))
 
 		self._tm = ThrustModel(hover_thrust)
 		self._probe = PlatformProbe(self._tm)
@@ -386,10 +399,10 @@ class MissionRoutine:
 		self.reset()
 		self._t0 = float(t)
 		self._h0 = max(1e-3, float(start_height_m))
-		# Conservative exploration gain: the safety-scaled ceiling at h0. Known
-		# from h0 alone (no probe needed), so the probe hover already runs the
-		# new accel-domain thrust law at this gain rather than the dormant LQR.
-		self._k_explore = self._safety * ceiling_gain(self._h0, self._dt)/12
+		# Exploration gain is HAND-TUNED (see initial_thrust_gain), not derived
+		# from h0. h0 is still seeded here for the descent height PREDICTION
+		# (diagnostic h_pred) and critical_time only -- not for any gain.
+		self._k_explore = self._initial_thrust_gain
 
 	@property
 	def substate(self) -> str:
@@ -497,7 +510,7 @@ class MissionRoutine:
 			self.gate = compute_gate(
 				peak_accel=self.probe_result.peak_accel,
 				descent_divergence_setpoint=self._d_star,
-				start_height_m=self._h0,
+				initial_thrust_gain=self._initial_thrust_gain,
 				control_period_sec=self._dt,
 				leg_clearance_m=self._leg_clearance,
 				ceiling_safety_factor=self._safety,
@@ -646,14 +659,14 @@ def _smoke_test() -> None:
 			# synthetic thrust command: hover plus a sinusoidal "platform" kick
 			a_plat = a_peak * math.cos(2 * math.pi * 0.2 * t)
 			u = hover + hover * a_plat / G_ACCEL
-			mc = m.update(t, dt, u)
+			mc = m.update(t, dt, u, offset_x=0.0, offset_y=0.0, target_found=True)
 			t += dt
 		print(f"{label:9s} a_peak={a_peak:.2f} -> substate={mc.substate:10s} "
 			f"k_min={m.gate.k_min:.2f} h_crit={m.gate.h_crit:.2f} feasible={m.feasible}")
 
 		if mc.substate == DESCEND:
 			for _ in range(10):
-				mc = m.update(t, dt, u)
+				mc = m.update(t, dt, u, offset_x=0.0, offset_y=0.0, target_found=True)
 				t += dt
 			print(f"  after 10 more ticks: {m.status_line()}  k_now={mc.thrust_gain_override:.2f}")
 

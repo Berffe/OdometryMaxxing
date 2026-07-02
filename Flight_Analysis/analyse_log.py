@@ -832,7 +832,9 @@ def _mission_phase_spans(df: pd.DataFrame, t: np.ndarray):
 		if start_idx is None:
 			start_idx = i
 		elif sub[i] != sub[start_idx]:
-			spans.append((t[start_idx], t[i - 1], sub[start_idx]))
+			# Close at the boundary sample (t[i]) so the next span starts where
+			# this one ends -- no one-sample unshaded gap between phases.
+			spans.append((t[start_idx], t[i], sub[start_idx]))
 			start_idx = i
 	if start_idx is not None:
 		spans.append((t[start_idx], t[len(sub) - 1], sub[start_idx]))
@@ -840,6 +842,7 @@ def _mission_phase_spans(df: pd.DataFrame, t: np.ndarray):
 
 
 _PHASE_COLORS = {
+	"center": ("tab:purple", 0.06),
 	"probe": ("tab:blue", 0.06),
 	"probe_hold": ("tab:cyan", 0.08),
 	"descend": ("tab:green", 0.06),
@@ -881,7 +884,7 @@ def plot_gain_schedule(df: pd.DataFrame, t: np.ndarray, output_dir: str):
 	if "mission_thrust_gain_k" in df.columns:
 		ax.plot(t, numeric_column(df, "mission_thrust_gain_k"), label="k(t) thrust gain", linewidth=1.8)
 	for col, style, lbl in (
-		("mission_k_explore", (0, (4, 3)), "k_explore (ceiling @ h0)"),
+		("mission_k_explore", (0, (4, 3)), "k_explore (hand-tuned initial gain)"),
 		("mission_k_min", (0, (1, 2)), "k_min (Herisse floor)"),
 	):
 		if col in df.columns:
@@ -914,14 +917,21 @@ def plot_gain_schedule(df: pd.DataFrame, t: np.ndarray, output_dir: str):
 
 
 def plot_height_prediction(df: pd.DataFrame, t: np.ndarray, output_dir: str):
-	"""Open-loop predicted height h_pred vs measured relative_z.
+	"""Open-loop predicted height h_pred vs measured height above the platform.
 
 	The descent schedules the gain against the OPEN-LOOP prediction
-	h(t)=h0*exp(-D* t), not a live height estimate. This plot is the single
-	most important tuning diagnostic: if h_pred and the true relative height
-	(here relative_z, from logged ground truth) diverge, the gain is being
-	evaluated at the wrong height and the schedule needs a more pessimistic
-	descent assumption (or a live estimator). h_crit is drawn for reference.
+	h(t)=h0*exp(-D* t), NOT a live height estimate, so this is the single most
+	important descent-tuning diagnostic: if h_pred and the true height above the
+	deck diverge, the clock-scheduled gain is being evaluated at the wrong
+	height and the schedule needs a more pessimistic descent assumption (or a
+	live estimator).
+
+	IMPORTANT dimensional note: h_pred is height above the PLATFORM (h0 is seeded
+	as takeoff_altitude - platform_height). The only correct ground-truth to
+	compare against is therefore relative_z_m (vehicle-to-platform gap). |vehicle_z|
+	is height above the GROUND and differs from h_pred by the platform height, so
+	it is shown only as dashed context and the error panel is suppressed for it --
+	comparing the two directly would report a spurious constant bias.
 	"""
 	if "mission_h_pred_m" not in df.columns:
 		print("Skipping height prediction plot. No mission_h_pred_m (old log?).")
@@ -932,50 +942,79 @@ def plot_height_prediction(df: pd.DataFrame, t: np.ndarray, output_dir: str):
 		print("Skipping height prediction plot. No descent rows with h_pred.")
 		return
 
-	# True relative height: prefer relative_z_m (ground truth), else |vehicle_z|.
+	# Correct ground truth is relative_z (height above the platform). Only then
+	# is h_pred - truth a meaningful prediction error.
 	truth = None
 	truth_label = None
+	truth_is_comparable = False
 	if "relative_z_m" in df.columns and np.any(np.isfinite(numeric_column(df, "relative_z_m"))):
 		truth = np.abs(numeric_column(df, "relative_z_m"))
-		truth_label = "|relative_z| (ground truth)"
+		truth_label = "|relative_z| (above platform, ground truth)"
+		truth_is_comparable = True
 	elif "vehicle_z_m" in df.columns:
+		# Dimensionally NOT comparable to h_pred (ground- vs platform-referenced).
 		truth = np.abs(numeric_column(df, "vehicle_z_m"))
-		truth_label = "|vehicle_z| (NED)"
+		truth_label = "|vehicle_z| (above GROUND -- offset by platform height)"
+		truth_is_comparable = False
 
-	fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
-	fig.suptitle("Open-loop height prediction vs measured")
-
-	ax = axes[0]
-	shade_mission_phases(ax, df, t)
-	ax.plot(t, h_pred, label="h_pred = h0*exp(-D* t)", linewidth=1.8)
-	if truth is not None:
-		ax.plot(t, truth, alpha=0.8, label=truth_label)
+	# Median h_crit (the schedule floor) and the time h_pred first reaches it.
+	h_crit_val = None
 	if "mission_h_crit_m" in df.columns:
 		hc = numeric_column(df, "mission_h_crit_m")
 		finite = hc[np.isfinite(hc)]
 		if len(finite):
-			ax.axhline(float(np.nanmedian(finite)), linestyle=":", linewidth=1.4, label="h_crit")
-	ax.set_ylabel("height [m]")
-	ax.grid(True)
+			h_crit_val = float(np.nanmedian(finite))
+	t_floor = None
+	if h_crit_val is not None and h_crit_val > 0:
+		below = np.isfinite(h_pred) & (h_pred <= h_crit_val)
+		if np.any(below):
+			t_floor = float(t[np.argmax(below)])  # first True
+
+	fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
+	fig.suptitle("Open-loop height prediction vs measured (descent diagnostic)")
+
+	# --- Top: h_pred vs truth, with the h_crit floor and its crossing. ---
+	ax = axes[0]
+	shade_mission_phases(ax, df, t)
+	ax.plot(t, h_pred, color="tab:blue", linewidth=1.9, label="h_pred = h0*exp(-D* t)")
+	if truth is not None:
+		style = "-" if truth_is_comparable else "--"
+		ax.plot(t, truth, color="tab:orange", alpha=0.85, linestyle=style, label=truth_label)
+	if h_crit_val is not None:
+		ax.axhline(h_crit_val, color="tab:red", linestyle=":", linewidth=1.4,
+		           label=f"h_crit = {h_crit_val:.2f} m (schedule floor)")
+	if t_floor is not None:
+		ax.axvline(t_floor, color="tab:red", linestyle="--", linewidth=1.1, alpha=0.7)
+		ax.annotate(f"h_pred=h_crit\n@ t={t_floor:.1f}s", xy=(t_floor, h_crit_val),
+		            xytext=(6, 10), textcoords="offset points", fontsize=8, color="tab:red")
+	ax.set_ylabel("height above platform [m]")
+	ax.grid(True, alpha=0.4)
 	ax.legend(loc="best", fontsize=8)
 
-	# prediction error, where both exist
+	# --- Bottom: prediction error, ONLY when the comparison is dimensionally valid. ---
 	ax = axes[1]
 	shade_mission_phases(ax, df, t)
-	if truth is not None:
+	if truth is not None and truth_is_comparable:
 		err = h_pred - truth
-		ax.plot(t, err, label="h_pred - truth", color="tab:red")
-		ax.axhline(0.0, linestyle="--", linewidth=1)
+		ax.plot(t, err, color="tab:red", linewidth=1.5, label="h_pred - truth")
+		ax.axhline(0.0, linestyle="--", linewidth=1, color="0.4")
 		finite = err[np.isfinite(err)]
 		if len(finite):
-			ax.set_title(f"prediction error: median={np.nanmedian(finite):+.3f} m, "
-			             f"RMS={np.sqrt(np.nanmean(finite**2)):.3f} m", fontsize=9)
+			med = float(np.nanmedian(finite))
+			rms = float(np.sqrt(np.nanmean(finite ** 2)))
+			ax.set_title(f"prediction error over descent: median={med:+.3f} m, RMS={rms:.3f} m  "
+			             f"(positive = clock thinks it is higher than it is -> gain decays late)",
+			             fontsize=9)
+	elif truth is not None:
+		ax.text(0.5, 0.5, "error suppressed: only a GROUND-referenced height is logged\n"
+		                  "(not comparable to platform-referenced h_pred)",
+		        ha="center", va="center", transform=ax.transAxes, fontsize=9, color="0.35")
 	else:
 		ax.text(0.5, 0.5, "no ground-truth height column to compare against",
-		        ha="center", va="center", transform=ax.transAxes)
+		        ha="center", va="center", transform=ax.transAxes, fontsize=9, color="0.35")
 	ax.set_ylabel("error [m]")
 	ax.set_xlabel("time [s]")
-	ax.grid(True)
+	ax.grid(True, alpha=0.4)
 	ax.legend(loc="best", fontsize=8)
 
 	save_current_figure(output_dir, "height_prediction.png")

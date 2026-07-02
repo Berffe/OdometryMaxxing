@@ -48,7 +48,7 @@ PX4_OFFBOARD_SWITCH_SETTLE_SEC = 0.5
 # feasibility gate together; faster descent (larger D*) makes k_min SMALLER
 # (and so h_crit smaller / more likely feasible), at the cost of less time to
 # react to vision dropouts. 0.15 1/s is a starting point, not tuned.
-DESCENT_DIVERGENCE_SETPOINT = 0.15
+DESCENT_DIVERGENCE_SETPOINT = 0.3
 # How long to hold the D*=0 probe before computing peak_accel/k_min/h_crit.
 # No periodicity assumption is needed (unlike the dropped mode-estimator
 # design) -- this only needs to be long enough to see the platform swing
@@ -68,11 +68,13 @@ LEG_CLEARANCE_M = 0.20
 # probe numbers look right on a real log.
 HOVER_PROBE_ONLY = True
 
-# Pure-PI-thrust / pure-PD-lateral for the bounds test: disable ALL phase-lead
-# and offset-prediction branches in the control law. True restores the original
-# lead-compensated behavior. Keep False while testing the Herisse/de Croon gain
-# bounds against the simplest feedback law.
-ENABLE_LEAD_BRANCHES = False
+# Hand-tuned initial/exploration thrust gain "k" (m/s) for the vertical loop --
+# set like the lateral PD gains, NOT derived from takeoff height + de Croon's
+# ceiling. The ATTITUDE_HOLD height reference is ground-relative while the
+# platform sits ~2 m up, so the height-derived gain was wrong; this decouples
+# it. This is the gain the hover/probe runs at and the value the descent
+# schedule decays from. 0.833 reproduces the validated hover.
+INITIAL_THRUST_GAIN = 6.5
 
 SHOW_CAMERA = True
 VERBOSE_STREAM_LOGS = False
@@ -236,7 +238,7 @@ class BeeLandNode(Node):
 		self._latest_frame = None
 		self._latest_target = TargetEstimate()
 
-		self.control_law = ControlLaw(enable_lead_branches=ENABLE_LEAD_BRANCHES)
+		self.control_law = ControlLaw()
 		self._latest_setpoint = AttitudeSetpoint(thrust=self.control_law.hover_thrust)
 
 		# Probe -> gate -> scheduled-gain descent for the moving-platform
@@ -251,6 +253,7 @@ class BeeLandNode(Node):
 			probe_min_duration_sec=PROBE_MIN_DURATION_SEC,
 			leg_clearance_m=LEG_CLEARANCE_M,
 			probe_only=HOVER_PROBE_ONLY,
+			initial_thrust_gain=INITIAL_THRUST_GAIN,
 		)
 		self._mission_infeasible_logged = False
 		self._last_mission_log_time = 0.0
