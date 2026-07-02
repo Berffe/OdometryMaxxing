@@ -48,7 +48,7 @@ PX4_OFFBOARD_SWITCH_SETTLE_SEC = 0.5
 # feasibility gate together; faster descent (larger D*) makes k_min SMALLER
 # (and so h_crit smaller / more likely feasible), at the cost of less time to
 # react to vision dropouts. 0.15 1/s is a starting point, not tuned.
-DESCENT_DIVERGENCE_SETPOINT = 0.3
+DESCENT_DIVERGENCE_SETPOINT = 0.30
 # How long to hold the D*=0 probe before computing peak_accel/k_min/h_crit.
 # No periodicity assumption is needed (unlike the dropped mode-estimator
 # design) -- this only needs to be long enough to see the platform swing
@@ -66,7 +66,7 @@ LEG_CLEARANCE_M = 0.20
 # descending or aborting. Use this to validate the hover loop and the probe /
 # bounds in isolation before trusting the descent. Set False only once the
 # probe numbers look right on a real log.
-HOVER_PROBE_ONLY = True
+HOVER_PROBE_ONLY = False
 
 # Hand-tuned initial/exploration thrust gain "k" (m/s) for the vertical loop --
 # set like the lateral PD gains, NOT derived from takeoff height + de Croon's
@@ -898,6 +898,20 @@ class BeeLandNode(Node):
 
 		if mc.substate != previous_substate:
 			self.get_logger().info(f"Mission substate: {previous_substate} -> {mc.substate}")
+		if mc.info.get("event") == "center_done":
+			# CENTER runs at full lateral authority while the target is often
+			# far off-center: large banking + noisy divergence (the same
+			# tilt-contamination that motivated resetting the platform probe
+			# here -- see mission_routine._do_center). Clear ONLY the divergence
+			# integral so that transient does not carry a bias into the
+			# following probe/hover. Deliberately NOT reset_visual_integrators():
+			# that also rebases the command-shaping filter to (0, 0, hover),
+			# which would step the commanded attitude/thrust at the handoff
+			# instead of continuing smoothly from wherever centering left off.
+			self.control_law.reset_divergence_integral()
+			self.get_logger().info(
+				"CENTER done -> cleared divergence integral before probe (filter state kept continuous)."
+			)
 		if now - self._last_mission_log_time >= 2.0:
 			self._last_mission_log_time = now
 			self.get_logger().info(self.mission.status_line())

@@ -63,7 +63,7 @@ class ControlLaw:
 		pitch_kd: float = 0.07,
 
 		# --- Thrust axis. ---
-		thrust_integral_gain_const: float = 0.01,
+		thrust_integral_gain_const: float = 0.1,
 		divergence_integral_limit: float = 1.2,
 		max_visual_thrust_delta_from_hover: float = 0.18,
 		raw_divergence_weight: float = 0.10,
@@ -130,6 +130,17 @@ class ControlLaw:
 		self._previous_pitch_cmd = 0.0
 		self._previous_thrust_cmd = self._hover_thrust
 		self._has_previous_command = False
+
+	def reset_divergence_integral(self):
+		"""Clear ONLY the divergence integral -- unlike reset_visual_integrators,
+		this leaves the command-shaping filter/slew state untouched, so it does
+		NOT introduce a step discontinuity in the next commanded roll/pitch/
+		thrust. Use this at a mid-flight phase transition (e.g. CENTER->PROBE)
+		where you want to discard integral bias accumulated during a noisy
+		period without rebasing the live command trajectory to hover/zero.
+		reset_visual_integrators() remains the right call for a true cold start
+		(no previous command exists yet, e.g. at mission.start())."""
+		self._divergence_integral = 0.0
 
 	def compute(
 		self,
