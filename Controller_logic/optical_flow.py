@@ -12,17 +12,29 @@ Divergence is obtained by a least-squares affine fit to the flow field
 (see _fit_divergence_affine), not a per-pixel finite-difference field
 collapsed with a median. For an affine field u=a0+a1 x+a2 y, v=b0+b1
 x+b2 y, divergence = du/dx+dv/dy = a1+b2 is EXACT and constant -- fitting
-it directly uses every valid flow vector in the ROI (weighted by how
-well it's explained by one global radial-expansion trend), instead of
-computing a local spatial derivative pixel-by-pixel and taking the
-median, which is dominated by whichever response is most common pixel-
-by-pixel rather than by the actual expansion signal. This matters
-specifically once the target fills the frame: the interior of a
-uniform, texture-poor surface gives near-zero/noisy per-pixel flow (the
-classic aperture problem), so a median across mostly-interior pixels
-washes the real signal out even though the textured rim still carries
-it; the affine fit instead lets that rim data pull the whole-field
-trend toward the correct value.
+it directly uses every valid flow vector in the ROI, instead of computing
+a local spatial derivative pixel-by-pixel and taking the median, which is
+dominated by whichever response is most common pixel-by-pixel rather than
+by the actual expansion signal. This matters specifically once the
+target fills the frame: the interior of a uniform, texture-poor surface
+gives near-zero/noisy per-pixel flow (the classic aperture problem).
+
+The fit is WEIGHTED by each pixel's reference-frame image-gradient
+magnitude (see _gradient_magnitude / _weighted_affine_least_squares), so
+a texture-poor patch is down-weighted directly rather than relying on a
+textured rim elsewhere in the ROI to out-vote it. That reliance was a real
+gap: once TargetEstimate.fov_saturated (the target's true size exceeds
+the camera's FOV -- see state.py), the rim is by definition outside the
+frame, and only the interior remains to fit against. A separate,
+close-range Farneback parameter set (winsize_close/levels_close/
+pyr_scale_close) engages on the same fov_saturated signal, since that
+regime also has the descent's largest per-frame pixel displacement.
+
+The fit additionally reports fit_quality (a weighted R^2 -- see
+_fit_divergence_affine), so a degraded-but-still-numeric divergence
+estimate can be told apart from a well-supported one. As of this writing
+it is DIAGNOSIS-ONLY: logged (diagnostics_writer.py's flow_fit_quality
+column) but not yet read by control_law.py or mission_routine.py.
 
 Debug path:
 
@@ -59,6 +71,29 @@ class OpticalFlowEstimator:
 		iterations: int = 3,
 		poly_n: int = 5,
 		poly_sigma: float = 1.2,
+		# --- Close-range Farneback parameters (target.fov_saturated) ---
+		# The far-field params above are tuned for a small-to-moderate target:
+		# modest per-frame pixel displacement, a compact ROI. Once
+		# fov_saturated (the target's true size exceeds the camera's FOV --
+		# see state.py's TargetEstimate docstring), the ROI is pinned at the
+		# full frame, physical closing rate is at its highest of the whole
+		# descent (larger per-frame pixel displacement), and there is no
+		# longer a textured rim to anchor the divergence fit (see this
+		# module's docstring) -- only whatever texture is in the interior.
+		# A larger winsize averages over more of that texture per estimate
+		# (more robust to a locally-flat patch, at the cost of spatial
+		# resolution we don't need once the ROI is a single expanding
+		# surface); more levels + a larger pyr_scale (finer-grained pyramid
+		# steps) track the larger displacement more robustly. Binary switch
+		# on fov_saturated rather than a continuous ramp on area_fraction:
+		# it's already a validated, zero-extra-cost signal (see the
+		# fov_saturation_vs_divergence.png diagnostic), and this regime is
+		# entered once, close to touchdown, not revisited repeatedly --
+		# revisit as a smooth ramp only if the step itself turns out to
+		# leave a visible mark on the divergence trace.
+		winsize_close: int = 35,
+		levels_close: int = 4,
+		pyr_scale_close: float = 0.6,
 		require_target_roi: bool = True,
 		roi_margin_fraction: float = 0.05,
 		min_roi_size_px: int = 32,
@@ -77,6 +112,10 @@ class OpticalFlowEstimator:
 		self._iterations = iterations
 		self._poly_n = poly_n
 		self._poly_sigma = poly_sigma
+
+		self._winsize_close = int(winsize_close)
+		self._levels_close = int(levels_close)
+		self._pyr_scale_close = float(pyr_scale_close)
 
 		self._require_target_roi = bool(require_target_roi)
 		self._roi_margin_fraction = float(roi_margin_fraction)
@@ -189,13 +228,21 @@ class OpticalFlowEstimator:
 
 			return result
 
+		# Close-range regime: see the constructor's winsize_close/levels_close/
+		# pyr_scale_close docstring. Read directly off the TargetEstimate
+		# already passed in -- no new signal needed.
+		close_range = bool(target is not None and getattr(target, "fov_saturated", False))
+		pyr_scale = self._pyr_scale_close if close_range else self._pyr_scale
+		levels = self._levels_close if close_range else self._levels
+		winsize = self._winsize_close if close_range else self._winsize
+
 		flow_px_per_frame = cv2.calcOpticalFlowFarneback(
 			prev_roi,
 			gray_roi,
 			None,
-			self._pyr_scale,
-			self._levels,
-			self._winsize,
+			pyr_scale,
+			levels,
+			winsize,
 			self._iterations,
 			self._poly_n,
 			self._poly_sigma,
@@ -213,6 +260,15 @@ class OpticalFlowEstimator:
 		mean_flow_x_norm = mean_flow_x / max(0.5 * image_width, 1.0)
 		mean_flow_y_norm = mean_flow_y / max(0.5 * image_height, 1.0)
 
+		# Reference-frame gradient magnitude, used to weight the affine
+		# divergence fit toward pixels with real local structure (see
+		# _fit_divergence_affine / this module's docstring): a flat,
+		# texture-poor patch gives near-random Farneback output and should
+		# be trusted less than a high-gradient patch, not averaged in
+		# equally. Computed on prev_roi (the frame flow vectors are anchored
+		# to) so it costs one Sobel pass, not two.
+		gradient_magnitude = self._gradient_magnitude(prev_roi)
+
 		# Debug-only: a per-pixel finite-difference field, useful to *look at*
 		# (e.g. to see whether signal is rim-only vs whole-field). The
 		# production scalar below is fit independently and more robustly --
@@ -223,10 +279,11 @@ class OpticalFlowEstimator:
 			image_height=image_height,
 		)
 
-		raw_divergence, n_inliers = self._fit_divergence_affine(
+		raw_divergence, n_inliers, fit_quality = self._fit_divergence_affine(
 			flow_px_s=flow_px_s,
 			image_width=image_width,
 			image_height=image_height,
+			gradient_magnitude=gradient_magnitude,
 		)
 		filtered_divergence = self._filter_divergence(raw_divergence)
 
@@ -239,6 +296,7 @@ class OpticalFlowEstimator:
 			mean_flow_y_norm=float(mean_flow_y_norm),
 			divergence=float(filtered_divergence),
 			raw_divergence=float(raw_divergence),
+			fit_quality=float(fit_quality),
 			roi_x0=int(x0),
 			roi_y0=int(y0),
 			roi_x1=int(x1),
@@ -268,14 +326,15 @@ class OpticalFlowEstimator:
 		flow_px_s: np.ndarray,
 		image_width: int,
 		image_height: int,
-	) -> Tuple[float, int]:
+		gradient_magnitude: Optional[np.ndarray] = None,
+	) -> Tuple[float, int, float]:
 		"""
 		Divergence via a global affine fit, not a per-pixel median.
 
 		Model (normalized image units/s, same scale as mean_flow_*_norm):
 		    u(x, y) = a0 + a1*x + a2*y
 		    v(x, y) = b0 + b1*x + b2*y
-		Solved independently by OLS (shared design matrix). For any affine
+		Solved by WEIGHTED OLS (shared design matrix). For any affine
 		field, du/dx + dv/dy = a1 + b2 exactly and is constant everywhere, so
 		this is the exact divergence of the best-fit field -- using ALL valid
 		flow vectors in the ROI, not a local difference at each pixel.
@@ -284,17 +343,42 @@ class OpticalFlowEstimator:
 		a constant only moves a0/b0), so ROI-local pixel coordinates are used
 		directly -- no need to know the ROI's offset within the full image.
 
-		One robust trim-and-refit pass keeps the best `affine_inlier_quantile`
-		fraction by residual and refits, so a cluster of unreliable vectors
-		(e.g. a textureless patch returning near-random flow) can't dominate
-		the fit the way it would dominate a per-pixel median.
+		WEIGHTING: each pixel is weighted by its reference-frame image
+		gradient magnitude (see _gradient_magnitude), not trusted equally.
+		This is the direct fix for the aperture-problem failure mode this
+		module's docstring already describes for a texture-poor interior --
+		previously handled only by hoping the textured rim was in-frame to
+		out-vote it in an unweighted fit. Once fov_saturated removes the rim
+		entirely (see optical_flow_estimator's winsize_close docstring),
+		weighting is what keeps a locally-flat patch of the interior from
+		being averaged in on equal footing with a high-gradient patch,
+		instead of relying on the rim being there to swamp it. Falls back to
+		uniform weighting if no gradient map is supplied.
+
+		One robust trim-and-refit pass on top keeps the best
+		`affine_inlier_quantile` fraction by (weighted) residual and refits --
+		a complementary, different heuristic from the gradient weighting
+		above: this catches vectors that mismatch the fitted model despite
+		reasonable local texture (e.g. a genuine outlier), not vectors that
+		were never trustworthy to begin with.
 
 		Falls back to the old field-median method if too few finite flow
-		vectors remain (degenerate ROI) -- a safety net, not the normal path.
+		vectors remain (degenerate ROI) -- a safety net, not the normal path;
+		fit_quality is reported as 0.0 there since no fit was actually made.
+
+		Returns (divergence, n_points_used, fit_quality). fit_quality is a
+		weighted R^2 over the combined u,v residuals: 1.0 means the affine
+		model explains the (weighted) flow variance essentially exactly, 0.0
+		means it does no better than reporting the weighted mean flow
+		everywhere, and negative means worse than that -- a plausible-looking
+		divergence number can still carry a low/negative fit_quality when
+		the ROI has become mostly noise, which is exactly the case this was
+		added to catch (see this file's usage note: diagnosis-only for now,
+		not yet read by control_law.py or mission_routine.py).
 		"""
 		roi_height, roi_width = flow_px_s.shape[:2]
 		if roi_width < 3 or roi_height < 3:
-			return 0.0, 0
+			return 0.0, 0, 0.0
 
 		u = flow_px_s[:, :, 0] / max(0.5 * image_width, 1.0)
 		v = flow_px_s[:, :, 1] / max(0.5 * image_height, 1.0)
@@ -308,40 +392,96 @@ class OpticalFlowEstimator:
 		u_flat = u.ravel().astype(np.float64)
 		v_flat = v.ravel().astype(np.float64)
 
-		finite = np.isfinite(u_flat) & np.isfinite(v_flat)
+		if gradient_magnitude is not None and gradient_magnitude.shape == (roi_height, roi_width):
+			weight_flat = gradient_magnitude.ravel().astype(np.float64)
+		else:
+			weight_flat = np.ones_like(u_flat)
+
+		finite = np.isfinite(u_flat) & np.isfinite(v_flat) & np.isfinite(weight_flat)
 		n_finite = int(np.count_nonzero(finite))
 		if n_finite < self._min_points_for_affine_fit:
 			field = self._estimate_divergence_field(flow_px_s, image_width, image_height)
-			return self._scalar_from_divergence_field(field), n_finite
+			return self._scalar_from_divergence_field(field), n_finite, 0.0
 
-		x, y, u_flat, v_flat = x[finite], y[finite], u_flat[finite], v_flat[finite]
+		x, y, u_flat, v_flat, weight_flat = (
+			x[finite], y[finite], u_flat[finite], v_flat[finite], weight_flat[finite]
+		)
 		design = np.column_stack([np.ones_like(x), x, y])
 
-		coeffs, divergence = self._affine_least_squares(design, u_flat, v_flat)
+		coeffs, divergence, fit_quality = self._weighted_affine_least_squares(
+			design, u_flat, v_flat, weight_flat
+		)
 
 		residual = (u_flat - design @ coeffs[0]) ** 2 + (v_flat - design @ coeffs[1]) ** 2
 		threshold = np.quantile(residual, self._affine_inlier_quantile)
 		inliers = residual <= threshold
 
 		if np.count_nonzero(inliers) >= self._min_points_for_affine_fit:
-			_, divergence = self._affine_least_squares(
-				design[inliers], u_flat[inliers], v_flat[inliers]
+			_, divergence, fit_quality = self._weighted_affine_least_squares(
+				design[inliers], u_flat[inliers], v_flat[inliers], weight_flat[inliers]
 			)
 			n_used = int(np.count_nonzero(inliers))
 		else:
 			n_used = n_finite
 
-		return float(divergence), n_used
+		return float(divergence), n_used, float(fit_quality)
 
 	@staticmethod
-	def _affine_least_squares(
-		design: np.ndarray, u: np.ndarray, v: np.ndarray
-	) -> Tuple[Tuple[np.ndarray, np.ndarray], float]:
-		"""OLS-solve u, v against `design`=[1, x, y]; return (coeffs, a1+b2)."""
-		coeffs_u, *_ = np.linalg.lstsq(design, u, rcond=None)
-		coeffs_v, *_ = np.linalg.lstsq(design, v, rcond=None)
+	def _weighted_affine_least_squares(
+		design: np.ndarray, u: np.ndarray, v: np.ndarray, weight: np.ndarray
+	) -> Tuple[Tuple[np.ndarray, np.ndarray], float, float]:
+		"""Gradient-magnitude-weighted OLS via the standard sqrt(w) rescaling
+		(minimizing sum(w*(y-Xb)^2) is exactly OLS in sqrt(w)-rescaled
+		variables, so this stays a single cheap linear solve, not an
+		iterative reweighting scheme). Weight is normalized to a mean of 1
+		first so its absolute scale never changes lstsq's conditioning, only
+		the RELATIVE trust between pixels; an all-zero/degenerate weight map
+		falls back to uniform (equivalent to the old unweighted fit).
+
+		Also returns a weighted R^2 (see _fit_divergence_affine's docstring
+		for interpretation) as a fit-quality proxy, computed in the same
+		rescaled space so it stays consistent with what was actually
+		minimized.
+		"""
+		w = np.clip(weight, 0.0, None)
+		w_mean = float(np.mean(w)) if np.any(w > 0.0) else 0.0
+		if w_mean <= 1e-12:
+			w = np.ones_like(w)
+			w_mean = 1.0
+		w = w / w_mean
+
+		sw = np.sqrt(w)
+		design_w = design * sw[:, None]
+		u_w = u * sw
+		v_w = v * sw
+
+		coeffs_u, *_ = np.linalg.lstsq(design_w, u_w, rcond=None)
+		coeffs_v, *_ = np.linalg.lstsq(design_w, v_w, rcond=None)
 		divergence = float(coeffs_u[1] + coeffs_v[2])
-		return (coeffs_u, coeffs_v), divergence
+
+		resid_u = u_w - design_w @ coeffs_u
+		resid_v = v_w - design_w @ coeffs_v
+		ss_res = float(np.sum(resid_u ** 2) + np.sum(resid_v ** 2))
+
+		u_mean_w = float(np.sum(w * u) / np.sum(w))
+		v_mean_w = float(np.sum(w * v) / np.sum(w))
+		ss_tot = float(np.sum(w * (u - u_mean_w) ** 2) + np.sum(w * (v - v_mean_w) ** 2))
+
+		fit_quality = (1.0 - ss_res / ss_tot) if ss_tot > 1e-12 else 0.0
+
+		return (coeffs_u, coeffs_v), divergence, float(fit_quality)
+
+	@staticmethod
+	def _gradient_magnitude(gray_roi: np.ndarray) -> np.ndarray:
+		"""Sobel gradient magnitude of a grayscale ROI -- the structural-
+		reliability weight for the affine divergence fit (see
+		_fit_divergence_affine). A flat/texture-poor patch has near-zero
+		gradient here and is the classic aperture-problem case: Farneback's
+		own polynomial-expansion estimate is least trustworthy exactly
+		where this is smallest."""
+		gx = cv2.Sobel(gray_roi, cv2.CV_32F, 1, 0, ksize=3)
+		gy = cv2.Sobel(gray_roi, cv2.CV_32F, 0, 1, ksize=3)
+		return cv2.magnitude(gx, gy)
 
 	def reset(self):
 		self._prev_gray = None

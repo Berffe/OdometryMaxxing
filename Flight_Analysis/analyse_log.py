@@ -23,6 +23,8 @@ Default generated files:
 	- target_detection_summary.png
 	- lateral_control.png
 	- vertical_control.png
+	- gain_schedule.png
+	- divergence_consistency.png          vision divergence vs. kinematic ground truth
 	- platform_motion_frequency.png       when platform_z_m is available
 	- drone_platform_position_xyz.png      drone and platform positions on x/y/z
 	- closing_rate_spectrum.png           when relative_vz_m_s or vehicle_vz_m_s is available
@@ -68,6 +70,36 @@ def read_log(csv_path: str | Path) -> pd.DataFrame:
 	if df.empty:
 		raise ValueError(f"CSV file is empty: {csv_path}")
 	return df
+
+
+def truncate_to_duration(df: pd.DataFrame, max_duration_sec: Optional[float], csv_path: str | Path) -> pd.DataFrame:
+	"""Drop rows beyond max_duration_sec of WALL-clock run time (t_sec), e.g.
+	after accidentally leaving the sim running. Deliberately keys on t_sec
+	specifically -- the one column every log has that is always wall-clock
+	(see diagnostics_writer.py) -- not on --time-base's chosen column, which
+	may be sim-time and run at a different rate under the sim's real-time
+	factor (see mission_routine.py's CLOCK note)."""
+	if max_duration_sec is None:
+		return df
+	if "t_sec" not in df.columns:
+		print(f"  --max-duration-sec ignored for {csv_path}: no t_sec column in this log.")
+		return df
+
+	t_sec = pd.to_numeric(df["t_sec"], errors="coerce")
+	keep = t_sec <= float(max_duration_sec)
+	n_dropped = int((~keep).sum())
+	if n_dropped == 0:
+		return df
+
+	truncated = df.loc[keep].reset_index(drop=True)
+	if truncated.empty:
+		raise ValueError(
+			f"--max-duration-sec={max_duration_sec:g} leaves no rows for {csv_path} "
+			f"(t_sec starts at {t_sec.min():g}). Check the value or drop the flag for this log."
+		)
+	print(f"  --max-duration-sec={max_duration_sec:g}: dropped {n_dropped}/{len(df)} rows "
+	      f"beyond t_sec={max_duration_sec:g} (log ran to t_sec={t_sec.max():g}).")
+	return truncated
 
 
 def numeric_column(df: pd.DataFrame, name: str, default: float = np.nan) -> np.ndarray:
@@ -397,7 +429,7 @@ def _append_mission_summary(df: pd.DataFrame, t: np.ndarray, lines: list):
 	if peak is not None:
 		lines.append(f"Probe peak platform accel: {peak:.4f} m/s^2")
 	if k_min is not None and k_explore is not None:
-		lines.append(f"k_min (Herisse floor): {k_min:.4f}   k_explore (de Croon ceiling @ h0): {k_explore:.4f}")
+		lines.append(f"k_min (Herisse floor): {k_min:.4f}   k_explore (hand-tuned initial gain): {k_explore:.4f}")
 	if h_crit is not None:
 		lines.append(f"h_crit (gain hits floor): {h_crit:.4f} m")
 	if feasible is not None:
@@ -431,6 +463,22 @@ def _append_mission_summary(df: pd.DataFrame, t: np.ndarray, lines: list):
 			lines.append(
 				"  (large/growing error here means the gain is scheduled at the "
 				"wrong height -- use a more pessimistic descent or a live estimator)"
+			)
+
+	consistency = _divergence_consistency(df, t)
+	if consistency is not None:
+		if "onset_t" in consistency:
+			lines.append(
+				f"Divergence/kinematics decorrelation: SUSTAINED mismatch from "
+				f"t={consistency['onset_t']:.1f}s (height={consistency['onset_height']:.2f} m) "
+				f"through end of log -- flow_divergence stops reflecting the true closing "
+				f"rate there (see divergence_consistency.png). This is a SENSING issue, "
+				f"not a gain issue."
+			)
+		else:
+			lines.append(
+				"Divergence/kinematics decorrelation: none detected -- flow_divergence "
+				"tracked relative_vz/|relative_z| to the end of the log."
 			)
 
 
@@ -494,11 +542,13 @@ def plot_target_detection_summary(df: pd.DataFrame, t: np.ndarray, output_dir: s
 
 
 def plot_lateral_control(df: pd.DataFrame, t: np.ndarray, output_dir: str):
+	have_flow = any(c in df.columns for c in ["flow_mean_x_norm_s", "flow_mean_y_norm_s"])
 	if not any(c in df.columns for c in ["target_offset_x", "target_offset_y", "command_roll_rad", "command_pitch_rad"]):
 		print("Skipping lateral control plot. Missing lateral target/command columns.")
 		return
 
-	fig, axes = plt.subplots(2, 1, figsize=(11, 6.5), sharex=True)
+	n_rows = 3 if have_flow else 2
+	fig, axes = plt.subplots(n_rows, 1, figsize=(11, 6.5 + (2.2 if have_flow else 0)), sharex=True)
 	fig.suptitle("Lateral visual control")
 
 	shade_mission_phases(axes[0], df, t)
@@ -507,20 +557,40 @@ def plot_lateral_control(df: pd.DataFrame, t: np.ndarray, output_dir: str):
 	if "target_offset_y" in df.columns:
 		axes[0].plot(t, numeric_column(df, "target_offset_y"), label="target_offset_y")
 	axes[0].axhline(0.0, linestyle="--", linewidth=1)
-	axes[0].set_ylabel("image offset [-]")
+	axes[0].set_ylabel("image offset [-]\n(P-term input)")
 	axes[0].grid(True)
 	axes[0].legend(loc="best")
 
+	flow_axis = 1 if have_flow else None
+	if have_flow:
+		ax = axes[1]
+		shade_mission_phases(ax, df, t)
+		if "flow_mean_x_norm_s" in df.columns:
+			ax.plot(t, numeric_column(df, "flow_mean_x_norm_s"), label="flow_mean_x_norm", color="tab:green")
+		if "flow_mean_y_norm_s" in df.columns:
+			ax.plot(t, numeric_column(df, "flow_mean_y_norm_s"), label="flow_mean_y_norm", color="tab:red")
+		ax.axhline(0.0, linestyle="--", linewidth=1)
+		# Same [-1,1]-per-frame-half-width/height normalization as offset_x/y
+		# above (see optical_flow.py / target_acquisition.py) -- units here are
+		# that same normalized scale per second, i.e. directly comparable in
+		# SPACE to the offset panel, differing only by the /s (this is the
+		# D-term input; compare its noise/lag directly against the P-term
+		# panel above when investigating derivative-term behavior).
+		ax.set_ylabel("normalized flow [1/s]\n(D-term input)")
+		ax.grid(True)
+		ax.legend(loc="best")
+
+	cmd_axis = axes[-1]
 	if "command_roll_rad" in df.columns:
-		axes[1].plot(t, numeric_column(df, "command_roll_rad"), label="roll command")
+		cmd_axis.plot(t, numeric_column(df, "command_roll_rad"), label="roll command")
 	if "command_pitch_rad" in df.columns:
-		axes[1].plot(t, numeric_column(df, "command_pitch_rad"), label="pitch command")
-	shade_mission_phases(axes[1], df, t)
-	axes[1].axhline(0.0, linestyle="--", linewidth=1)
-	axes[1].set_ylabel("command [rad]")
-	axes[1].set_xlabel("time [s]")
-	axes[1].grid(True)
-	axes[1].legend(loc="best")
+		cmd_axis.plot(t, numeric_column(df, "command_pitch_rad"), label="pitch command")
+	shade_mission_phases(cmd_axis, df, t)
+	cmd_axis.axhline(0.0, linestyle="--", linewidth=1)
+	cmd_axis.set_ylabel("command [rad]")
+	cmd_axis.set_xlabel("time [s]")
+	cmd_axis.grid(True)
+	cmd_axis.legend(loc="best")
 
 	save_current_figure(output_dir, "lateral_control.png")
 
@@ -531,15 +601,20 @@ def plot_vertical_control(df: pd.DataFrame, t: np.ndarray, output_dir: str, dive
 		print("Skipping vertical control plot. Missing vertical/divergence/command columns.")
 		return
 
-	fig, axes = plt.subplots(3, 1, figsize=(11, 8), sharex=True)
+	have_integral = "command_thrust_integral" in df.columns and np.any(
+		np.isfinite(numeric_column(df, "command_thrust_integral"))
+	)
+	n_rows = 4 if have_integral else 3
+	fig, axes = plt.subplots(n_rows, 1, figsize=(11, 8 + (2 if have_integral else 0)), sharex=True)
 	fig.suptitle("Vertical / divergence control")
 
 	if "flow_divergence_1_s" in df.columns:
 		axes[0].plot(t, numeric_column(df, "flow_divergence_1_s"), label="filtered divergence")
 	if "flow_raw_divergence_1_s" in df.columns:
 		axes[0].plot(t, numeric_column(df, "flow_raw_divergence_1_s"), label="raw divergence", alpha=0.75)
-	# Prefer the actual per-tick commanded setpoint (probe D*=0 -> descent D*),
-	# falling back to the static CLI value for old logs.
+	# Prefer the actual per-tick commanded setpoint (probe D*=0 -> descent D*,
+	# possibly ramping -- see mission_divergence_setpoint_1_s), falling back to
+	# the static CLI value for old logs.
 	if "mission_divergence_setpoint_1_s" in df.columns and np.any(
 		np.isfinite(numeric_column(df, "mission_divergence_setpoint_1_s"))
 	):
@@ -573,6 +648,7 @@ def plot_vertical_control(df: pd.DataFrame, t: np.ndarray, output_dir: str, dive
 		right_labels.append(line.get_label())
 		ax_alt.set_ylabel("relative z [m]")
 
+	shade_mission_phases(axes[1], df, t)
 	axes[1].axhline(0.0, linestyle="--", linewidth=1)
 	axes[1].set_ylabel("velocity [m/s]")
 	axes[1].grid(True)
@@ -582,10 +658,31 @@ def plot_vertical_control(df: pd.DataFrame, t: np.ndarray, output_dir: str, dive
 	if "command_thrust" in df.columns:
 		axes[2].plot(t, numeric_column(df, "command_thrust"), label="thrust command")
 		axes[2].axhline(0.73, linestyle="--", linewidth=1, label="hover ref 0.73")
+	shade_mission_phases(axes[2], df, t)
 	axes[2].set_ylabel("thrust [-]")
-	axes[2].set_xlabel("time [s]")
 	axes[2].grid(True)
 	axes[2].legend(loc="best")
+
+	if have_integral:
+		integral = numeric_column(df, "command_thrust_integral")
+		axes[3].plot(t, integral, color="tab:purple", label="divergence integral (raw)")
+		shade_mission_phases(axes[3], df, t)
+		axes[3].axhline(0.0, linestyle="--", linewidth=1, color="0.4")
+		finite = integral[np.isfinite(integral)]
+		if len(finite):
+			# Flag likely clamp saturation: sustained runs pinned at the series'
+			# own extreme, which is what windup against divergence_integral_limit
+			# looks like from the outside (the limit itself is not logged).
+			hi, lo = float(np.nanmax(finite)), float(np.nanmin(finite))
+			pinned_hi = np.isclose(integral, hi, atol=max(1e-3, 0.01 * abs(hi)))
+			pinned_lo = np.isclose(integral, lo, atol=max(1e-3, 0.01 * abs(lo)))
+			frac_pinned = float(np.mean(pinned_hi | pinned_lo))
+			note = ""
+			if frac_pinned > 0.05 and (hi - lo) > 1e-6:
+				note = f"  ({frac_pinned*100:.0f}% of samples pinned near an extreme -- possible clamp saturation)"
+			axes[3].set_title(f"range=[{lo:+.3f}, {hi:+.3f}]{note}", fontsize=9)
+		axes[3].set_ylabel("thrust_integral_gain_const *\nintegral(divergence error)")
+	axes[-1].set_xlabel("time [s]")
 
 	save_current_figure(output_dir, "vertical_control.png")
 
@@ -730,6 +827,218 @@ def plot_closing_rate_spectrum(
 	save_current_figure(output_dir, "closing_rate_spectrum.png")
 
 
+def _rolling_smooth(t: np.ndarray, y: np.ndarray, window_sec: float) -> np.ndarray:
+	"""Centered rolling median over ~window_sec of samples (sample count
+	derived from the median sample spacing, so this doesn't assume a
+	uniform dt). Used to separate a SUSTAINED trend from per-sample
+	optical-flow/velocity noise -- median rather than mean so a handful of
+	spiky outliers (common in relative_vz near the ground, see below)
+	don't drag the smoothed curve toward them."""
+	dt = median_positive_dt(t)
+	if not np.isfinite(dt) or dt <= 1e-9:
+		return y.copy()
+	n = max(1, int(round(window_sec / dt)))
+	if n <= 1:
+		return y.copy()
+	return pd.Series(y).rolling(window=n, center=True, min_periods=max(1, n // 3)).median().to_numpy()
+
+
+def _divergence_consistency(df: pd.DataFrame, t: np.ndarray, min_height_m: float = 0.05) -> Optional[dict]:
+	"""Compare the VISION-based divergence estimate against a 'physical'
+	proxy computed purely from ground-truth kinematics:
+
+		proxy = relative_vz / |relative_z|        (closing_rate / height)
+
+	i.e. the same quantity flow_divergence is meant to estimate from optical
+	flow, computed instead from the logged ground truth. This is a sanity
+	check on the SENSING pipeline, independent of any control-law gain: if
+	flow_divergence and the proxy disagree, the controller is being fed a
+	number that no longer reflects reality, and no gain retune fixes that --
+	only fixing (or working around) the sensing does.
+
+	Scans for a SUSTAINED mismatch by walking backward from the end of the
+	series: if the smoothed |error| is above threshold at the last sample
+	and stays above threshold in an unbroken run back to some onset point,
+	that onset is reported. This deliberately ignores an isolated mid-descent
+	noise spike that recovers -- it is built to catch exactly the terminal,
+	does-not-recover-before-touchdown breakdown (close-range optical-flow
+	degradation stacking with the gain schedule's own k_min-authority loss
+	right at the end of DESCEND), not every noisy sample.
+
+	Returns None if the required columns/data aren't present. Otherwise a
+	dict with the raw/smoothed series (for plotting) and, if found,
+	onset_t / onset_height for the start of the trailing mismatch run.
+	"""
+	required = ["flow_divergence_1_s", "relative_vz_m_s", "relative_z_m"]
+	if not all(c in df.columns for c in required):
+		return None
+
+	div = numeric_column(df, "flow_divergence_1_s")
+	vz = numeric_column(df, "relative_vz_m_s")
+	relz = numeric_column(df, "relative_z_m")
+	if not (np.any(np.isfinite(div)) and np.any(np.isfinite(vz)) and np.any(np.isfinite(relz))):
+		return None
+
+	height = np.abs(relz)
+	# Floor the denominator, not the numerator: right at touchdown height ->
+	# 0 and the true ratio is genuinely unbounded, which is exactly the
+	# regime this is meant to expose -- clip only hard enough to keep the
+	# proxy finite/plottable, not to hide the blow-up.
+	proxy = vz / np.clip(height, min_height_m, None)
+
+	div_s = _rolling_smooth(t, div, window_sec=0.6)
+	proxy_s = _rolling_smooth(t, proxy, window_sec=0.6)
+	err_s = np.abs(div_s - proxy_s)
+
+	# Flag threshold: the larger of a fixed floor (so a quiet near-zero hold
+	# doesn't trip on tiny absolute noise) and a fraction of the proxy's own
+	# typical scale over the series (so a fast, large-divergence descent
+	# gets a proportionally larger tolerance).
+	finite_proxy = proxy_s[np.isfinite(proxy_s)]
+	scale = float(np.nanmedian(np.abs(finite_proxy))) if len(finite_proxy) else 0.0
+	threshold = max(0.15, 0.75 * scale)
+
+	# Both the merge-gap tolerance and the minimum reportable run length are
+	# tied to the smoothing window above (not separate magic numbers): a
+	# "sustained" mismatch shouldn't be trusted as sustained if it's shorter
+	# than the window used to smooth it, and a gap tolerant enough to bridge
+	# a single flicker but not two genuinely separate incidents should be a
+	# fraction of that same window.
+	smoothing_window_sec = 0.6
+	merge_gap_sec = 0.5 * smoothing_window_sec
+	min_run_sec = smoothing_window_sec
+
+	onset_idx = None
+	finite = np.isfinite(err_s) & np.isfinite(height)
+	idxs = np.where(finite)[0]
+	if len(idxs) >= 5:
+		bad = err_s[idxs] > threshold
+
+		# Group into contiguous "bad" runs, then merge runs separated by a
+		# short time gap -- a single sample of accidental agreement (e.g.
+		# right at touchdown, when a disarmed/near-zero vz and a near-zero
+		# divergence both trivially settle near 0 together for a moment)
+		# should not fragment one real sustained breakdown into pieces that
+		# each look too short to flag.
+		runs = []
+		i = 0
+		n = len(idxs)
+		while i < n:
+			if bad[i]:
+				j = i
+				while j + 1 < n and bad[j + 1]:
+					j += 1
+				runs.append([i, j])
+				i = j + 1
+			else:
+				i += 1
+
+		merged = []
+		for r in runs:
+			if merged and (t[idxs[r[0]]] - t[idxs[merged[-1][1]]]) <= merge_gap_sec:
+				merged[-1][1] = r[1]
+			else:
+				merged.append(list(r))
+
+		# Only the LAST merged run can support a "mismatch persists through
+		# the end of the log" claim -- if the tail of the data is back
+		# within tolerance, there is nothing sustained to report even if an
+		# earlier run was long. Require it to reach the final finite sample
+		# and to be longer than min_run_sec, so a single blip surviving the
+		# merge doesn't get reported as an onset.
+		if merged:
+			last = merged[-1]
+			reaches_end = last[1] == n - 1
+			duration = t[idxs[last[1]]] - t[idxs[last[0]]]
+			if reaches_end and duration >= min_run_sec:
+				onset_idx = idxs[last[0]]
+
+	result = {
+		"height": height,
+		"proxy": proxy,
+		"div_smoothed": div_s,
+		"proxy_smoothed": proxy_s,
+		"err_smoothed": err_s,
+		"threshold": threshold,
+	}
+	if onset_idx is not None:
+		result["onset_t"] = float(t[onset_idx])
+		result["onset_height"] = float(height[onset_idx])
+	return result
+
+
+def plot_divergence_consistency(df: pd.DataFrame, t: np.ndarray, output_dir: str | Path):
+	"""Vision-based divergence vs. a ground-truth kinematic proxy
+	(relative_vz / |relative_z|) across the whole log, with DESCEND
+	highlighted. Isolates the SENSING half of the terminal-approach story
+	from the gain-schedule half (mission_routine.py's k_min-authority-loss
+	note covers the latter): flow_divergence undershooting D* for most of
+	DESCEND is the expected, documented gain-schedule gap, but if it instead
+	COLLAPSES toward zero/negative while the true closing rate (relative_vz)
+	is climbing hard right before touchdown, that's the vision pipeline
+	itself decorrelating from reality, not a control response -- retuning
+	gains will not fix it."""
+	consistency = _divergence_consistency(df, t)
+	if consistency is None:
+		print("Skipping divergence consistency plot. Missing flow_divergence_1_s / "
+		      "relative_vz_m_s / relative_z_m, or no finite data.")
+		return
+
+	div = numeric_column(df, "flow_divergence_1_s")
+	dstar = numeric_column(df, "mission_divergence_setpoint_1_s") if "mission_divergence_setpoint_1_s" in df.columns else None
+
+	fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
+	fig.suptitle("Divergence sensing consistency: vision estimate vs. kinematic ground truth")
+
+	ax = axes[0]
+	shade_mission_phases(ax, df, t)
+	ax.plot(t, div, color="tab:blue", alpha=0.30, linewidth=1, label="flow_divergence")
+	ax.plot(t, consistency["div_smoothed"], color="tab:blue", linewidth=1.8, label="flow_divergence (smoothed)")
+	ax.plot(t, consistency["proxy"], color="tab:orange", alpha=0.30, linewidth=1,
+	        label="proxy = relative_vz / |relative_z|")
+	ax.plot(t, consistency["proxy_smoothed"], color="tab:orange", linewidth=1.8, label="proxy (smoothed)")
+	if dstar is not None and np.any(np.isfinite(dstar)):
+		ax.plot(t, dstar, linestyle=":", linewidth=1.4, color="0.3", label="commanded D*")
+	ax.axhline(0.0, linestyle="--", linewidth=0.8, color="0.5")
+	if "onset_t" in consistency:
+		ax.axvline(consistency["onset_t"], color="tab:red", linestyle="--", linewidth=1.3)
+	ax.set_ylabel("divergence [1/s]")
+	ax.grid(True, alpha=0.4)
+	ax.legend(loc="best", fontsize=8)
+
+	ax = axes[1]
+	shade_mission_phases(ax, df, t)
+	ax.plot(t, consistency["err_smoothed"], color="tab:red", linewidth=1.6,
+	        label="|flow_divergence - proxy| (smoothed)")
+	ax.axhline(consistency["threshold"], linestyle=":", linewidth=1.3, color="0.3",
+	           label=f"flag threshold {consistency['threshold']:.2f}")
+	if "onset_t" in consistency:
+		ax.axvline(consistency["onset_t"], color="tab:red", linestyle="--", linewidth=1.3)
+		ax.annotate(
+			f"sustained mismatch from\nt={consistency['onset_t']:.1f}s, "
+			f"h={consistency['onset_height']:.2f}m",
+			xy=(consistency["onset_t"], consistency["threshold"]),
+			xytext=(8, 10), textcoords="offset points", fontsize=8, color="tab:red",
+		)
+	ax.set_ylabel("|error| [1/s]")
+	ax.grid(True, alpha=0.4)
+	ax.legend(loc="best", fontsize=8)
+
+	ax = axes[2]
+	shade_mission_phases(ax, df, t)
+	ax.plot(t, consistency["height"], color="tab:purple", linewidth=1.6,
+	        label="|relative_z| (height above platform)")
+	if "onset_t" in consistency:
+		ax.axvline(consistency["onset_t"], color="tab:red", linestyle="--", linewidth=1.3)
+		ax.axhline(consistency["onset_height"], color="tab:red", linestyle=":", linewidth=1.1)
+	ax.set_ylabel("height [m]")
+	ax.set_xlabel("time [s]")
+	ax.grid(True, alpha=0.4)
+	ax.legend(loc="best", fontsize=8)
+
+	save_current_figure(output_dir, "divergence_consistency.png")
+
+
 # ---------------------------------------------------------------------------
 # Optional full/detail plots
 # ---------------------------------------------------------------------------
@@ -870,7 +1179,7 @@ def plot_gain_schedule(df: pd.DataFrame, t: np.ndarray, output_dir: str):
 	between k_explore (top) and k_min (floor), and the lateral scale should be
 	the same curve normalized to [k_min/k_explore, 1].
 	"""
-	have = [c for c in ("mission_thrust_gain_k", "mission_lateral_gain_scale") if c in df.columns]
+	have = [c for c in ("mission_thrust_gain_k", "mission_lateral_p_scale", "mission_lateral_d_scale") if c in df.columns]
 	if not have:
 		print("Skipping gain schedule plot. No mission_* gain columns (old log?).")
 		return
@@ -896,18 +1205,25 @@ def plot_gain_schedule(df: pd.DataFrame, t: np.ndarray, output_dir: str):
 	ax.grid(True)
 	ax.legend(loc="best", fontsize=8)
 
-	# --- lateral scale (should be k(t)/k_explore) ---
+	# --- lateral P/D scales (INDEPENDENT since the CENTER-phase P/D-split fix;
+	# during DESCEND both track k(t)/k_explore identically -- see mission_
+	# routine.py's _do_descend, so they overlap there; during CENTER they
+	# differ, reflecting the two different historical scale factors being
+	# reversed -- see CENTER_LATERAL_P_SCALE/CENTER_LATERAL_D_SCALE) ---
 	ax = axes[1]
 	shade_mission_phases(ax, df, t)
-	if "mission_lateral_gain_scale" in df.columns:
-		ax.plot(t, numeric_column(df, "mission_lateral_gain_scale"), label="lateral gain scale", linewidth=1.8)
-	# overlay normalized thrust gain as a cross-check that both ride one ramp
+	if "mission_lateral_p_scale" in df.columns:
+		ax.plot(t, numeric_column(df, "mission_lateral_p_scale"), label="lateral P scale", linewidth=1.8)
+	if "mission_lateral_d_scale" in df.columns:
+		ax.plot(t, numeric_column(df, "mission_lateral_d_scale"), label="lateral D scale", linewidth=1.4, linestyle="--")
+	# overlay normalized thrust gain as a cross-check that DESCEND's lateral
+	# scales ride the same ramp as thrust (should overlap P/D there)
 	if {"mission_thrust_gain_k", "mission_k_explore"}.issubset(df.columns):
 		k = numeric_column(df, "mission_thrust_gain_k")
 		ke = numeric_column(df, "mission_k_explore")
 		with np.errstate(divide="ignore", invalid="ignore"):
 			norm = np.where(ke > 1e-9, k / ke, np.nan)
-		ax.plot(t, norm, linestyle="--", alpha=0.7, label="k(t)/k_explore (cross-check)")
+		ax.plot(t, norm, linestyle=":", alpha=0.6, label="k(t)/k_explore (cross-check)")
 	ax.set_ylabel("lateral scale [-]")
 	ax.set_xlabel("time [s]")
 	ax.grid(True)
@@ -1048,6 +1364,7 @@ def make_default_plots(df: pd.DataFrame, t: np.ndarray, output_dir: str | Path, 
 	plot_lateral_control(df, t, output_dir)
 	plot_vertical_control(df, t, output_dir, divergence_setpoint=args.divergence_setpoint)
 	plot_gain_schedule(df, t, output_dir)
+	plot_divergence_consistency(df, t, output_dir)
 	plot_height_prediction(df, t, output_dir)
 	plot_platform_motion_frequency(df, t, output_dir, expected_frequency_hz=args.platform_frequency_hz)
 	plot_drone_platform_position_xyz(df, t, output_dir)
@@ -1182,6 +1499,17 @@ def parse_args():
 		help="Divergence setpoint drawn on vertical_control.png. Default: 0.01.",
 	)
 	parser.add_argument(
+		"--max-duration-sec",
+		type=float,
+		default=None,
+		help=(
+			"Hard cutoff on wall-clock run duration: rows with t_sec beyond this are "
+			"dropped before any analysis/plotting (e.g. after accidentally leaving the "
+			"sim running). Uses t_sec specifically (the one WALL-clock column every log "
+			"has), regardless of --time-base. Default: no limit."
+		),
+	)
+	parser.add_argument(
 		"--full",
 		action="store_true",
 		help="Generate optional detailed/legacy plots in addition to the concise default set.",
@@ -1208,6 +1536,7 @@ def main():
 
 	for index, csv_path in enumerate(csv_paths, start=1):
 		df = read_log(csv_path)
+		df = truncate_to_duration(df, args.max_duration_sec, csv_path)
 		t, time_column, time_description = choose_time_base(df, requested=args.time_base)
 		output_complete = output_dir_for_csv(csv_path, output_root, len(csv_paths), index, positional_output_requested)
 		ensure_output_dir(output_complete)

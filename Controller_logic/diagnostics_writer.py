@@ -70,6 +70,7 @@ class DiagnosticsWriter:
 		px4_nav_state: Optional[int] = None,
 		px4_arming_state: Optional[int] = None,
 		px4_failsafe: Optional[bool] = None,
+		divergence_integral: Optional[float] = None,
 		**_: Any,
 	):
 		wall_timestamp = float(wall_timestamp)
@@ -103,6 +104,7 @@ class DiagnosticsWriter:
 				"flow_mean_y_norm_s": self._num(getattr(flow, "mean_flow_y_norm", 0.0)),
 				"flow_divergence_1_s": self._num(getattr(flow, "divergence", 0.0)),
 				"flow_raw_divergence_1_s": self._num(getattr(flow, "raw_divergence", 0.0)),
+				"flow_fit_quality": self._num(getattr(flow, "fit_quality", 0.0)),
 				"flow_roi_x0": self._int_or_blank(getattr(flow, "roi_x0", -1)),
 				"flow_roi_y0": self._int_or_blank(getattr(flow, "roi_y0", -1)),
 				"flow_roi_x1": self._int_or_blank(getattr(flow, "roi_x1", -1)),
@@ -117,6 +119,13 @@ class DiagnosticsWriter:
 				"command_yaw_rad": self._num(getattr(setpoint, "yaw", 0.0)),
 				"command_thrust": self._num(getattr(setpoint, "thrust", 0.0)),
 			})
+
+		# ControlLaw's internal divergence integral (thrust_integral_gain_const *
+		# this = the integral contribution to thrust). Logged to directly confirm
+		# or refute windup/saturation during transients (e.g. a D* step) instead
+		# of inferring it from the thrust trace alone.
+		if divergence_integral is not None:
+			row["command_thrust_integral"] = self._num(divergence_integral)
 
 		if vehicle_state is not None:
 			row.update({
@@ -173,7 +182,8 @@ class DiagnosticsWriter:
 				"mission_substate": mission.get("substate", "") or "",
 				"mission_divergence_setpoint_1_s": self._num(mission.get("divergence_setpoint")),
 				"mission_thrust_gain_k": self._num(mission.get("thrust_gain_k")),
-				"mission_lateral_gain_scale": self._num(mission.get("lateral_gain_scale")),
+				"mission_lateral_p_scale": self._num(mission.get("lateral_p_scale")),
+				"mission_lateral_d_scale": self._num(mission.get("lateral_d_scale")),
 				"mission_k_min": self._num(mission.get("k_min")),
 				"mission_k_explore": self._num(mission.get("k_explore")),
 				"mission_h_crit_m": self._num(mission.get("h_crit")),
@@ -226,6 +236,7 @@ class DiagnosticsWriter:
 			"flow_mean_y_norm_s",
 			"flow_divergence_1_s",
 			"flow_raw_divergence_1_s",
+			"flow_fit_quality",
 			"flow_roi_x0",
 			"flow_roi_y0",
 			"flow_roi_x1",
@@ -235,6 +246,7 @@ class DiagnosticsWriter:
 			"command_pitch_rad",
 			"command_yaw_rad",
 			"command_thrust",
+			"command_thrust_integral",
 			"vehicle_timestamp_sec",
 			"vehicle_px4_timestamp_sec",
 			"vehicle_x_m",
@@ -265,7 +277,8 @@ class DiagnosticsWriter:
 			"mission_substate",
 			"mission_divergence_setpoint_1_s",
 			"mission_thrust_gain_k",
-			"mission_lateral_gain_scale",
+			"mission_lateral_p_scale",
+			"mission_lateral_d_scale",
 			"mission_k_min",
 			"mission_k_explore",
 			"mission_h_crit_m",

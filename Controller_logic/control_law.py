@@ -12,9 +12,13 @@ area_fraction latch) has been removed now that the constant-gain architecture
 is validated in flight. What remains:
 
   LATERAL (roll, pitch): one fixed PD gain set per axis,
-        u = -(k_p * offset + k_d * optical_flow) * lateral_gain_scale
-  scaled per-tick by lateral_gain_scale (the mission routine ramps this on the
-  same de Croon 2016 App. B height schedule as the thrust gain).
+        u = -(k_p * lateral_p_scale * offset + k_d * lateral_d_scale * optical_flow)
+  scaled per-tick by INDEPENDENT P and D scales (the mission routine ramps
+  these on the same de Croon 2016 App. B height schedule as the thrust gain
+  during DESCEND; during CENTER they instead hold fixed at mission-phase-
+  specific values -- see mission_routine.py's CENTER docstrings). Split
+  because kp and kd have been scaled by different historical factors, so a
+  single shared scale cannot reproduce an earlier validated (kp, kd) pair.
 
   THRUST: a direct Herisse (2012, eq. 32) / de Croon accel-domain law,
         a_cmd        = thrust_gain_override * (D - D*)      [m/s^2]
@@ -57,10 +61,89 @@ class ControlLaw:
 		divergence_setpoint: float = 0.0,  # 0 = visual hover; raised to descend.
 
 		# --- Lateral constant PD (offset P + optical-flow D), per axis. ---
+		# Scaled from the previous validated values (roll 0.22/0.11, pitch
+		# 0.15/0.07) to raise tracking BANDWIDTH without adding aggressiveness.
+		#
+		# Measured directly (cross-spectral analysis of relative_y vs
+		# platform_y over a steady-lateral-gain window): at the
+		# platform's own oscillation frequency (~0.06 Hz here), closed-loop
+		# tracking gain was only ~3.6% -- the vehicle was essentially parked
+		# near a compromise position while the platform oscillated under it,
+		# with roll/pitch nowhere close to saturating (max 0.047/0.017 rad
+		# against a 0.20 rad limit) -- so the limit was never the bottleneck.
+		#
+		# The lateral loop is a PD compensator on what is effectively a double
+		# integrator (roll -> tilt -> horizontal accel -> velocity ->
+		# position). For that plant, kp sets the closed-loop natural
+		# frequency/bandwidth and kd sets the damping ratio
+		# (zeta ~ kd/sqrt(kp)); a properly bandwidth-matched loop tracks a
+		# disturbance well below its own bandwidth near-perfectly, so ~3.6%
+		# tracking at a comparatively SLOW 0.06 Hz means the loop's effective
+		# bandwidth was sitting below the platform's own frequency, not just
+		# "a bit low."
+		#
+		# Fix: raise kp (x2) to push bandwidth up past the platform's
+		# frequency, and raise kd by LESS (x sqrt(2)) to hold the SAME damping
+		# ratio rather than let the loop go underdamped/oscillatory as
+		# bandwidth increases -- the standard "same shape, faster" 2nd-order
+		# scaling. There is large saturation headroom (measured max commands
+		# were ~25% and ~8% of roll_limit/pitch_limit respectively), so this
+		# is a conservative first step, not a max-authority change; re-measure
+		# the same tracking-gain diagnostic on the next log before scaling
+		# further.
+		#
+		# ^ That step (kp x2, kd x sqrt(2)) preserved the EXISTING damping
+		# ratio while raising bandwidth -- it did not fix damping itself. The
+		# next step below addresses that directly.
+		# REVERTED from a 3x kd trial (0.46/0.30) -- direct A/B comparison
+		# against the two most recent logs (identical except kd) showed the
+		# higher kd made things WORSE, not better: envelope decay half-life
+		# went from 50.5s to 179.7s (~3.6x SLOWER), and peak commands moved
+		# closer to saturating (roll 0.152->0.193 against a 0.20 limit)
+		# instead of settling faster. This contradicts the idealized clean-
+		# derivative 2nd-order prediction -- the likely reason is that kd
+		# multiplies REAL optical flow, which carries measurement noise and
+		# processing latency, not a clean derivative; past some point a
+		# derivative term on a noisy/lagged signal injects excitation and
+		# effectively adds dead-time rather than damping. The data overrides
+		# the theory here: do not raise kd further as the next lever. See the
+		# comment block above for what WAS validated (the kp/kd(sqrt2) step
+		# and the gain blend, both measured as improvements).
 		roll_kp: float = 0.22,
 		roll_kd: float = 0.11,
 		pitch_kp: float = 0.15,
 		pitch_kd: float = 0.07,
+
+		# --- Error-magnitude gain blend (large-offset transient damping) ---
+		# roll_kp/kd/pitch_kp/kd above are the FULL gains, used once |offset|
+		# is small (near-centered, oscillation-tracking regime -- this is what
+		# was tuned/validated against the platform-tracking measurement).
+		#
+		# Problem this fixes: roll_u = -(kp*offset + kd*flow)*s is summed
+		# BEFORE _soft_limit's L*tanh(v/L) saturation. At large offset (e.g.
+		# during CENTER, before anything has converged), the compound P+D
+		# signal can be several times roll_limit, deep in tanh's saturating
+		# region. There, EFFECTIVE gain (d(output)/d(input) = sech^2(v/L))
+		# collapses -- e.g. at offset=0.9 with the gains above, effective gain
+		# is only ~7% of nominal. The loop becomes nearly deaf to error
+		# exactly when the error is largest, which is a standard mechanism for
+		# large swings/overshoot severe enough to push the target out of the
+		# camera FOV. This is also why raising kd:kp alone barely helped: both
+		# terms are summed before the SAME saturating nonlinearity, so no
+		# ratio between them changes how hard the compound signal is squashed.
+		#
+		# Fix: smoothly reduce the gain BEFORE the P+D sum as |offset| grows,
+		# so the signal feeding _soft_limit never has to travel as deep into
+		# the collapsing-gain region during a large-offset transient. Blended
+		# with a raised-cosine (same shape as the D* ramp, for the same
+		# reason: a hard switch between gain sets would itself be a
+		# derivative-discontinuity kick). Uses the RADIAL offset magnitude
+		# (hypot of both axes), not separate per-axis thresholds, since "close
+		# to centered" is inherently a 2D notion -- this keeps roll/pitch
+		# scaled down together rather than asymmetrically.
+		large_offset_gain_scale: float = 0.45,   # multiplier applied at/beyond large_offset_threshold
+		small_offset_threshold: float = 0.15,    # |offset| below this: FULL gain (scale=1.0)
+		large_offset_threshold: float = 0.55,    # |offset| at/above this: large_offset_gain_scale
 
 		# --- Thrust axis. ---
 		thrust_integral_gain_const: float = 0.1,
@@ -90,6 +173,12 @@ class ControlLaw:
 		self._roll_kd = float(roll_kd)
 		self._pitch_kp = float(pitch_kp)
 		self._pitch_kd = float(pitch_kd)
+
+		self._large_offset_gain_scale = max(0.0, float(large_offset_gain_scale))
+		self._small_offset_threshold = max(0.0, float(small_offset_threshold))
+		self._large_offset_threshold = max(
+			self._small_offset_threshold + 1e-6, float(large_offset_threshold)
+		)
 
 		self._thrust_integral_gain_const = float(thrust_integral_gain_const)
 		self._divergence_integral_limit = abs(float(divergence_integral_limit))
@@ -150,7 +239,9 @@ class ControlLaw:
 		*,
 		divergence_setpoint: Optional[float] = None,
 		thrust_gain_override: Optional[float] = None,
-		lateral_gain_scale: float = 1.0,
+		lateral_p_scale: float = 1.0,
+		lateral_d_scale: float = 1.0,
+		enable_integral: bool = True,
 	) -> AttitudeSetpoint:
 		"""Desired roll/pitch/yaw/thrust from visual data only.
 
@@ -158,7 +249,34 @@ class ControlLaw:
 		    untouched). 0 for the probe/hover hold, small positive to descend.
 		thrust_gain_override: "k" in a_cmd = k*(D - D*). Supplied per-tick by
 		    the mission (hand-tuned exploration gain, decayed through descent).
-		lateral_gain_scale: multiplies the constant lateral PD gains this call.
+		lateral_p_scale / lateral_d_scale: INDEPENDENT multipliers on the
+		    offset (P) and optical-flow (D) terms respectively. Split into two
+		    knobs rather than one because kp and kd have, over this project's
+		    tuning history, been scaled by DIFFERENT factors relative to
+		    earlier validated baselines (e.g. kp x2, kd x sqrt(2) when tuned
+		    for platform-oscillation tracking) -- a single shared scale cannot
+		    reverse two different historical factors at once, so it can only
+		    ever land on the RIGHT kp or the right kd, not both (verified
+		    directly: scale=0.5 landed kp exactly on an earlier baseline but
+		    left kd under-damped relative to that same baseline). Both apply
+		    on top of _offset_magnitude_gain_scale (which still scales P and D
+		    together, since that mechanism is about compound-signal saturation,
+		    not P/D balance -- see that method's docstring).
+		enable_integral: when False, the integral neither accumulates nor
+		    contributes to thrust this tick (frozen at its current value, not
+		    reset -- see reset_divergence_integral for an explicit clear). Use
+		    this during DESCEND: the scheduled gain k(t) deliberately decays
+		    toward k_min as height decreases, trading tracking authority for
+		    stability margin, so divergence necessarily undershoots D* by a
+		    structural (not noise, not a fixable bias) amount for most of the
+		    descent. An always-on integral has no way to tell that gap is
+		    intentional and keeps accumulating against it for the whole
+		    descent, dragging a persistent thrust bias into the final approach
+		    when precision matters most. Integral action is for correcting a
+		    fixable bias around a stable operating point (e.g. hover during
+		    CENTER/PROBE/PROBE_HOLD, where it's left enabled by default) --
+		    not for chasing a gap the gain schedule has deliberately decided
+		    not to close.
 		"""
 		dt = max(1e-3, float(dt))
 
@@ -176,9 +294,13 @@ class ControlLaw:
 			offset_x = float(target.offset_x)
 			offset_y = float(target.offset_y)
 
-			s = max(0.0, float(lateral_gain_scale))
-			roll_u = -(self._roll_kp * offset_x + self._roll_kd * flow_x) * s
-			pitch_u = -(self._pitch_kp * offset_y + self._pitch_kd * flow_y) * s
+			# Error-magnitude blend still scales P and D TOGETHER (compound-
+			# signal saturation protection, not a P/D balance concern).
+			err_scale = self._offset_magnitude_gain_scale(offset_x, offset_y)
+			p_scale = max(0.0, float(lateral_p_scale)) * err_scale
+			d_scale = max(0.0, float(lateral_d_scale)) * err_scale
+			roll_u = -(self._roll_kp * p_scale * offset_x + self._roll_kd * d_scale * flow_x)
+			pitch_u = -(self._pitch_kp * p_scale * offset_y + self._pitch_kd * d_scale * flow_y)
 
 			roll_cmd = self._soft_limit(self._roll_output_sign * roll_u, self._roll_limit)
 			pitch_cmd = self._soft_limit(self._pitch_output_sign * pitch_u, self._pitch_limit)
@@ -196,11 +318,14 @@ class ControlLaw:
 		if can_use_divergence:
 			error = self._divergence_for_control(flow) - effective_divergence_setpoint
 
-			self._divergence_integral = self._clamp(
-				self._divergence_integral + error * dt,
-				-self._divergence_integral_limit,
-				self._divergence_integral_limit,
-			)
+			if enable_integral:
+				self._divergence_integral = self._clamp(
+					self._divergence_integral + error * dt,
+					-self._divergence_integral_limit,
+					self._divergence_integral_limit,
+				)
+			# else: frozen at its current value -- neither accumulates nor
+			# contributes below (integral_delta is forced to 0.0).
 
 			if thrust_gain_override is not None:
 				# Herisse eq. 32 / de Croon accel-domain law: a_cmd = +k*(D-D*).
@@ -211,7 +336,10 @@ class ControlLaw:
 			else:
 				proportional_delta = 0.0
 
-			integral_delta = self._thrust_integral_gain_const * self._divergence_integral
+			integral_delta = (
+				self._thrust_integral_gain_const * self._divergence_integral
+				if enable_integral else 0.0
+			)
 			visual_thrust_delta = self._soft_limit(
 				proportional_delta + integral_delta, self._max_visual_thrust_delta
 			)
@@ -270,6 +398,25 @@ class ControlLaw:
 		raw = self._safe_float(getattr(flow, "raw_divergence", filtered), default=filtered)
 		w = self._raw_divergence_weight
 		return (1.0 - w) * filtered + w * raw
+
+	def _offset_magnitude_gain_scale(self, offset_x: float, offset_y: float) -> float:
+		"""1.0 (full gain) when the radial offset is small; smoothly falls to
+		large_offset_gain_scale as it grows past small_offset_threshold,
+		reaching that floor at large_offset_threshold. Raised-cosine blend
+		(same shape/reasoning as the D* ramp): zero slope at both ends, no
+		derivative-discontinuity kick at either threshold. Applied to BOTH
+		lateral_p_scale and lateral_d_scale equally (compound pre-saturation
+		signal protection, not a P/D balance concern -- see compute()'s
+		docstring for that distinction) -- upstream of _soft_limit."""
+		err = math.hypot(float(offset_x), float(offset_y))
+		if err <= self._small_offset_threshold:
+			return 1.0
+		if err >= self._large_offset_threshold:
+			return self._large_offset_gain_scale
+		span = self._large_offset_threshold - self._small_offset_threshold
+		frac = (err - self._small_offset_threshold) / span
+		shaped = 0.5 * (1.0 - math.cos(math.pi * frac))
+		return 1.0 + (self._large_offset_gain_scale - 1.0) * shaped
 
 	@staticmethod
 	def _soft_limit(value: float, limit: float) -> float:

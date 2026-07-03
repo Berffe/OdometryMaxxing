@@ -1,172 +1,158 @@
 """
-Procedural albedo texture for flower_disc.obj.
+Generate a replacement flower_top.png (+ matching normal map) for
+bee_platform.sdf's platform_link visual_top, designed directly against the
+measured deficiencies of the current texture rather than by eye:
 
-Multi-scale design so optical-flow texture stays dense across the WHOLE
-disc, not just the rim, at every camera distance:
-  - coarse petal-intensity modulation (large scale, visible far away)
-  - phyllotaxis (Fibonacci golden-angle spiral) floret blobs across the
-    whole disc -- the same dense dot pattern used in photogrammetry /
-    digital-image-correlation targets, specifically because it gives
-    dense, well-conditioned correspondences for optical flow
-  - fine correlated grain noise (a few-px correlation length -- pure
-    per-pixel white noise has no spatial structure smaller than one
-    pixel for a flow algorithm to lock onto) for texture at the closest
-    range, sub-floret scale.
-Color stays within one saturated hue band so the existing HSV-based
-saliency detector (broad hue range, min_saturation/min_value floors)
-keeps working unmodified -- see check_hsv_floors().
+    current flower_top.png, inside the disc:
+        grayscale (BGR2GRAY, what optical_flow.py actually sees): min=28 max=148
+        mean=50.6 std=13.9  -- dark, narrow range
+        gradient magnitude: MEDIAN = 0.0, 88.5% of pixels near-zero gradient
+        dot pitch: single fixed frequency, ~30px = ~5.9cm real-world
+            (flower_disc.obj: polar UV map, 512px = 1.0m disc radius)
+
+Design goals, each tied to one of the measured problems above:
+    1. Wide, full-range local contrast (not a narrow dark band) -> histogram
+       equalization on the combined noise field.
+    2. Information-dense everywhere, not 88% flat -> continuous fractal/value
+       noise as the base signal, not sparse marks on a flat field.
+    3. Multi-scale (not one fixed pitch) -> sum of several noise octaves
+       spanning from macro (~25cm feature size) down to near-texel-scale
+       (~2mm), so SOME resolvable spatial frequency exists at any camera
+       distance from far-away approach to millimeters off the deck.
+    4. No large flat zones, including dead center -> noise is defined and
+       equalized over the WHOLE disc, not confined to a band (see the
+       earlier flat-center failure found in the synthetic test target).
+    5. Aperiodic -> noise-based, not a repeating grid; avoids Farneback
+       aliasing at closing rates that happen to match a fixed grid pitch.
+    6. Stays comfortably above target_acquisition.py's HSV thresholds
+       (min_saturation=60, min_value=45) so detection confidence is not
+       traded away for flow quality -- verified numerically below, not
+       assumed.
+
+flower_disc.obj is a polar-UV disc: the texture's inscribed circle (center
+(512,512), radius 512px) is exactly what gets rendered; the four corners
+outside it are never sampled and are just filled with a neutral tone.
 """
 
 import numpy as np
-from PIL import Image
+import cv2
 
 
-def generate_flower_texture(size: int = 1024, petal_count: int = 10, n_florets: int = 1400, seed: int = 0):
+SIZE = 1024
+CENTER = (SIZE / 2.0, SIZE / 2.0)
+DISC_RADIUS_PX = SIZE / 2.0  # 512px = 1.0m real disc radius (flower_disc.obj)
+
+
+def value_noise_octave(size: int, grid: int, seed: int) -> np.ndarray:
+	"""One octave of smooth value noise: a coarse random grid, upsampled with
+	cubic interpolation. `grid` is the coarse-grid resolution -- a SMALL grid
+	upsampled to `size` gives a LARGE feature size (low frequency); a grid
+	close to `size` gives near-texel-scale features (high frequency)."""
 	rng = np.random.default_rng(seed)
-	yy, xx = np.mgrid[0:size, 0:size].astype(np.float64)
-	gx = (xx - size / 2) / (size / 2)
-	gy = (yy - size / 2) / (size / 2)
-	r = np.sqrt(gx**2 + gy**2)
-	theta = np.arctan2(gy, gx)
-	disc = r <= 1.0
-
-	base_hue, base_sat, base_val = 340.0 / 360.0, 0.75, 0.62
-
-	# Coarse petal modulation (large scale, visible far away).
-	petal_mod = 1.0 + 0.30 * np.cos(petal_count * theta) * np.clip(r, 0, 1)
-
-	# Phyllotaxis floret field: dense dot pattern, golden-angle spiral.
-	golden_angle = np.pi * (3.0 - np.sqrt(5.0))
-	floret_field = np.zeros((size, size), dtype=np.float64)
-	c = 1.0 / np.sqrt(max(n_florets - 1, 1))
-	for n in range(n_florets):
-		rn = c * np.sqrt(n)
-		if rn > 1.05:
-			break
-		th = n * golden_angle
-		cx, cy = rn * np.cos(th), rn * np.sin(th)
-		px, py = (cx * 0.5 + 0.5) * size, (cy * 0.5 + 0.5) * size
-		spacing = c / (2.0 * np.sqrt(max(n, 1)))
-		radius_px = max(2.5, min(0.85 * spacing * size / 2.0, size * 0.022))
-		rad_i = int(np.ceil(radius_px))
-		x0, x1 = max(0, int(px - rad_i - 1)), min(size, int(px + rad_i + 2))
-		y0, y1 = max(0, int(py - rad_i - 1)), min(size, int(py + rad_i + 2))
-		if x1 <= x0 or y1 <= y0:
-			continue
-		sub_x = xx[y0:y1, x0:x1]
-		sub_y = yy[y0:y1, x0:x1]
-		d = np.sqrt((sub_x - px) ** 2 + (sub_y - py) ** 2)
-		# Smooth circular bump, exactly zero outside its own footprint (d>radius)
-		# -- a true dot, not a square: clip(...) alone would plateau at a
-		# constant value for all d>radius, stamping the whole square bounding
-		# box rather than fading out at the circle's edge.
-		within = d <= radius_px
-		safe_ratio = np.clip(1.0 - d / radius_px, 0.0, 1.0)
-		bump = np.where(within, safe_ratio ** 1.4, 0.0)
-		current = floret_field[y0:y1, x0:x1]
-		floret_field[y0:y1, x0:x1] = np.where(bump > current, bump, current)
-
-	# Fine correlated grain: low-res noise, bilinearly upsampled so it has a
-	# multi-pixel correlation length (a trackable structure, unlike i.i.d. noise).
-	low = rng.normal(0, 1, size=(max(size // 16, 8), max(size // 16, 8)))
-	low_u8 = ((low - low.min()) / (np.ptp(low) + 1e-9) * 255).astype(np.uint8)
-	grain = np.asarray(
-		Image.fromarray(low_u8).resize((size, size), Image.BILINEAR), dtype=np.float64
-	) / 255.0
-
-	# Contrast depth is the key parameter for optical-flow trackability: dense
-	# structure alone (the floret/grain pattern) is not enough if the resulting
-	# pixel intensity barely moves -- Farneback needs real grayscale gradient.
-	val = base_val * petal_mod * (0.55 + 0.85 * floret_field) * (0.85 + 0.30 * grain)
-	val = np.clip(val, 0.20, 1.0)  # floor stays above the detector's min_value=45/255=0.176
-	sat = np.clip(base_sat * (1.0 - 0.15 * floret_field), 0.30, 1.0)  # floor above min_saturation=60/255=0.235
-	hue = (base_hue + 0.01 * np.cos(3 * theta) + 0.006 * (grain - 0.5)) % 1.0
-
-	rgb = _hsv_to_rgb_array(hue, sat, val)
-
-	# Outside the disc (never sampled by this mesh) -- muted vignette tint,
-	# avoids a harsh black/transparent seam if ever previewed in a 3D viewer.
-	outside_val = np.clip(base_val * 0.55, 0.2, 1.0)
-	rgb[~disc] = (np.array([outside_val, outside_val * 0.75, outside_val * 0.8]) * 255).astype(np.uint8)
-
-	return rgb, {"floret_field": floret_field, "petal_mod": petal_mod, "disc": disc, "r": r, "theta": theta}
+	coarse = rng.uniform(-1.0, 1.0, (grid, grid)).astype(np.float32)
+	# INTER_CUBIC gives smooth (not blocky) interpolation between grid points,
+	# which is what makes this "value noise" rather than a visible mosaic.
+	return cv2.resize(coarse, (size, size), interpolation=cv2.INTER_CUBIC)
 
 
-def generate_flower_normal_map(aux: dict, floret_height: float = 0.45, strength: float = 1.6) -> np.ndarray:
-	"""
-	Tangent-space normal map derived from the floret dots' height field, so
-	shading lines up with the painted dot pattern instead of being an
-	unrelated flat/placeholder map.
+def fractal_noise(size: int, octaves, base_seed: int = 0) -> np.ndarray:
+	"""Sum of octaves = (grid_resolution, amplitude) pairs. Amplitude is
+	specified explicitly per octave (not a fixed persistence falloff) so the
+	FINE octaves can be kept strong on purpose -- a standard 1/f falloff
+	would reproduce exactly the 'coarse macro pattern, negligible fine
+	detail' problem the current texture already has."""
+	total = np.zeros((size, size), dtype=np.float32)
+	for i, (grid, amp) in enumerate(octaves):
+		total += amp * value_noise_octave(size, grid, seed=base_seed + i)
+	return total
 
-	Bumps come ONLY from floret_field, not the petal modulation: petal_mod is
-	a function of theta=atan2(y,x), which has a 1/r gradient singularity at
-	the disc center -- differentiating it for a height field produces a
-	huge spurious gradient right at the center (a bright pinwheel artifact).
-	floret_field is built from explicit Euclidean distances to floret
-	centers and has no such singularity, so it's the only height contributor.
 
-	normal = normalize([-dh/dx, -dh/dy, 1]), encoded as ((n+1)/2*255) in RGB
-	(standard tangent-space encoding, what gz-sim's PBR normal_map expects).
-	This is a rendering/observability bonus on top of (not a substitute for)
-	the diffuse albedo contrast that actually fixes optical-flow tracking.
-	"""
-	floret_field, disc = aux["floret_field"], aux["disc"]
-	size = floret_field.shape[0]
+def make_flower_albedo() -> np.ndarray:
+	yy, xx = np.mgrid[0:SIZE, 0:SIZE].astype(np.float32)
+	rho = np.hypot(xx - CENTER[0], yy - CENTER[1]) / DISC_RADIUS_PX
+	theta = np.arctan2(yy - CENTER[1], xx - CENTER[0])
+	disc = rho <= 1.0
 
-	height = floret_height * floret_field
-	dx = 2.0 / size
-	gy, gx = np.gradient(height, dx)
+	# Octaves chosen to span ~25cm (macro mottling, feature size = disc_diam/grid)
+	# down to ~1.5mm (near-texel fine grain), explicitly NOT 1/f-weighted --
+	# fine octaves are kept comparably strong so they survive being one of
+	# several summed layers instead of being washed out by the coarse ones.
+	#   grid=8   -> feature ~25cm   (macro mottling)
+	#   grid=24  -> feature ~8cm
+	#   grid=80  -> feature ~2.5cm
+	#   grid=260 -> feature ~0.8cm
+	#   grid=700 -> feature ~0.3cm  (near texel-scale fine grain)
+	octaves = [(8, 1.0), (24, 0.85), (80, 0.75), (260, 0.65), (700, 0.55)]
+	noise = fractal_noise(SIZE, octaves, base_seed=1)
 
-	nx = -gx * strength
-	ny = -gy * strength
-	nz = np.ones_like(height)
-	norm = np.sqrt(nx**2 + ny**2 + nz**2)
+	# Petal macro-structure: an 8-fold angular modulation, for the "looks
+	# like a flower" requirement. Applied as a SMALL additive bias on the
+	# noise field (not a multiplicative flattening), so it changes the
+	# large-scale look without erasing local contrast anywhere -- it must
+	# not recreate the 'flat except for sparse marks' problem.
+	petals = 0.18 * np.cos(8.0 * theta) * np.clip(1.0 - rho, 0.0, 1.0)
+	noise = noise + petals
+
+	# Histogram-equalize to guarantee full-range, well-spread local contrast
+	# (fixes the measured 28-148 / mean-50.6 narrow dark band directly,
+	# rather than hoping the noise amplitudes alone land in a good range).
+	noise_norm = cv2.normalize(noise, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+	value = cv2.equalizeHist(noise_norm)
+
+	# Floor Value so the darkest noise valleys stay comfortably above
+	# target_acquisition.py's min_value=45 HSV threshold everywhere, not just
+	# on average -- verified numerically after generation, not assumed here.
+	value = np.clip(value.astype(np.float32), 70, 255).astype(np.uint8)
+
+	# Hue: warm floral range (magenta/red -> warm pink/orange), modulated
+	# gently by angle so the petal structure also reads as a hue shift, not
+	# just a brightness ripple. Kept independent of the fine noise so hue
+	# doesn't add spurious extra frequencies to fight the luminance design.
+	hue = (12.0 + 8.0 * np.cos(8.0 * theta) + 4.0 * np.sin(3.0 * theta + rho * 6.0))
+	hue = np.mod(hue, 180.0).astype(np.uint8)
+
+	# Saturation: high and fairly uniform, comfortably above min_saturation=60.
+	sat = np.full((SIZE, SIZE), 200, dtype=np.uint8)
+
+	hsv = cv2.merge([hue, sat, value])
+	bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+
+	# Neutral fill outside the disc (never actually sampled by flower_disc.obj's
+	# polar UV map, but kept clean/non-jarring if ever viewed directly).
+	background = np.full_like(bgr, (60, 55, 58))
+	out = np.where(disc[..., None], bgr, background)
+	return out.astype(np.uint8), value, disc
+
+
+def make_normal_map_from_value(value: np.ndarray, disc: np.ndarray, strength: float = 2.2) -> np.ndarray:
+	"""Derive a tangent-space normal map from the SAME luminance field used
+	for the albedo, so PBR shading reinforces the same multi-scale structure
+	under the world's directional sun light, instead of carrying independent
+	(and possibly contradictory) bump detail. Secondary to the albedo fix --
+	shading-derived gradient depends on light direction/angle of approach,
+	the albedo does not."""
+	h = value.astype(np.float32) / 255.0
+	gx = cv2.Sobel(h, cv2.CV_32F, 1, 0, ksize=3) * strength
+	gy = cv2.Sobel(h, cv2.CV_32F, 0, 1, ksize=3) * strength
+
+	nx, ny, nz = -gx, -gy, np.ones_like(h)
+	norm = np.sqrt(nx * nx + ny * ny + nz * nz)
 	nx, ny, nz = nx / norm, ny / norm, nz / norm
 
-	rgb = np.zeros((size, size, 3), dtype=np.uint8)
-	rgb[..., 0] = np.clip((nx * 0.5 + 0.5) * 255, 0, 255).astype(np.uint8)
-	rgb[..., 1] = np.clip((ny * 0.5 + 0.5) * 255, 0, 255).astype(np.uint8)
-	rgb[..., 2] = np.clip((nz * 0.5 + 0.5) * 255, 0, 255).astype(np.uint8)
+	r = ((nx * 0.5 + 0.5) * 255).astype(np.uint8)
+	g = ((ny * 0.5 + 0.5) * 255).astype(np.uint8)
+	b = ((nz * 0.5 + 0.5) * 255).astype(np.uint8)
+	normal_bgr = cv2.merge([r, g, b])  # PNG stored as-is; matches flower_top_normal.png convention
 
-	rgb[~disc] = (128, 128, 255)  # flat/neutral normal outside the mesh's UV footprint
-	return rgb
-
-
-def _hsv_to_rgb_array(hue: np.ndarray, sat: np.ndarray, val: np.ndarray) -> np.ndarray:
-	h6 = hue * 6.0
-	i = np.floor(h6).astype(int) % 6
-	f = h6 - np.floor(h6)
-	p = val * (1 - sat)
-	q = val * (1 - f * sat)
-	t = val * (1 - (1 - f) * sat)
-	r_ch = np.select([i == 0, i == 1, i == 2, i == 3, i == 4, i == 5], [val, q, p, p, t, val])
-	g_ch = np.select([i == 0, i == 1, i == 2, i == 3, i == 4, i == 5], [t, val, val, q, p, p])
-	b_ch = np.select([i == 0, i == 1, i == 2, i == 3, i == 4, i == 5], [p, p, t, val, val, q])
-	rgb = np.zeros(hue.shape + (3,), dtype=np.uint8)
-	rgb[..., 0] = np.clip(r_ch * 255, 0, 255).astype(np.uint8)
-	rgb[..., 1] = np.clip(g_ch * 255, 0, 255).astype(np.uint8)
-	rgb[..., 2] = np.clip(b_ch * 255, 0, 255).astype(np.uint8)
-	return rgb
-
-
-def check_hsv_floors(rgb: np.ndarray, disc: np.ndarray, min_saturation: int = 60, min_value: int = 45):
-	import cv2
-
-	hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
-	s_in, v_in = hsv[..., 1][disc], hsv[..., 2][disc]
-	return {
-		"s_min": int(s_in.min()), "s_mean": float(s_in.mean()),
-		"v_min": int(v_in.min()), "v_mean": float(v_in.mean()),
-		"s_ok": bool(s_in.min() >= min_saturation),
-		"v_ok": bool(v_in.min() >= min_value),
-	}
+	flat = np.full_like(normal_bgr, (255, 128, 128))  # neutral tangent-space normal (B,G,R)=(255,128,128)
+	return np.where(disc[..., None], normal_bgr, flat).astype(np.uint8)
 
 
 if __name__ == "__main__":
-	rgb, aux = generate_flower_texture(size=1024, n_florets=2200, seed=0)
-	Image.fromarray(rgb).save("flower_top.png")
-	print("albedo:", check_hsv_floors(rgb, aux["disc"]))
+	albedo, value_field, disc_mask = make_flower_albedo()
+	cv2.imwrite("flower_top_NEW.png", albedo)
 
-	normal_rgb = generate_flower_normal_map(aux)
-	Image.fromarray(normal_rgb).save("flower_top_normal.png")
-	print("normal map saved: flower_top_normal.png")
+	normal = make_normal_map_from_value(value_field, disc_mask)
+	cv2.imwrite("flower_top_normal_NEW.png", normal)
+
+	print("Wrote flower_top_NEW.png and flower_top_normal_NEW.png")

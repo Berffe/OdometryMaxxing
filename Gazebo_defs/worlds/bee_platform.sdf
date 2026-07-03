@@ -147,7 +147,7 @@
 			<ode>
 			<kp>1000000</kp>
 			<kd>100</kd>
-			<max_vel>0.01</max_vel>
+			<max_vel>10.0</max_vel>
 			<min_depth>0.001</min_depth>
 			</ode>
 		</contact>
@@ -194,8 +194,8 @@
 		<x_frequency>0.0</x_frequency>
 		<x_phase>0.0</x_phase>
 
-		<y_amplitude>0.0</y_amplitude>
-		<y_frequency>0.0</y_frequency>
+		<y_amplitude>0.1</y_amplitude>
+		<y_frequency>0.3</y_frequency>
 		<y_phase>0.0</y_phase>
 
 		<z_amplitude>0.3</z_amplitude>
@@ -211,7 +211,7 @@
 		name="gz::sim::systems::TouchPlugin">
 		<target>bee_x500</target>
 		<namespace>bee_platform</namespace>
-		<time>0.15</time>
+		<time>0.01</time>
 		<enabled>true</enabled>
 	</plugin>
 	</model>

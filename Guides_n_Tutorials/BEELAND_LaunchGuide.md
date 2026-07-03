@@ -23,6 +23,8 @@ cp -r ~/PX4-Autopilot/BEE_LAND/logs/* /mnt/c/Users/Pipef/OneDrive/Academiques/St
 
 cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Gazebo_defs/worlds/* ~/PX4-Autopilot/BEE_LAND/worlds/
 
+cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Gazebo_defs/models/* ~/PX4-Autopilot/BEE_LAND/models/
+
 cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Controller_logic/*.py ~/PX4-Autopilot/BEE_LAND/controller/
 
 cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/OpenLoop_Test/*.py ~/PX4-Autopilot/BEE_LAND/openloop/

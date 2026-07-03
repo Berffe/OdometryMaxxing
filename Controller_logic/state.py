@@ -67,6 +67,16 @@ class FlowResult:
 	        so the normalized field is the px/s field rescaled (recoverable).
 	    raw_divergence : unfiltered divergence; logged separately because the
 	        filter adds phase lag that matters for identification.
+	    fit_quality : weighted R^2 of the affine divergence fit (see
+	        optical_flow.py's _fit_divergence_affine), in roughly [~negative,
+	        1.0]; 1.0 is a well-supported fit, 0.0 is no better than the
+	        weighted mean flow, negative means the affine model fit worse
+	        than that baseline. DIAGNOSIS-ONLY as of this writing: logged
+	        (diagnostics_writer.py's flow_fit_quality column) so a degraded-
+	        but-still-numeric divergence can be told apart from a
+	        well-supported one, but not yet read by control_law.py or
+	        mission_routine.py -- a low fit_quality does not currently change
+	        any command.
 	    roi_* : ROI the flow was computed in (target box), x1/y1 exclusive.
 	"""
 
@@ -80,6 +90,7 @@ class FlowResult:
 	mean_flow_x: float = 0.0
 	mean_flow_y: float = 0.0
 	raw_divergence: float = 0.0
+	fit_quality: float = 0.0
 
 	roi_x0: int = -1
 	roi_y0: int = -1

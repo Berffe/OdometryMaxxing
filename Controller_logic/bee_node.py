@@ -40,6 +40,35 @@ MISSION_PERIOD_SEC = 0.05
 PX4_SETPOINT_PERIOD_SEC = 0.05
 PX4_OFFBOARD_SWITCH_SETTLE_SEC = 0.5
 
+# ============================================================================
+# WARNING -- READ BEFORE TUNING descent_divergence_setpoint / initial_thrust_gain
+# ============================================================================
+# bee_node.py constructs MissionRoutine with EXPLICIT keyword arguments below
+# (search "MissionRoutine("), which means the DEFAULT values written into
+# mission_routine.py's own constructor signature are DEAD CODE for any real
+# flight -- they are unconditionally overridden every time bee_node.py runs.
+# Those constructor defaults only matter if MissionRoutine is constructed
+# STANDALONE (e.g. mission_routine.py's own __main__ smoke test), never here.
+#
+# This is a real trap: editing mission_routine.py's default value (e.g.
+# changing "initial_thrust_gain: float = 0.833" to "= 6.5" in its constructor
+# signature) has ZERO effect on what actually flies through bee_node.py. The
+# constants below -- DESCENT_DIVERGENCE_SETPOINT and INITIAL_THRUST_GAIN --
+# are the ONLY place that governs real flight behavior. This exact mismatch
+# already caused one very weak-gain, high-descent-rate run (mission_thrust_
+# gain_k logged as 0.3332 = the OLD center-thrust-gain-scale mechanism (0.4)
+# times the OLD default 0.833, not the intended 6.5) that looked like a
+# control regression but was actually just a stale/desynced constant. (That
+# reduced-CENTER-thrust-gain mechanism has since been removed entirely --
+# CENTER's vertical loop now always runs at the full exploration gain -- but
+# the lesson about dead-code defaults below still applies to whatever
+# constants ARE still live.) If you want a value to take effect,
+# change it HERE, not in mission_routine.py's signature. If you also update
+# mission_routine.py's defaults (recommended, so a standalone construction/
+# the smoke test reflects the same tuning), that is in ADDITION to changing
+# the constants here, never instead of it.
+# ============================================================================
+
 # --- Moving-platform landing: probe -> gate -> scheduled-gain descent ---
 # (see mission_routine.py's module docstring for the full derivation).
 # DESCENT_DIVERGENCE_SETPOINT is both the D* commanded during descent AND the
@@ -48,7 +77,76 @@ PX4_OFFBOARD_SWITCH_SETTLE_SEC = 0.5
 # feasibility gate together; faster descent (larger D*) makes k_min SMALLER
 # (and so h_crit smaller / more likely feasible), at the cost of less time to
 # react to vision dropouts. 0.15 1/s is a starting point, not tuned.
+# *** SOURCE OF TRUTH for the flown value -- see the WARNING above. ***
 DESCENT_DIVERGENCE_SETPOINT = 0.30
+# Ramp the commanded D* linearly from 0 to DESCENT_DIVERGENCE_SETPOINT over
+# this many seconds at descent entry, instead of stepping it instantly. Fixes
+# the thrust/vz transient measured at PROBE->DESCEND (a real step in the
+# control_law error term, not in k(t) which was already smooth). 0 recovers
+# the old instant-step behavior. See mission_routine.py's constructor
+# docstring for why this does not also affect k(t)'s decay rate.
+D_STAR_RAMP_IN_SEC = 3.0
+# CENTER's vertical (thrust) loop runs at the full exploration gain
+# (k_explore) throughout -- the earlier reduced-CENTER-thrust-gain mechanism
+# (which decoupled the vertical loop from CENTER's heavy lateral banking) has
+# been removed; it is not used. See mission_routine.py's constructor
+# docstring near center_to_probe_lateral_ramp_sec for the current reasoning.
+#
+# Time to smoothly restore the LATERAL gains (CENTER -> PROBE steady-state)
+# once CENTER hands off (same raised-cosine shape as D_STAR_RAMP_IN_SEC, same
+# reasoning: avoid a step right at a handoff we've already found transients
+# matter at). The probe's own peak_accel/min-duration measurement does not
+# start until this completes. 0 recovers an instant restore. Thrust is NOT
+# part of this ramp (see above).
+CENTER_TO_PROBE_LATERAL_RAMP_SEC = 2
+# LATERAL gain during CENTER, mission-PHASE-based (fixed for the whole phase)
+# rather than instantaneous-|offset|-based (control_law's large_offset_gain_
+# scale, which restores full gain every time the vehicle swings near center
+# mid-oscillation -- including repeatedly, while still early in CENTER). This
+# is the originally-requested design: small gain to approach/center gently,
+# THEN increase once genuinely converged, THEN start following the
+# disturbance -- which an offset-magnitude blend alone cannot express, since
+# it cannot distinguish "still centering, momentarily near zero" from
+# "actually converged". Ramps to the PROBE steady-state scales
+# (PROBE_LATERAL_P_SCALE/PROBE_LATERAL_D_SCALE) over
+# CENTER_TO_PROBE_LATERAL_RAMP_SEC.
+#
+# TWO INDEPENDENT scales, not one -- a single shared scale cannot reproduce
+# an earlier validated (kp, kd) pair, since kp and kd were boosted by
+# DIFFERENT factors when tuned for platform-oscillation tracking (kp x2, kd x
+# sqrt(2) -- see control_law.py's gain history comments). Verified directly: a
+# single scale=0.5 landed kp exactly on the earlier validated baseline
+# (0.44*0.5=0.22) but left kd under-damped relative to that SAME baseline
+# (0.155*0.5=0.078 vs the validated 0.11) -- CENTER was actually LESS damped
+# than the historical "before horizontal oscillations" baseline it was meant
+# to recover, not more. These values EXACTLY reverse the two historical
+# factors: 1/2 reverses "kp x2"; 1/sqrt(2) reverses "kd x sqrt(2)" -- together
+# reproducing the original validated (roll_kp=0.22, roll_kd=0.11,
+# pitch_kp=0.15, pitch_kd=0.07) gains to within <0.4% (rounding in the stored
+# decimal constants, not a modeling error). 1.0/1.0 disables this (CENTER at
+# full lateral gain, old behavior).
+CENTER_LATERAL_P_SCALE = 0.5
+CENTER_LATERAL_D_SCALE = 1.5
+# STEADY PROBE lateral P scale (kd left at 1.0 -- raising kd was already A/B
+# tested and found to make tracking WORSE: it operates on optical flow, a
+# real noisy/lagged signal, not a clean derivative).
+#
+# Motivated by a cross-spectral measurement of the closed loop at full gain
+# against the platform's own oscillation: amplitude ratio 2.229 (residual
+# EXCEEDS the platform's own motion -- not simple under-tracking, which would
+# show ratio->1 at ~180 deg phase, the original pre-kp-boost signature) and
+# phase -98.9 deg (close to -90, the textbook signature of a lightly-damped
+# 2nd-order system driven AT its own resonant frequency). The platform's
+# ~0.055 Hz oscillation is landing almost exactly on the closed loop's
+# resonant peak -- the worst possible frequency for an underdamped loop.
+# kp sets natural frequency; raising it further pushes the resonant peak AWAY
+# from the platform's low frequency. Unlike kd, this isn't undermined by
+# derivative noise, since kp acts on offset (position), a clean signal. 1.5
+# is a MODERATE first step (kp_eff: roll 0.44->0.66, pitch 0.30->0.45), not a
+# confident final answer -- re-measure the same amplitude-ratio/phase
+# diagnostic on the next log. 1.0 disables this (PROBE unchanged).
+PROBE_LATERAL_P_SCALE = 1
+PROBE_LATERAL_D_SCALE = 1
 # How long to hold the D*=0 probe before computing peak_accel/k_min/h_crit.
 # No periodicity assumption is needed (unlike the dropped mode-estimator
 # design) -- this only needs to be long enough to see the platform swing
@@ -56,6 +154,31 @@ DESCENT_DIVERGENCE_SETPOINT = 0.30
 # real-platform validation yet; tighten or extend once logged against an
 # actual oscillating deck.
 PROBE_MIN_DURATION_SEC = 15.0
+
+# dt fed into the de Croon feasibility gate -- see mission_routine.py's
+# stability_dt_sec constructor docstring for the full reasoning. This is
+# DELIBERATELY the camera's known sim-time frame period, NOT CONTROL_PERIOD_SEC
+# above and NOT any wall-clock-measured vision rate: the gate's dt must equal
+# what a real camera delivers at RTF=1 (the regime the safety margin has to
+# hold in on real hardware), independent of how slow any particular sim run
+# happens to be. Update this if your camera plugin's configured fps differs
+# from 30 Hz.
+STABILITY_DT_SEC = 1.0 / 30.0
+
+# LOG-ONLY wall-clock-duration hint for mission_routine's sim-time timers
+# (probe_min_duration_sec, center_dwell_sec, center_timeout_sec,
+# d_star_ramp_in_sec -- see that module's CLOCK note). Every one of those is
+# measured on sim time by design; under a simulator real-time-factor (RTF) < 1
+# they take proportionally longer in wall-clock terms. This constant is NOT
+# read by any control-relevant code path -- it exists purely so the startup
+# log can print an honest wall-time estimate instead of leaving the operator
+# to discover it empirically (as "15 seconds" quietly becoming ~75). Measure
+# your own RTF with analyse_log.py's estimate_rtf() on a recent log, or from
+# the sim_wall_offset_sec drift, and update this if your machine/scene load
+# changes meaningfully -- a stale value only misleads the printed estimate,
+# it cannot affect flight behavior.
+EXPECTED_SIM_RTF = 0.2
+
 # Vehicle's own ground/landing-gear clearance, in meters -- the feasibility
 # gate's threshold for h_crit. PLACEHOLDER: set this from the actual airframe
 # geometry before flying for real; 0.20 m is not derived from anything here.
@@ -73,7 +196,11 @@ HOVER_PROBE_ONLY = False
 # ceiling. The ATTITUDE_HOLD height reference is ground-relative while the
 # platform sits ~2 m up, so the height-derived gain was wrong; this decouples
 # it. This is the gain the hover/probe runs at and the value the descent
-# schedule decays from. 0.833 reproduces the validated hover.
+# schedule decays from. 0.833 was the original validated-hover value; raised
+# to 6.5 per subsequent tuning (see e.g. the platform-tracking-gain and
+# vertical-thrust-during-CENTER discussions) -- re-validate hover stability
+# if reverting toward a much smaller value.
+# *** SOURCE OF TRUTH for the flown value -- see the WARNING above. ***
 INITIAL_THRUST_GAIN = 6.5
 
 SHOW_CAMERA = True
@@ -254,6 +381,13 @@ class BeeLandNode(Node):
 			leg_clearance_m=LEG_CLEARANCE_M,
 			probe_only=HOVER_PROBE_ONLY,
 			initial_thrust_gain=INITIAL_THRUST_GAIN,
+			d_star_ramp_in_sec=D_STAR_RAMP_IN_SEC,
+			center_to_probe_lateral_ramp_sec=CENTER_TO_PROBE_LATERAL_RAMP_SEC,
+			center_lateral_p_scale=CENTER_LATERAL_P_SCALE,
+			center_lateral_d_scale=CENTER_LATERAL_D_SCALE,
+			probe_lateral_p_scale=PROBE_LATERAL_P_SCALE,
+			probe_lateral_d_scale=PROBE_LATERAL_D_SCALE,
+			stability_dt_sec=STABILITY_DT_SEC,
 		)
 		self._mission_infeasible_logged = False
 		self._last_mission_log_time = 0.0
@@ -622,6 +756,21 @@ class BeeLandNode(Node):
 			attitude_source=getattr(previous, "attitude_source", ""),
 		)
 
+	def _log_mission_timer_wall_estimates(self):
+		"""LOG-ONLY: print the approximate WALL-clock duration of mission_routine's
+		sim-time timers at EXPECTED_SIM_RTF, so 'probe_min_duration_sec=15.0'
+		does not silently become ~75 real seconds with no warning. Does not
+		affect flight behavior -- see EXPECTED_SIM_RTF's docstring."""
+		rtf = max(1e-3, float(EXPECTED_SIM_RTF))
+		self.get_logger().info(
+			f"Mission sim-time timers at EXPECTED_SIM_RTF={rtf:.2f} (update this "
+			"constant if your measured RTF differs -- see analyse_log.py's "
+			f"estimate_rtf()): probe_min_duration={PROBE_MIN_DURATION_SEC:.1f}s "
+			f"sim (~{PROBE_MIN_DURATION_SEC/rtf:.0f}s wall), "
+			f"d_star_ramp_in={D_STAR_RAMP_IN_SEC:.1f}s sim "
+			f"(~{D_STAR_RAMP_IN_SEC/rtf:.0f}s wall)."
+		)
+
 	def on_mission_timer(self):
 		now = self.time.wall_sec()
 
@@ -711,6 +860,7 @@ class BeeLandNode(Node):
 					t=float(getattr(self._latest_flow, "timestamp", now)),
 					start_height_m=TAKEOFF_ALTITUDE_M-2,
 				)
+				self._log_mission_timer_wall_estimates()
 				self.get_logger().info(
 					"ROS 2 PX4 attitude offboard stream is active and CONFIRMED in "
 					f"offboard. Closed-loop visual controller is now active. "
@@ -745,6 +895,7 @@ class BeeLandNode(Node):
 						t=float(getattr(self._latest_flow, "timestamp", now)),
 						start_height_m=TAKEOFF_ALTITUDE_M,
 					)
+					self._log_mission_timer_wall_estimates()
 					self._enter_phase(PHASE_CLOSED_LOOP)
 					return
 				# We DO see status, but it never became offboard -> PX4 rejected it.
@@ -939,7 +1090,9 @@ class BeeLandNode(Node):
 			dt,
 			divergence_setpoint=mc.divergence_setpoint,
 			thrust_gain_override=mc.thrust_gain_override,
-			lateral_gain_scale=mc.lateral_gain_scale,
+			lateral_p_scale=mc.lateral_p_scale,
+			lateral_d_scale=mc.lateral_d_scale,
+			enable_integral=mc.enable_integral,
 		)
 		self._write_diagnostics_row()
 
@@ -1065,6 +1218,7 @@ class BeeLandNode(Node):
 			px4_nav_state=self._px4_nav_state,
 			px4_arming_state=self._px4_arming_state,
 			px4_failsafe=self._px4_failsafe,
+			divergence_integral=self.control_law.divergence_integral,
 		)
 
 	def _mission_telemetry(self):
@@ -1080,7 +1234,8 @@ class BeeLandNode(Node):
 			"substate": mc.substate,
 			"divergence_setpoint": mc.divergence_setpoint,
 			"thrust_gain_k": mc.thrust_gain_override,
-			"lateral_gain_scale": mc.lateral_gain_scale,
+			"lateral_p_scale": mc.lateral_p_scale,
+			"lateral_d_scale": mc.lateral_d_scale,
 			"k_min": gate.k_min,
 			"k_explore": gate.k_explore,
 			"h_crit": gate.h_crit,

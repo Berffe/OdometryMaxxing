@@ -67,8 +67,8 @@
 					<format>R8G8B8</format>
 				</image>
 				<clip>
-					<near>0.04</near>
-					<far>100</far>
+					<near>0.005</near>
+					<far>30</far>
 				</clip>
 			</camera>
 		</sensor>
