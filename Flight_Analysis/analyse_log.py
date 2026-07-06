@@ -23,6 +23,7 @@ Default generated files:
 	- target_detection_summary.png
 	- lateral_control.png
 	- vertical_control.png
+	- flow_derotation.png                 raw vs de-rotated optical flow (ego-rotation removal)
 	- gain_schedule.png
 	- divergence_consistency.png          vision divergence vs. kinematic ground truth
 	- platform_motion_frequency.png       when platform_z_m is available
@@ -1358,11 +1359,91 @@ def plot_multi_column(df: pd.DataFrame, t: np.ndarray, output_dir: str | Path, c
 	save_current_figure(output_dir, filename)
 
 
+def plot_flow_derotation(df: pd.DataFrame, t: np.ndarray, output_dir: str | Path):
+	"""Raw vs de-rotated optical flow -- the acceptance plot for ego-rotation
+	removal (derotation.py / optical_flow.py).
+
+	Reading it: over a segment with strong body RATE but little translation (a
+	hover wobble), the de-rotated traces should collapse toward zero while the
+	raw traces track the rotation, and the dotted "rotational component removed"
+	should overlay the raw trace. The wrong-sign failure is loud here -- a
+	de-rotated trace with LARGER amplitude than raw means that axis's rotation is
+	being added instead of subtracted; flip that column of R_body_to_optical (see
+	derotation.py's validation banner) and re-run.
+	"""
+	if "flow_mean_x_raw_px_s" not in df.columns and "flow_mean_y_raw_px_s" not in df.columns:
+		print("Skipping flow de-rotation plot. No pre-de-rotation columns "
+		      "(de-rotation logging off, or an older log).")
+		return
+
+	valid = bool_column(df, "flow_valid", default=True)
+
+	def masked(col: str) -> np.ndarray:
+		y = numeric_column(df, col)
+		return np.where(valid, y, np.nan)
+
+	raw_x, der_x = masked("flow_mean_x_raw_px_s"), masked("flow_mean_x_px_s")
+	raw_y, der_y = masked("flow_mean_y_raw_px_s"), masked("flow_mean_y_px_s")
+
+	have_div = "flow_divergence_prederotation_1_s" in df.columns
+	n_rows = 3 if have_div else 2
+	fig, axes = plt.subplots(n_rows, 1, figsize=(11, 8 if have_div else 6), sharex=True)
+	fig.suptitle("Optical-flow de-rotation: raw vs corrected")
+
+	# Flag logs where de-rotation never actually engaged (raw == corrected), so
+	# an overlapping plot isn't misread as "correction had no effect".
+	frac_derot = float(np.mean(bool_column(df, "flow_derotated", default=False)))
+	if frac_derot < 0.01:
+		axes[0].set_title(
+			"de-rotation inactive in this log (raw == corrected) -- no body "
+			"rates buffered, or derotator disabled",
+			fontsize=9,
+		)
+
+	axes[0].plot(t, raw_x, label="mean flow x -- raw", color="tab:blue", alpha=0.65)
+	axes[0].plot(t, der_x, label="mean flow x -- de-rotated", color="tab:blue", linewidth=1.8)
+	axes[0].plot(t, raw_x - der_x, label="rotational component removed",
+	             color="tab:orange", linestyle=":", alpha=0.85)
+	shade_mission_phases(axes[0], df, t)
+	axes[0].axhline(0.0, linestyle="--", linewidth=1)
+	axes[0].set_ylabel("flow x [px/s]")
+	axes[0].grid(True)
+	axes[0].legend(loc="best")
+
+	axes[1].plot(t, raw_y, label="mean flow y -- raw", color="tab:green", alpha=0.65)
+	axes[1].plot(t, der_y, label="mean flow y -- de-rotated", color="tab:green", linewidth=1.8)
+	axes[1].plot(t, raw_y - der_y, label="rotational component removed",
+	             color="tab:orange", linestyle=":", alpha=0.85)
+	shade_mission_phases(axes[1], df, t)
+	axes[1].axhline(0.0, linestyle="--", linewidth=1)
+	axes[1].set_ylabel("flow y [px/s]")
+	axes[1].grid(True)
+	axes[1].legend(loc="best")
+
+	if have_div:
+		pre = masked("flow_divergence_prederotation_1_s")
+		# Compare against the (unfiltered) de-rotated divergence so both traces
+		# are the same estimator, differing only by de-rotation.
+		post_col = "flow_raw_divergence_1_s" if "flow_raw_divergence_1_s" in df.columns else "flow_divergence_1_s"
+		post = masked(post_col)
+		axes[2].plot(t, pre, label="divergence -- pre-de-rotation", color="tab:red", alpha=0.65)
+		axes[2].plot(t, post, label="divergence -- de-rotated (unfiltered)", color="tab:red", linewidth=1.8)
+		shade_mission_phases(axes[2], df, t)
+		axes[2].axhline(0.0, linestyle="--", linewidth=1)
+		axes[2].set_ylabel("divergence [1/s]")
+		axes[2].grid(True)
+		axes[2].legend(loc="best")
+
+	axes[-1].set_xlabel("time [s]")
+	save_current_figure(output_dir, "flow_derotation.png")
+
+
 def make_default_plots(df: pd.DataFrame, t: np.ndarray, output_dir: str | Path, args):
 	plot_target_detection_summary(df, t, output_dir)
 	plot_detection_boxes_fov(df, t, args.image_width, args.image_height, output_dir, args.max_boxes)
 	plot_lateral_control(df, t, output_dir)
 	plot_vertical_control(df, t, output_dir, divergence_setpoint=args.divergence_setpoint)
+	plot_flow_derotation(df, t, output_dir)
 	plot_gain_schedule(df, t, output_dir)
 	plot_divergence_consistency(df, t, output_dir)
 	plot_height_prediction(df, t, output_dir)

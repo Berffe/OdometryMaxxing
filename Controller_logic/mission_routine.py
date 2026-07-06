@@ -191,7 +191,7 @@ class PlatformProbe:
 	"infeasible" calls.
 	"""
 
-	def __init__(self, thrust_model: ThrustModel, highpass_tau_sec: float = 15.0):
+	def __init__(self, thrust_model: ThrustModel, highpass_tau_sec: float = 2.5):
 		# highpass_tau_sec sets the EMA time constant used to subtract the
 		# slow mean before tracking peak |accel|. It must be long enough to
 		# remove the thrust loop's own slow resonance (documented ~23s ring in

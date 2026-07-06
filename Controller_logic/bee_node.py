@@ -21,11 +21,17 @@ except ImportError:
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Pose
 from std_msgs.msg import Bool
-from px4_msgs.msg import VehicleLocalPosition, VehicleAttitude, VehicleStatus
+from px4_msgs.msg import (
+	VehicleLocalPosition,
+	VehicleAttitude,
+	VehicleStatus,
+	VehicleAngularVelocity,
+)
 from cv_bridge import CvBridge, CvBridgeError
 
 from .state import VehicleState, PlatformState, AttitudeSetpoint, TargetEstimate
 from .optical_flow import OpticalFlowEstimator
+from .derotation import CameraGeometry, Derotator, AngularRateBuffer
 from .target_acquisition import TargetAcquisition
 from .control_law import ControlLaw
 from .mission_routine import MissionRoutine, INFEASIBLE as MISSION_INFEASIBLE
@@ -125,8 +131,8 @@ CENTER_TO_PROBE_LATERAL_RAMP_SEC = 2
 # pitch_kp=0.15, pitch_kd=0.07) gains to within <0.4% (rounding in the stored
 # decimal constants, not a modeling error). 1.0/1.0 disables this (CENTER at
 # full lateral gain, old behavior).
-CENTER_LATERAL_P_SCALE = 0.5
-CENTER_LATERAL_D_SCALE = 1.5
+CENTER_LATERAL_P_SCALE = 1
+CENTER_LATERAL_D_SCALE = 1
 # STEADY PROBE lateral P scale (kd left at 1.0 -- raising kd was already A/B
 # tested and found to make tracking WORSE: it operates on optical flow, a
 # real noisy/lagged signal, not a clean derivative).
@@ -164,6 +170,18 @@ PROBE_MIN_DURATION_SEC = 15.0
 # happens to be. Update this if your camera plugin's configured fps differs
 # from 30 Hz.
 STABILITY_DT_SEC = 1.0 / 30.0
+
+# --- Belly-camera intrinsics, mirrored from model.sdf's bee_camera sensor -----
+# model.sdf: <horizontal_fov>1.3962634</horizontal_fov> (= 80 deg),
+#            <image><width>120</width><height>80</height></image>.
+# The SDF stores FOV + width, NOT focal length; the pinhole relation
+# f_px = (width/2)/tan(hfov/2) recovers it (~71.5 px here) -- done inside
+# CameraGeometry.from_horizontal_fov so the value stays tied to these numbers.
+# This bridge publishes no CameraInfo topic, so these are the single source of
+# truth: if you change the sensor in model.sdf, change these to match.
+CAMERA_HFOV_RAD = 1.3962634
+CAMERA_WIDTH_PX = 120
+CAMERA_HEIGHT_PX = 80
 
 # LOG-ONLY wall-clock-duration hint for mission_routine's sim-time timers
 # (probe_min_duration_sec, center_dwell_sec, center_timeout_sec,
@@ -455,7 +473,23 @@ class BeeLandNode(Node):
 		self._touchdown_time = None
 		self._touchdown_message_count = 0
 
-		self.optical_flow = OpticalFlowEstimator()
+		# Optical-flow de-rotation (see derotation.py). CameraGeometry derives
+		# the focal length from the SDF's horizontal FOV + width; the default
+		# body->optical rotation already folds in the nadir mount and the
+		# cv2.ROTATE_180 that on_camera applies -- but its SIGNS must be
+		# validated against a pure-rotation segment (see derotation.py's banner)
+		# before the de-rotated flow is trusted for control.
+		camera_geometry = CameraGeometry.from_horizontal_fov(
+			CAMERA_HFOV_RAD, CAMERA_WIDTH_PX, CAMERA_HEIGHT_PX
+		)
+		self._derotator = Derotator(camera_geometry)
+		# Body-rate history, averaged over each inter-frame interval in
+		# on_camera. Kept here (not in VehicleState) so de-rotation uses the
+		# interval MEAN rate, not a single latest sample.
+		self._rate_buffer = AngularRateBuffer()
+		self._prev_camera_stamp = None
+
+		self.optical_flow = OpticalFlowEstimator(derotator=self._derotator)
 		self.target_acquisition = TargetAcquisition()
 
 		self.diagnostics = DiagnosticsWriter(output_dir="logs", filename=None, flush_every_row=True)
@@ -472,7 +506,7 @@ class BeeLandNode(Node):
 			reliability=QoSReliabilityPolicy.BEST_EFFORT,
 			durability=QoSDurabilityPolicy.VOLATILE,
 			history=QoSHistoryPolicy.KEEP_LAST,
-			depth=5,
+			depth=1,
 		)
 		touchdown_status_qos = QoSProfile(
 			reliability=QoSReliabilityPolicy.RELIABLE,
@@ -491,6 +525,18 @@ class BeeLandNode(Node):
 			VehicleAttitude,
 			"/fmu/out/vehicle_attitude",
 			self.on_vehicle_attitude,
+			px4_qos,
+		)
+		# Body-frame angular rate (FRD, rad/s) for optical-flow de-rotation.
+		# This topic must be in your uXRCE-DDS dds_topics.yaml; like the
+		# vehicle_status discovery note above, subscribing does NOT make PX4
+		# publish it. If it's absent, add it to dds_topics.yaml, or swap this
+		# for VehicleOdometry and read msg.angular_velocity (same FRD rates) --
+		# the buffer/derotator downstream are identical either way.
+		self.create_subscription(
+			VehicleAngularVelocity,
+			"/fmu/out/vehicle_angular_velocity",
+			self.on_vehicle_angular_velocity,
 			px4_qos,
 		)
 		# VehicleStatus carries nav_state (is PX4 ACTUALLY in offboard?),
@@ -578,8 +624,26 @@ class BeeLandNode(Node):
 
 		stamp = self._image_timestamp_sec(msg)
 		self.time.observe_sim_timestamp(stamp)
+
+		# Mean body rate over THIS inter-frame interval, for de-rotation. dt is a
+		# SIM-family difference (stamp - previous stamp); the buffer then walks
+		# back by that duration through its own PX4-family stamps. Neither step
+		# crosses clock families, so clock.py's diagnostic offsets never touch
+		# this control path. body_rates stays None on the first frame or before
+		# the rate stream is up, which makes optical_flow take its legacy
+		# no-de-rotation path.
+		body_rates = None
+		if self._prev_camera_stamp is not None:
+			dt_cam = stamp - self._prev_camera_stamp
+			omega_mean, _n, ok = self._rate_buffer.mean_recent(dt_cam)
+			if ok:
+				body_rates = omega_mean
+		self._prev_camera_stamp = stamp
+
 		target = self.target_acquisition.update(frame, timestamp=stamp)
-		flow = self.optical_flow.update(frame, stamp, target=target)
+		flow = self.optical_flow.update(
+			frame, stamp, target=target, body_rates=body_rates
+		)
 
 		self._latest_frame = frame
 		self._latest_target = target
@@ -694,6 +758,20 @@ class BeeLandNode(Node):
 			self.get_logger().info(
 				f"vehicle attitude: roll={roll:.3f} rad, pitch={pitch:.3f} rad, yaw={yaw:.3f} rad"
 			)
+
+	def on_vehicle_angular_velocity(self, msg: VehicleAngularVelocity):
+		"""Body-frame angular rate (FRD, rad/s) for optical-flow de-rotation.
+
+		Buffered rather than merged into VehicleState, so on_camera can average
+		it over each camera inter-frame interval (see AngularRateBuffer's CLOCK
+		NOTE). The sample is tagged with the message's own PX4 stamp in seconds
+		(msg.timestamp / 1e6) -- same family/handling as on_vehicle_attitude's
+		attitude_timestamp -- and observed for offset diagnostics like the other
+		/fmu/out streams. Never feeds the control law directly; the de-rotated
+		flow does.
+		"""
+		self.time.observe_px4_timestamp(msg.timestamp)
+		self._rate_buffer.add(msg.timestamp / 1e6, msg.xyz)
 
 	def on_vehicle_status(self, msg: VehicleStatus):
 		"""PX4 VehicleStatus: the authority on whether we are ACTUALLY in

@@ -78,6 +78,20 @@ class FlowResult:
 	        mission_routine.py -- a low fit_quality does not currently change
 	        any command.
 	    roi_* : ROI the flow was computed in (target box), x1/y1 exclusive.
+
+	De-rotation diagnostics (see optical_flow.py + derotation.py):
+	    derotated : True if ego-rotation removal ran on this frame (a derotator
+	        was configured AND body rates were available for the interval). When
+	        False, the *_raw fields below equal their de-rotated counterparts and
+	        divergence_prederotation equals raw_divergence -- de-rotation was a
+	        no-op, so raw and corrected coincide.
+	    mean_flow_x_raw / mean_flow_y_raw : mean flow in px/s BEFORE de-rotation.
+	        The de-rotated mean flow is the existing mean_flow_x / mean_flow_y, so
+	        (raw - de-rotated) is exactly the rotational component removed.
+	    divergence_prederotation : unfiltered divergence [1/s] of the pre-de-
+	        rotation field. The gap to raw_divergence is how much ego-rotation was
+	        biasing the divergence estimate. LOG-ONLY (like fit_quality): not read
+	        by control_law.py or mission_routine.py.
 	"""
 
 	timestamp: float = 0.0
@@ -96,6 +110,11 @@ class FlowResult:
 	roi_y0: int = -1
 	roi_x1: int = -1
 	roi_y1: int = -1
+
+	derotated: bool = False
+	mean_flow_x_raw: float = 0.0
+	mean_flow_y_raw: float = 0.0
+	divergence_prederotation: float = 0.0
 
 
 @dataclass

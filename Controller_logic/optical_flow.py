@@ -101,6 +101,11 @@ class OpticalFlowEstimator:
 		min_points_for_affine_fit: int = 30,
 		affine_inlier_quantile: float = 0.85,
 		store_debug: bool = False,
+		# Optional ego-rotation removal. Pass a derotation.Derotator to enable
+		# it; leave None for the legacy (no de-rotation) behavior. When set,
+		# update() also needs a per-frame body_rates vector to actually
+		# subtract anything -- without it the flow is passed through unchanged.
+		derotator=None,
 	):
 		self._prev_gray = None
 		self._prev_bgr = None
@@ -136,11 +141,19 @@ class OpticalFlowEstimator:
 		self._store_debug = bool(store_debug)
 		self._last_debug = {}
 
+		# Ego-rotation removal (see derotation.py). None -> disabled.
+		self._derotator = derotator
+
 	def update(
 		self,
 		frame_bgr,
 		timestamp: float,
 		target: Optional[TargetEstimate] = None,
+		# Mean body angular rate (rad/s, FRD [p, q, r]) over the interval
+		# between the previous frame and this one -- see bee_node.on_camera and
+		# derotation.AngularRateBuffer. Only used when a derotator was supplied
+		# to the constructor; None (or no derotator) => no de-rotation.
+		body_rates=None,
 	) -> FlowResult:
 		if frame_bgr is None:
 			result = FlowResult(timestamp=timestamp, valid=False)
@@ -251,6 +264,26 @@ class OpticalFlowEstimator:
 
 		flow_px_s = flow_px_per_frame / dt
 
+		# --- Ego-rotation removal (see derotation.py) ----------------------
+		# Subtract the predicted rotational flow field (depth-independent, a
+		# pure function of body rate + camera geometry) BEFORE mean flow and the
+		# affine divergence fit, so both the [offset, flow_norm] state and the
+		# divergence see translation-only flow.
+		#
+		# raw_flow_px_s keeps a reference to the PRE-de-rotation field for the
+		# raw-vs-corrected diagnostics below; derotate() returns a NEW array, so
+		# the reference stays intact. When de-rotation is inactive the two names
+		# alias the same array and raw == corrected everywhere (no double work).
+		raw_flow_px_s = flow_px_s
+		derotation_active = self._derotator is not None and body_rates is not None
+		if derotation_active:
+			flow_px_s = self._derotator.derotate(
+				flow_px_s, body_rates, roi=(x0, y0, x1, y1)
+			)
+
+		raw_mean_flow_x = float(np.mean(raw_flow_px_s[:, :, 0]))
+		raw_mean_flow_y = float(np.mean(raw_flow_px_s[:, :, 1]))
+
 		mean_flow_x = float(np.mean(flow_px_s[:, :, 0]))
 		mean_flow_y = float(np.mean(flow_px_s[:, :, 1]))
 
@@ -287,6 +320,21 @@ class OpticalFlowEstimator:
 		)
 		filtered_divergence = self._filter_divergence(raw_divergence)
 
+		# Divergence on the PRE-de-rotation field, diagnostics-only: the gap
+		# between this and raw_divergence is how much ego-rotation was biasing
+		# the divergence estimate. Recomputed only when de-rotation actually ran
+		# (otherwise identical to raw_divergence). Same gradient weighting -- the
+		# weight map is image-derived and de-rotation-independent.
+		if derotation_active:
+			divergence_prederotation, _, _ = self._fit_divergence_affine(
+				flow_px_s=raw_flow_px_s,
+				image_width=image_width,
+				image_height=image_height,
+				gradient_magnitude=gradient_magnitude,
+			)
+		else:
+			divergence_prederotation = raw_divergence
+
 		result = FlowResult(
 			timestamp=timestamp,
 			valid=True,
@@ -301,6 +349,10 @@ class OpticalFlowEstimator:
 			roi_y0=int(y0),
 			roi_x1=int(x1),
 			roi_y1=int(y1),
+			derotated=bool(derotation_active),
+			mean_flow_x_raw=float(raw_mean_flow_x),
+			mean_flow_y_raw=float(raw_mean_flow_y),
+			divergence_prederotation=float(divergence_prederotation),
 		)
 
 		self._save_debug(

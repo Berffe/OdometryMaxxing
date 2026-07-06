@@ -31,7 +31,7 @@ is validated in flight. What remains:
   bias correction on top; it is 0 by default.
 
 Both the lateral command and the thrust command are passed through a first-
-order low-pass + slew-rate limiter + clamp (_shape_commands) before output.
+order low-pass + optional slew-rate limiter + clamp (_shape_commands) before output.
 
 The divergence used for control is a fixed blend of the filtered and raw
 divergence (raw_divergence_weight); the mission's divergence_setpoint D* is
@@ -109,10 +109,10 @@ class ControlLaw:
 		# the theory here: do not raise kd further as the next lever. See the
 		# comment block above for what WAS validated (the kp/kd(sqrt2) step
 		# and the gain blend, both measured as improvements).
-		roll_kp: float = 0.22,
-		roll_kd: float = 0.11,
-		pitch_kp: float = 0.15,
-		pitch_kd: float = 0.07,
+		roll_kp: float = 0.83,
+		roll_kd: float = 0.65,
+		pitch_kp: float = 0.83,
+		pitch_kd: float = 0.65,
 
 		# --- Error-magnitude gain blend (large-offset transient damping) ---
 		# roll_kp/kd/pitch_kp/kd above are the FULL gains, used once |offset|
@@ -153,11 +153,17 @@ class ControlLaw:
 		enable_divergence_control: bool = True,
 		require_target_for_descent: bool = True,
 
-		# --- Output limits + command shaping (low-pass -> slew -> clamp). ---
+		# --- Output limits + command shaping (low-pass -> optional slew -> clamp). ---
+		# Set enable_slew_rate_limits=False for latency/phase-margin tests: the
+		# first-order command filter and hard clamps stay active, but roll/pitch/
+		# thrust no longer have per-tick rate limiting. Do NOT turn the numeric
+		# slew rates to zero to disable them -- zero means "no motion allowed"
+		# in _slew_limit().
+		enable_slew_rate_limits: bool = False,
 		roll_limit: float = 0.20,
 		pitch_limit: float = 0.20,
-		thrust_min: float = 0.62,
-		thrust_max: float = 0.84,
+		thrust_min: float = 0.57,
+		thrust_max: float = 0.90,
 		roll_output_sign: float = 1.0,
 		pitch_output_sign: float = 1.0,
 		roll_slew_rate_rad_s: float = 0.35,
@@ -193,6 +199,7 @@ class ControlLaw:
 		self._thrust_max = float(thrust_max)
 		self._roll_output_sign = 1.0 if roll_output_sign >= 0.0 else -1.0
 		self._pitch_output_sign = 1.0 if pitch_output_sign >= 0.0 else -1.0
+		self._enable_slew_rate_limits = bool(enable_slew_rate_limits)
 		self._roll_slew_rate_rad_s = abs(float(roll_slew_rate_rad_s))
 		self._pitch_slew_rate_rad_s = abs(float(pitch_slew_rate_rad_s))
 		self._thrust_slew_rate_per_s = abs(float(thrust_slew_rate_per_s))
@@ -208,6 +215,18 @@ class ControlLaw:
 	@property
 	def hover_thrust(self) -> float:
 		return self._hover_thrust
+
+	@property
+	def slew_rate_limits_enabled(self) -> bool:
+		return self._enable_slew_rate_limits
+
+	def set_slew_rate_limits_enabled(self, enabled: bool) -> None:
+		"""Enable/disable roll, pitch, and thrust slew-rate limiting at runtime.
+
+		When disabled, _shape_commands still applies the first-order command
+		filter and final clamps; it only bypasses the per-axis rate limiter.
+		"""
+		self._enable_slew_rate_limits = bool(enabled)
 
 	@property
 	def divergence_integral(self) -> float:
@@ -366,6 +385,7 @@ class ControlLaw:
 		"""
 		filter:  c_f = (1-a) c_prev + a c       (first-order low-pass)
 		slew:    c_s = c_prev + clip(c_f - c_prev, +-rate*dt)
+		         bypassed entirely when enable_slew_rate_limits=False
 		clamp:   to the axis limits.
 		"""
 		if not self._has_previous_command:
@@ -379,9 +399,14 @@ class ControlLaw:
 		pitch_f = (1.0 - a) * self._previous_pitch_cmd + a * pitch
 		thrust_f = (1.0 - a) * self._previous_thrust_cmd + a * thrust
 
-		roll_s = self._slew_limit(self._previous_roll_cmd, roll_f, self._roll_slew_rate_rad_s * dt)
-		pitch_s = self._slew_limit(self._previous_pitch_cmd, pitch_f, self._pitch_slew_rate_rad_s * dt)
-		thrust_s = self._slew_limit(self._previous_thrust_cmd, thrust_f, self._thrust_slew_rate_per_s * dt)
+		if self._enable_slew_rate_limits:
+			roll_s = self._slew_limit(self._previous_roll_cmd, roll_f, self._roll_slew_rate_rad_s * dt)
+			pitch_s = self._slew_limit(self._previous_pitch_cmd, pitch_f, self._pitch_slew_rate_rad_s * dt)
+			thrust_s = self._slew_limit(self._previous_thrust_cmd, thrust_f, self._thrust_slew_rate_per_s * dt)
+		else:
+			roll_s = roll_f
+			pitch_s = pitch_f
+			thrust_s = thrust_f
 
 		roll_s = self._clamp(roll_s, -self._roll_limit, self._roll_limit)
 		pitch_s = self._clamp(pitch_s, -self._pitch_limit, self._pitch_limit)
