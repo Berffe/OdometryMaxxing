@@ -14,7 +14,7 @@
 			but still well above the landing skids.
 			pitch = +90 deg makes the Gazebo camera look downward.
 		-->
-		<pose relative_to="base_link">0.03 0 -0.085 0 1.5708 0</pose>
+		<pose relative_to="base_link">0.03 0 -0.045 0 1.5708 0</pose>
 
 		<inertial>
 			<mass>0.02</mass>

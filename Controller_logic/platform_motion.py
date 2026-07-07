@@ -77,6 +77,37 @@ except ImportError:
 # divergence -- see assumption 2 above.
 PLATFORM_NED_SIGN = 1.0
 
+# bee_platform.sdf's platform_link carries its collision/visual_body as a
+# cylinder (radius=1.0, length=0.2) with NO offset <pose> -- so it is
+# centered exactly on platform_link's own origin, which is the pose
+# OscillatingPlatformController publishes as platform.z. That means
+# platform.z is the disc's GEOMETRIC CENTER, not its top face -- the actual
+# landing surface the drone's legs make contact with sits HALF THE
+# CYLINDER'S LENGTH above that center, a fixed +0.1m in the platform's own
+# (ENU, up-positive) frame that was previously silently missing from every
+# relative_z/relative_vz computation below.
+#
+# This was found by comparing bee_x500/x500_base's actual leg geometry
+# (base_link_collision_3/_4: unrotated 0.25x0.015x0.015 boxes centered at
+# z=-0.2195 relative to base_link, i.e. a true skid-bottom clearance of
+# 0.227m -- MORE than MissionRoutine's leg_clearance_m=0.20 default, not
+# less) against logged touchdown relative_z_m, which read far below what
+# either number alone would predict. A center-vs-surface offset on the
+# platform side, missing this whole time, is a clean, geometry-verified
+# partial (very possibly not sole) explanation: relative_z_m has been
+# reporting distance-to-the-disc's-CENTER, not distance-to-the-surface the
+# legs actually reach, understating the true clearance by this amount at
+# every height, not just at touchdown.
+#
+# Applied to the RAW platform.z (ENU) value BEFORE the PLATFORM_NED_SIGN
+# conversion below, not after: this offset is a fact about the platform's
+# own z-axis geometry (its reported origin sits 0.1m below its true top
+# surface, in ITS OWN up-positive frame), so it belongs in the same frame
+# platform.z is already in, before any NED-conversion sign logic is
+# applied -- exactly like correcting a mismeasured platform.z at the
+# source, not a separate correction bolted onto the combined NED result.
+PLATFORM_TOP_SURFACE_OFFSET_M = 0.2 / 2.0  # bee_platform.sdf <length>0.2</length>, halved
+
 # Untested (x_amplitude/y_amplitude are 0 in every run so far): NED's x=North
 # corresponds to ENU's y, and NED's y=East corresponds to ENU's x. Set True
 # once a lateral oscillation test shows relative_x/y tracking the WRONG
@@ -139,12 +170,20 @@ def relative_motion(
 
 	z derivation (x/y follow the same logic once their own NED<->ENU axis
 	mapping is confirmed -- see module docstring assumption 2):
-	    relative_z  = vehicle.z + PLATFORM_NED_SIGN*platform.z
-	    relative_vz = vehicle.vz + PLATFORM_NED_SIGN*platform.vz  (= d(relative_z)/dt)
+	    relative_z  = vehicle.z + PLATFORM_NED_SIGN*(platform.z + PLATFORM_TOP_SURFACE_OFFSET_M)
+	    relative_vz = vehicle.vz + PLATFORM_NED_SIGN*platform.vz  (= d(relative_z)/dt;
+	        the offset is a constant, so it drops out of the derivative -- vz is
+	        unaffected)
 	platform.z is ENU (up-positive); vehicle.z is NED (down-positive). Vehicle
 	descending (vehicle.vz>0) and platform RISING (platform.vz>0, moving up
 	toward the vehicle from below) both shrink the physical gap between them,
 	so their NED-converted contributions to closing rate ADD, not subtract.
+
+	PLATFORM_TOP_SURFACE_OFFSET_M (see module docstring) shifts platform.z
+	from the disc's reported CENTER to its actual top (landing) surface
+	before combining -- without it, relative_z measures distance to the
+	platform's geometric center, ~0.1m below where the legs actually reach,
+	understating true clearance at every height, not just at touchdown.
 	"""
 	if vehicle is None or platform is None:
 		return (None, None, None, None, None, None)
@@ -159,7 +198,7 @@ def relative_motion(
 	rel_vx = vehicle.vx - platform_vx
 	rel_vy = vehicle.vy - platform_vy
 
-	rel_z = vehicle.z + PLATFORM_NED_SIGN * platform.z
+	rel_z = vehicle.z + PLATFORM_NED_SIGN * (platform.z + PLATFORM_TOP_SURFACE_OFFSET_M)
 	rel_vz = vehicle.vz + PLATFORM_NED_SIGN * platform.vz
 
 	return rel_x, rel_y, rel_z, rel_vx, rel_vy, rel_vz

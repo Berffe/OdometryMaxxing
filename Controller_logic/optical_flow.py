@@ -25,10 +25,12 @@ a texture-poor patch is down-weighted directly rather than relying on a
 textured rim elsewhere in the ROI to out-vote it. That reliance was a real
 gap: once TargetEstimate.fov_saturated (the target's true size exceeds
 the camera's FOV -- see state.py), the rim is by definition outside the
-frame, and only the interior remains to fit against. A separate,
-close-range Farneback parameter set (winsize_close/levels_close/
-pyr_scale_close) engages on the same fov_saturated signal, since that
-regime also has the descent's largest per-frame pixel displacement.
+frame, and only the interior remains to fit against. The ROI is also, at
+that point, at its largest of the whole descent -- handled by shrinking the
+Farneback search problem itself (see the constructor's downsample_target_px
+docstring) rather than the earlier design's separate, MORE expensive
+close-range parameter set: a continuous downsample tied to ROI size, not a
+binary switch tied to fov_saturated.
 
 The fit additionally reports fit_quality (a weighted R^2 -- see
 _fit_divergence_affine), so a degraded-but-still-numeric divergence
@@ -71,29 +73,79 @@ class OpticalFlowEstimator:
 		iterations: int = 3,
 		poly_n: int = 5,
 		poly_sigma: float = 1.2,
-		# --- Close-range Farneback parameters (target.fov_saturated) ---
-		# The far-field params above are tuned for a small-to-moderate target:
-		# modest per-frame pixel displacement, a compact ROI. Once
-		# fov_saturated (the target's true size exceeds the camera's FOV --
-		# see state.py's TargetEstimate docstring), the ROI is pinned at the
-		# full frame, physical closing rate is at its highest of the whole
-		# descent (larger per-frame pixel displacement), and there is no
-		# longer a textured rim to anchor the divergence fit (see this
-		# module's docstring) -- only whatever texture is in the interior.
-		# A larger winsize averages over more of that texture per estimate
-		# (more robust to a locally-flat patch, at the cost of spatial
-		# resolution we don't need once the ROI is a single expanding
-		# surface); more levels + a larger pyr_scale (finer-grained pyramid
-		# steps) track the larger displacement more robustly. Binary switch
-		# on fov_saturated rather than a continuous ramp on area_fraction:
-		# it's already a validated, zero-extra-cost signal (see the
-		# fov_saturation_vs_divergence.png diagnostic), and this regime is
-		# entered once, close to touchdown, not revisited repeatedly --
-		# revisit as a smooth ramp only if the step itself turns out to
-		# leave a visible mark on the divergence trace.
-		winsize_close: int = 35,
-		levels_close: int = 4,
-		pyr_scale_close: float = 0.6,
+		# --- ROI-adaptive downsampling (replaces the old binary close-range
+		# Farneback parameter set) ---
+		#
+		# The old design used a SECOND, more expensive Farneback parameter set
+		# (winsize_close=35, levels_close=4, pyr_scale_close=0.6) switched on
+		# fov_saturated, reasoning that a bigger/closer ROI needs a bigger
+		# search window. That made the single most expensive regime of the
+		# whole descent (full-frame ROI, closest to touchdown) also the most
+		# computationally expensive -- exactly backwards for a latency budget
+		# that a de Croon stability gate depends on (see bee_node.py's
+		# STABILITY_DT_SEC / VISION_PROCESSING_LATENCY_BUDGET_SEC).
+		#
+		# The replacement: shrink the ROI itself before Farneback runs, by a
+		# factor tied to the ROI's own size, so the array Farneback actually
+		# searches stays close to a FIXED working size regardless of how big
+		# the target has grown -- a bigger ROI gets MORE downsampling, not a
+		# bigger search window. This is justified by the same "we don't need
+		# per-pixel resolution once the ROI is a single expanding surface"
+		# reasoning the old close-range branch already used, just applied to
+		# the search cost directly instead of to the window size.
+		#
+		# Mechanics (see update()): prev_roi/gray_roi are resized down by
+		# `scale` before calcOpticalFlowFarneback (a single, cheap cv2.resize,
+		# INTER_AREA -- the correct anti-aliasing choice for shrinking);
+		# Farneback then runs with the SAME parameters (pyr_scale/levels/
+		# winsize/iterations/poly_n/poly_sigma above) in both regimes, since
+		# after downsampling a big-ROI close-range frame and a small-ROI
+		# far-field frame present Farneback with a similarly-sized problem.
+		# The resulting flow field is amplitude-corrected (divided by
+		# `scale` -- a downsampled-pixel of apparent motion is 1/scale
+		# original pixels of real motion).
+		#
+		# From there, WITHOUT de-rotation active, the affine divergence fit
+		# runs DIRECTLY on this still-downsampled field -- it does not need
+		# reconstructing to full ROI resolution first. _fit_divergence_affine
+		# takes a pixel_scale argument for exactly this: it widens the
+		# coordinate spacing it fits against by 1/scale to match, so the
+		# fitted slope (the divergence) comes out in the same physical units
+		# regardless of how densely the array it's fitting was sampled. This
+		# matters because profiling showed the fit itself (the weighted
+		# lstsq solve plus the trim-and-refit pass) -- not Farneback -- was
+		# the dominant cost once Farneback alone had already been shrunk by
+		# downsampling: reconstructing the field to full resolution before
+		# fitting left the fit solving over the same point count as before,
+		# undoing most of the savings for the one piece of update() that
+		# actually cost the most. Fitting on the small field directly closes
+		# that gap (measured ~2x further reduction on top of the earlier
+		# downsampling-with-upsample version, in addition to whatever
+		# derotation being off already saved).
+		#
+		# WITH de-rotation active, this shortcut is skipped: Derotator
+		# samples the rotational model at full-image pixel coordinates (see
+		# derotation.py), so update() upsamples the field back to full ROI
+		# resolution first in that case, exactly as before -- correctness
+		# for a currently-disabled feature was not worth the risk of a
+		# subtle scale bug to save time on a path that isn't running.
+		#
+		# downsample_target_px: the working array's target max dimension.
+		#     scale = clip(downsample_target_px / max(roi_w, roi_h),
+		#                   downsample_min_scale, 1.0)
+		#     A ROI already <= this size is left alone (scale clips to 1.0):
+		#     the far-field regime, with its naturally compact ROI, is
+		#     unaffected. Only a ROI bigger than this target gets shrunk, and
+		#     it shrinks MORE the bigger it is -- exactly the "big ROI, more
+		#     downsample" behavior wanted, and it degrades gracefully (a
+		#     continuous function of ROI size) rather than the old binary
+		#     fov_saturated switch.
+		# downsample_min_scale: a floor so an extreme close-in ROI (already
+		#     the full 120x80 frame at this project's camera resolution)
+		#     can't be shrunk into too few pixels for the affine fit's
+		#     min_points_for_affine_fit guard to have real texture to chew on.
+		downsample_target_px: int = 96,
+		downsample_min_scale: float = 0.5,
 		require_target_roi: bool = True,
 		roi_margin_fraction: float = 0.05,
 		min_roi_size_px: int = 32,
@@ -105,6 +157,12 @@ class OpticalFlowEstimator:
 		# it; leave None for the legacy (no de-rotation) behavior. When set,
 		# update() also needs a per-frame body_rates vector to actually
 		# subtract anything -- without it the flow is passed through unchanged.
+		# DISABLED BY DEFAULT as of the light optical-flow pass (see
+		# bee_node.py): re-enable once the downsampled flow field has been
+		# re-validated against the derotation acceptance test in
+		# derotation.py's docstring (downsampling changes the flow field's
+		# spatial resolution, which the rotational-field model samples at
+		# full resolution).
 		derotator=None,
 	):
 		self._prev_gray = None
@@ -118,9 +176,8 @@ class OpticalFlowEstimator:
 		self._poly_n = poly_n
 		self._poly_sigma = poly_sigma
 
-		self._winsize_close = int(winsize_close)
-		self._levels_close = int(levels_close)
-		self._pyr_scale_close = float(pyr_scale_close)
+		self._downsample_target_px = max(3, int(downsample_target_px))
+		self._downsample_min_scale = max(1e-3, min(1.0, float(downsample_min_scale)))
 
 		self._require_target_roi = bool(require_target_roi)
 		self._roi_margin_fraction = float(roi_margin_fraction)
@@ -241,26 +298,64 @@ class OpticalFlowEstimator:
 
 			return result
 
-		# Close-range regime: see the constructor's winsize_close/levels_close/
-		# pyr_scale_close docstring. Read directly off the TargetEstimate
-		# already passed in -- no new signal needed.
-		close_range = bool(target is not None and getattr(target, "fov_saturated", False))
-		pyr_scale = self._pyr_scale_close if close_range else self._pyr_scale
-		levels = self._levels_close if close_range else self._levels
-		winsize = self._winsize_close if close_range else self._winsize
+		# ROI-adaptive downsampling (see constructor docstring): shrink the
+		# search problem for a big ROI instead of growing the search window.
+		scale = self._downsample_scale_for_roi(prev_roi.shape[1], prev_roi.shape[0])
 
-		flow_px_per_frame = cv2.calcOpticalFlowFarneback(
-			prev_roi,
-			gray_roi,
+		if scale < 1.0:
+			small_w = max(3, int(round(prev_roi.shape[1] * scale)))
+			small_h = max(3, int(round(prev_roi.shape[0] * scale)))
+			prev_small = cv2.resize(prev_roi, (small_w, small_h), interpolation=cv2.INTER_AREA)
+			gray_small = cv2.resize(gray_roi, (small_w, small_h), interpolation=cv2.INTER_AREA)
+		else:
+			prev_small = prev_roi
+			gray_small = gray_roi
+
+		flow_small_per_frame = cv2.calcOpticalFlowFarneback(
+			prev_small,
+			gray_small,
 			None,
-			pyr_scale,
-			levels,
-			winsize,
+			self._pyr_scale,
+			self._levels,
+			self._winsize,
 			self._iterations,
 			self._poly_n,
 			self._poly_sigma,
 			0,
 		)
+
+		# A downsampled-pixel of apparent motion is 1/scale ORIGINAL pixels of
+		# real motion -- correct the amplitude regardless of what happens next.
+		flow_small_per_frame = flow_small_per_frame / scale if scale < 1.0 else flow_small_per_frame
+
+		# derotation needs to be decided BEFORE choosing whether to upsample:
+		# Derotator.rotational_flow samples the rotational model at full-image
+		# pixel coordinates (using x0, y0 -- this ROI's offset within the full
+		# frame), so it needs a full-resolution field to subtract against.
+		# Without derotation, there's no such requirement -- the affine fit
+		# doesn't care how densely its input is sampled, only that the
+		# coordinate SPACING it's told about matches what it's given (see
+		# _fit_divergence_affine's pixel_scale). Fitting directly on the
+		# downsampled field, instead of reconstructing it to full ROI
+		# resolution first, is what actually shrinks the fit's cost --
+		# downsampling Farneback alone left the fit solving over the same
+		# point count as before every time, which was most of what this
+		# function was actually spending on close-range descent (see
+		# bee_node.py's VISION_PROCESSING_LATENCY_BUDGET_SEC docstring).
+		derotation_active = self._derotator is not None and body_rates is not None
+
+		if derotation_active and scale < 1.0:
+			flow_px_per_frame = cv2.resize(
+				flow_small_per_frame,
+				(prev_roi.shape[1], prev_roi.shape[0]),
+				interpolation=cv2.INTER_LINEAR,
+			)
+			fit_pixel_scale = 1.0
+			gradient_source = prev_roi
+		else:
+			flow_px_per_frame = flow_small_per_frame
+			fit_pixel_scale = scale
+			gradient_source = prev_small
 
 		flow_px_s = flow_px_per_frame / dt
 
@@ -275,7 +370,6 @@ class OpticalFlowEstimator:
 		# the reference stays intact. When de-rotation is inactive the two names
 		# alias the same array and raw == corrected everywhere (no double work).
 		raw_flow_px_s = flow_px_s
-		derotation_active = self._derotator is not None and body_rates is not None
 		if derotation_active:
 			flow_px_s = self._derotator.derotate(
 				flow_px_s, body_rates, roi=(x0, y0, x1, y1)
@@ -298,18 +392,35 @@ class OpticalFlowEstimator:
 		# _fit_divergence_affine / this module's docstring): a flat,
 		# texture-poor patch gives near-random Farneback output and should
 		# be trusted less than a high-gradient patch, not averaged in
-		# equally. Computed on prev_roi (the frame flow vectors are anchored
-		# to) so it costs one Sobel pass, not two.
-		gradient_magnitude = self._gradient_magnitude(prev_roi)
+		# equally. Computed on gradient_source -- prev_roi (full ROI
+		# resolution) only when derotation forced an upsample above,
+		# otherwise prev_small, so the weight map always matches
+		# flow_px_s's actual shape without a separate resize step.
+		gradient_magnitude = self._gradient_magnitude(gradient_source)
 
 		# Debug-only: a per-pixel finite-difference field, useful to *look at*
 		# (e.g. to see whether signal is rim-only vs whole-field). The
 		# production scalar below is fit independently and more robustly --
-		# see the module docstring.
-		divergence_field = self._estimate_divergence_field(
-			flow_px_s=flow_px_s,
-			image_width=image_width,
-			image_height=image_height,
+		# see the module docstring. Gated behind store_debug: this was
+		# previously computed EVERY frame regardless (np.gradient over the
+		# full ROI -- the largest ROI of the whole descent, once
+		# fov_saturated pins it to the full frame) even though _save_debug
+		# only ever kept the result when store_debug was already True. That
+		# made it pure wasted wall-clock cost on every real flight, and real
+		# wall-clock cost here is exactly what feeds
+		# bee_node.py's VISION_PROCESSING_LATENCY_BUDGET_SEC / the de Croon
+		# gate's dt -- so a debug-only computation was silently eating into
+		# the safety margin on every production run, not just during
+		# debugging.
+		divergence_field = (
+			self._estimate_divergence_field(
+				flow_px_s=flow_px_s,
+				image_width=image_width,
+				image_height=image_height,
+				pixel_scale=fit_pixel_scale,
+			)
+			if self._store_debug
+			else None
 		)
 
 		raw_divergence, n_inliers, fit_quality = self._fit_divergence_affine(
@@ -317,6 +428,7 @@ class OpticalFlowEstimator:
 			image_width=image_width,
 			image_height=image_height,
 			gradient_magnitude=gradient_magnitude,
+			pixel_scale=fit_pixel_scale,
 		)
 		filtered_divergence = self._filter_divergence(raw_divergence)
 
@@ -325,12 +437,25 @@ class OpticalFlowEstimator:
 		# the divergence estimate. Recomputed only when de-rotation actually ran
 		# (otherwise identical to raw_divergence). Same gradient weighting -- the
 		# weight map is image-derived and de-rotation-independent.
+		#
+		# robust=False here (see _fit_divergence_affine): this value is
+		# logged for offline analysis only (state.py's
+		# divergence_prederotation / diagnostics_writer.py), never read by
+		# control_law.py or mission_routine.py, so it does not need the
+		# second trim-and-refit pass that the CONTROL-facing raw_divergence
+		# above gets -- that pass roughly doubles this call's cost, and this
+		# is a second full affine solve happening on top of the one above,
+		# every frame, at whatever the current ROI size is (largest right
+		# when fov_saturated makes it the full frame -- exactly the regime
+		# this latency budget matters most in).
 		if derotation_active:
 			divergence_prederotation, _, _ = self._fit_divergence_affine(
 				flow_px_s=raw_flow_px_s,
 				image_width=image_width,
 				image_height=image_height,
 				gradient_magnitude=gradient_magnitude,
+				robust=False,
+				pixel_scale=fit_pixel_scale,
 			)
 		else:
 			divergence_prederotation = raw_divergence
@@ -379,9 +504,34 @@ class OpticalFlowEstimator:
 		image_width: int,
 		image_height: int,
 		gradient_magnitude: Optional[np.ndarray] = None,
+		robust: bool = True,
+		pixel_scale: float = 1.0,
 	) -> Tuple[float, int, float]:
 		"""
 		Divergence via a global affine fit, not a per-pixel median.
+
+		robust: when True (the control-facing default), runs the
+		    trim-and-refit outlier pass documented below. When False, returns
+		    straight after the first weighted OLS solve -- roughly half the
+		    cost, at the price of no outlier robustness. Only intended for
+		    diagnostic-only callers (e.g. update()'s divergence_prederotation)
+		    where a coarser number logged for offline analysis is an
+		    acceptable trade for not doubling a control-path-adjacent cost
+		    every frame.
+
+		pixel_scale: how many ORIGINAL ROI pixels each element of flow_px_s
+		    represents, when flow_px_s is itself a downsampled array (see
+		    update()'s ROI-adaptive downsampling: fitting directly on the
+		    downsampled field, instead of reconstructing it to full ROI
+		    resolution first, is what actually shrinks this fit's cost --
+		    downsampling Farneback alone left this function solving over the
+		    same point count as before). 1.0 (the default) means flow_px_s is
+		    already at full ROI resolution -- unchanged behavior. A value s<1
+		    means adjacent array elements are 1/s original pixels apart, so
+		    the coordinate spacing (dx_norm/dy_norm below) widens by 1/s to
+		    match -- the flow VALUES themselves are assumed to already be
+		    amplitude-corrected to original-pixel units by the caller (see
+		    update()), so only the coordinate axis needs adjusting here.
 
 		Model (normalized image units/s, same scale as mean_flow_*_norm):
 		    u(x, y) = a0 + a1*x + a2*y
@@ -401,7 +551,7 @@ class OpticalFlowEstimator:
 		module's docstring already describes for a texture-poor interior --
 		previously handled only by hoping the textured rim was in-frame to
 		out-vote it in an unweighted fit. Once fov_saturated removes the rim
-		entirely (see optical_flow_estimator's winsize_close docstring),
+		entirely (see optical_flow_estimator's downsample_target_px docstring),
 		weighting is what keeps a locally-flat patch of the interior from
 		being averaged in on equal footing with a high-gradient patch,
 		instead of relying on the rim being there to swamp it. Falls back to
@@ -435,8 +585,9 @@ class OpticalFlowEstimator:
 		u = flow_px_s[:, :, 0] / max(0.5 * image_width, 1.0)
 		v = flow_px_s[:, :, 1] / max(0.5 * image_height, 1.0)
 
-		dx_norm = 2.0 / max(image_width - 1, 1)
-		dy_norm = 2.0 / max(image_height - 1, 1)
+		s = max(1e-6, float(pixel_scale))
+		dx_norm = (2.0 / max(image_width - 1, 1)) / s
+		dy_norm = (2.0 / max(image_height - 1, 1)) / s
 
 		rows, cols = np.mgrid[0:roi_height, 0:roi_width]
 		x = (cols * dx_norm).ravel().astype(np.float64)
@@ -452,7 +603,7 @@ class OpticalFlowEstimator:
 		finite = np.isfinite(u_flat) & np.isfinite(v_flat) & np.isfinite(weight_flat)
 		n_finite = int(np.count_nonzero(finite))
 		if n_finite < self._min_points_for_affine_fit:
-			field = self._estimate_divergence_field(flow_px_s, image_width, image_height)
+			field = self._estimate_divergence_field(flow_px_s, image_width, image_height, pixel_scale=s)
 			return self._scalar_from_divergence_field(field), n_finite, 0.0
 
 		x, y, u_flat, v_flat, weight_flat = (
@@ -463,6 +614,9 @@ class OpticalFlowEstimator:
 		coeffs, divergence, fit_quality = self._weighted_affine_least_squares(
 			design, u_flat, v_flat, weight_flat
 		)
+
+		if not robust:
+			return float(divergence), n_finite, float(fit_quality)
 
 		residual = (u_flat - design @ coeffs[0]) ** 2 + (v_flat - design @ coeffs[1]) ** 2
 		threshold = np.quantile(residual, self._affine_inlier_quantile)
@@ -535,6 +689,19 @@ class OpticalFlowEstimator:
 		gy = cv2.Sobel(gray_roi, cv2.CV_32F, 0, 1, ksize=3)
 		return cv2.magnitude(gx, gy)
 
+	def _downsample_scale_for_roi(self, roi_width: int, roi_height: int) -> float:
+		"""scale = clip(downsample_target_px / max(roi_w, roi_h), min_scale, 1.0)
+
+		1.0 (no downsampling) for any ROI already at or below the target size
+		-- the far-field regime is unaffected. Shrinks continuously, more for
+		a bigger ROI, once it exceeds the target -- replaces the old binary
+		fov_saturated switch to a bigger search window with a continuous
+		switch to a smaller search problem. See constructor docstring.
+		"""
+		largest_dim = max(int(roi_width), int(roi_height), 1)
+		scale = self._downsample_target_px / float(largest_dim)
+		return max(self._downsample_min_scale, min(1.0, scale))
+
 	def reset(self):
 		self._prev_gray = None
 		self._prev_bgr = None
@@ -599,6 +766,7 @@ class OpticalFlowEstimator:
 		flow_px_s: np.ndarray,
 		image_width: int,
 		image_height: int,
+		pixel_scale: float = 1.0,
 	) -> np.ndarray:
 		roi_height, roi_width = flow_px_s.shape[:2]
 
@@ -611,8 +779,9 @@ class OpticalFlowEstimator:
 		u_norm_s = flow_px_s[:, :, 0] / (0.5 * image_width)
 		v_norm_s = flow_px_s[:, :, 1] / (0.5 * image_height)
 
-		dx_norm = 2.0 / max(image_width - 1, 1)
-		dy_norm = 2.0 / max(image_height - 1, 1)
+		s = max(1e-6, float(pixel_scale))
+		dx_norm = (2.0 / max(image_width - 1, 1)) / s
+		dy_norm = (2.0 / max(image_height - 1, 1)) / s
 
 		du_dx = np.gradient(u_norm_s, dx_norm, axis=1)
 		dv_dy = np.gradient(v_norm_s, dy_norm, axis=0)

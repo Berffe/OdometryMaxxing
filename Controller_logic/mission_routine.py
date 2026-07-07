@@ -191,7 +191,7 @@ class PlatformProbe:
 	"infeasible" calls.
 	"""
 
-	def __init__(self, thrust_model: ThrustModel, highpass_tau_sec: float = 2.5):
+	def __init__(self, thrust_model: ThrustModel, highpass_tau_sec: float = 7):
 		# highpass_tau_sec sets the EMA time constant used to subtract the
 		# slow mean before tracking peak |accel|. It must be long enough to
 		# remove the thrust loop's own slow resonance (documented ~23s ring in
@@ -215,7 +215,7 @@ class PlatformProbe:
 		self._n = 0
 		self._elapsed = 0.0
 
-	def update(self, thrust_cmd: float, dt: float) -> None:
+	def update(self, thrust_cmd: float, dt: float, safe_accel : float = 0.1) -> None:
 		dt = max(1e-3, float(dt))
 		a = self._tm.accel_from_thrust(thrust_cmd)
 
@@ -226,7 +226,7 @@ class PlatformProbe:
 			alpha = math.exp(-dt / max(1e-3, self._tau))
 			self._mean = alpha * self._mean + (1.0 - alpha) * a
 
-		ac = abs(a - self._mean)
+		ac = abs(a - self._mean)*(1 + safe_accel)
 		self._peak = max(self._peak, ac)
 		self._n += 1
 		self._elapsed += dt
@@ -412,6 +412,25 @@ class MissionRoutine:
 		# hold in. Default 1/30s matches this project's camera plugin config;
 		# override if yours differs. If None, falls back to control_period_sec
 		# (the old, WALL-loop-period behavior) for backward compatibility.
+		#
+		# CORRECTION (see bee_node.py's STABILITY_DT_SEC for the full
+		# reasoning): the camera frame period alone still UNDERSTATES the true
+		# dead-time, for two further reasons, both confirmed against real
+		# flight logs rather than assumed:
+		#   1. If a separate WALL-clock timer publishes setpoints to PX4 slower
+		#      than the camera produces new estimates (as it does here: 20Hz
+		#      publish vs 30Hz camera), that publish timer -- not the camera --
+		#      is what actually bounds how often a fresh correction reaches the
+		#      actuator. Use max(camera_period, publish_period), not the camera
+		#      period alone.
+		#   2. Real, RTF-independent wall-clock compute time (target
+		#      acquisition + optical flow + the divergence fit) sits between a
+		#      frame arriving and a command being ready to publish at all. This
+		#      is additive on top of (1), not folded into it via max() --
+		#      it delays availability, it doesn't set a rate.
+		# This constructor still just takes whatever stability_dt_sec it's
+		# given; bee_node.py's STABILITY_DT_SEC constant is where these three
+		# terms are actually composed and fed in.
 		stability_dt_sec: Optional[float] = 1.0 / 30.0,
 		# HAND-TUNED initial/exploration thrust gain "k" (m/s), set like the
 		# lateral PD gains rather than derived from height + Ho's ceiling. This
@@ -528,8 +547,8 @@ class MissionRoutine:
 		# validated (roll_kp=0.22, roll_kd=0.11, pitch_kp=0.15, pitch_kd=0.07)
 		# gains to within <0.4% (the residual is rounding in the stored
 		# decimal constants, not a modeling error).
-		center_lateral_p_scale: float = 0.5,
-		center_lateral_d_scale: float = 1.0 / math.sqrt(2.0),
+		center_lateral_p_scale: float = 1,
+		center_lateral_d_scale: float = 1,
 		# STEADY PROBE lateral P scale (kd left at 1.0 -- deliberately NOT
 		# raised further, since raising kd was already A/B-tested and found
 		# to make tracking WORSE, not better: it operates on optical flow, a
@@ -558,7 +577,7 @@ class MissionRoutine:
 		# and phase should move away from -90 deg (toward 0) if this is
 		# working. 1.0 disables this (PROBE at the current tracking-tuned
 		# kp, unchanged).
-		probe_lateral_p_scale: float = 1.5,
+		probe_lateral_p_scale: float = 1.0,
 		probe_lateral_d_scale: float = 1.0,
 	):
 		self._dt = float(control_period_sec)
@@ -776,7 +795,7 @@ class MissionRoutine:
 				},
 			)
 
-		self._probe.update(last_thrust_cmd, dt)
+		self._probe.update(last_thrust_cmd, dt, safe_accel=0.2)
 		self.probe_result = self._probe.result(self._probe_min)
 
 		if self.probe_result.ready:

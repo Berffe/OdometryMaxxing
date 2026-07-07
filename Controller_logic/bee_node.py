@@ -41,9 +41,13 @@ from .mavsdk_worker import MavsdkWorker
 from .clock import TimeManager
 
 
-CONTROL_PERIOD_SEC = 0.05
+# Control computation is intentionally faster than the PX4 publication stream:
+# - control timer: low-latency polling for NEW vision samples
+# - PX4 setpoint timer: fixed, predictable offboard publication cadence
+CONTROL_PERIOD_SEC = 0.01
 MISSION_PERIOD_SEC = 0.05
 PX4_SETPOINT_PERIOD_SEC = 0.05
+COMPUTE_CONTROL_ONLY_ON_NEW_VISION = True
 PX4_OFFBOARD_SWITCH_SETTLE_SEC = 0.5
 
 # ============================================================================
@@ -84,7 +88,7 @@ PX4_OFFBOARD_SWITCH_SETTLE_SEC = 0.5
 # (and so h_crit smaller / more likely feasible), at the cost of less time to
 # react to vision dropouts. 0.15 1/s is a starting point, not tuned.
 # *** SOURCE OF TRUTH for the flown value -- see the WARNING above. ***
-DESCENT_DIVERGENCE_SETPOINT = 0.30
+DESCENT_DIVERGENCE_SETPOINT = 0.50
 # Ramp the commanded D* linearly from 0 to DESCENT_DIVERGENCE_SETPOINT over
 # this many seconds at descent entry, instead of stepping it instantly. Fixes
 # the thrust/vz transient measured at PROBE->DESCEND (a real step in the
@@ -162,14 +166,54 @@ PROBE_LATERAL_D_SCALE = 1
 PROBE_MIN_DURATION_SEC = 15.0
 
 # dt fed into the de Croon feasibility gate -- see mission_routine.py's
-# stability_dt_sec constructor docstring for the full reasoning. This is
-# DELIBERATELY the camera's known sim-time frame period, NOT CONTROL_PERIOD_SEC
-# above and NOT any wall-clock-measured vision rate: the gate's dt must equal
-# what a real camera delivers at RTF=1 (the regime the safety margin has to
-# hold in on real hardware), independent of how slow any particular sim run
-# happens to be. Update this if your camera plugin's configured fps differs
-# from 30 Hz.
-STABILITY_DT_SEC = 1.0 / 30.0
+# stability_dt_sec constructor docstring for the base reasoning (why this must
+# be a hardware-real, RTF=1 quantity, not a wall-clock-measured one). This
+# composes THREE terms, each independently real and RTF-independent, and each
+# missing from the original single-term (1/30 s) estimate:
+#
+# 1. CAMERA_FRAME_PERIOD_SEC: what the camera delivers at RTF=1 -- unchanged
+#    reasoning from before.
+# 2. PX4_SETPOINT_PERIOD_SEC (defined above): the ROS WALL-clock timer that
+#    actually publishes to PX4. This is a genuine hardware period (a fixed
+#    ROS timer, not gated to the vision/sim clock -- confirmed against logs:
+#    timing_px4_publish_period_wall_sec tracks 0.05s regardless of
+#    timing_sim_rtf_estimate), so no RTF correction is needed for it, unlike
+#    timing_control_period_wall_sec (which IS inflated by RTF and must never
+#    feed this estimate). It matters because a fresh vision-driven correction
+#    can only reach the actuator at the rate of WHICHEVER TIMER IS SLOWER: if
+#    the camera produces a new estimate faster than PX4_SETPOINT_PERIOD_SEC,
+#    intermediate corrections are simply never sent (the publish timer only
+#    ever picks up the latest). At 30 Hz camera / 20 Hz publish, the publish
+#    period (0.05s) is the binding one, not the camera's own 1/30s -- taking
+#    max() of the two is therefore the physically correct choice, not a
+#    guess; a system with a faster publish timer than its camera would
+#    instead be camera-bound and max() would correctly fall back to that.
+# 3. VISION_PROCESSING_LATENCY_BUDGET_SEC: real, wall-clock CPU time between
+#    a frame arriving and a corrected command being READY to publish (target
+#    acquisition + optical flow + the divergence fit). This is a SEPARATE
+#    term from the two periods above -- it's not "how often can a fresh
+#    correction go out", it's "how long after the sensor sample is one ready
+#    at all" -- so it is ADDED, not chosen via max(). Confirmed
+#    RTF-independent from logs, and as of the on_camera per-stage timing
+#    breakdown (timing_stage_*_ms below), confirmed to be dominated by
+#    optical_flow.update() specifically -- not Farneback itself, but the
+#    divergence affine fit's np.linalg.lstsq calls (two fits x a
+#    trim-and-refit pass each = 4 solves/frame with derotation on). Set from
+#    a conservative (not mean) reading of timing_stage_optical_flow_ms /
+#    timing_camera_cb_duration_ms -- the same "a single spike only makes the
+#    gate MORE conservative, which is the safe direction" logic
+#    PlatformProbe.result() already applies to peak_accel -- because an
+#    underestimate here silently reopens the exact gap this whole correction
+#    exists to close. Re-measure and update whenever the optical-flow
+#    pipeline's cost changes.
+CAMERA_FRAME_PERIOD_SEC = 1.0 / 30.0
+VISION_PROCESSING_LATENCY_BUDGET_SEC = 0.01  # conservative p95-ish reading of
+                                              # timing_camera_cb_duration_ms;
+                                              # re-measure after pipeline changes.
+STABILITY_DT_SEC = (
+	max(CAMERA_FRAME_PERIOD_SEC, PX4_SETPOINT_PERIOD_SEC)
+	+ VISION_PROCESSING_LATENCY_BUDGET_SEC
+)
 
 # --- Belly-camera intrinsics, mirrored from model.sdf's bee_camera sensor -----
 # model.sdf: <horizontal_fov>1.3962634</horizontal_fov> (= 80 deg),
@@ -221,12 +265,12 @@ HOVER_PROBE_ONLY = False
 # *** SOURCE OF TRUTH for the flown value -- see the WARNING above. ***
 INITIAL_THRUST_GAIN = 6.5
 
-SHOW_CAMERA = True
+SHOW_CAMERA = False
 VERBOSE_STREAM_LOGS = False
 
 # Start the attempt already airborne. 5 m corresponds to the cleanest far-range
 # calibration operating point (area_fraction around 0.066 in the last batch).
-TAKEOFF_ALTITUDE_M = 5.0
+TAKEOFF_ALTITUDE_M = 7.0
 EKF2_SETTLE_TIME = 5.0
 MAVSDK_SYSTEM_ADDRESS = "udpin://0.0.0.0:14540"
 MAVSDK_PORT_TO_FREE = 14540
@@ -433,6 +477,49 @@ class BeeLandNode(Node):
 		# value: in this setup they can live in different epochs. Only deltas inside
 		# one clock family are meaningful.
 		self._prev_control_flow_timestamp = None
+		# CONTROL_PERIOD_SEC can be faster than the camera. In that case the
+		# 100 Hz timer should act as a low-latency poller for fresh vision, not
+		# as a fake 100 Hz visual controller repeatedly integrating/filtering the
+		# same optical-flow sample. This stamp records the last flow sample that
+		# actually produced a new command.
+		self._last_controlled_flow_timestamp = None
+
+		# Wall-clock latency diagnostics. These do not feed the controller; they
+		# only tell us whether delay comes from vision processing, control polling,
+		# the fixed PX4 publication cadence, or simulator real-time factor.
+		self._latest_camera_cb_start_wall = None
+		self._latest_camera_cb_end_wall = None
+		self._latest_camera_cb_duration_ms = None
+		# Per-stage breakdown of on_camera, added to find which stage actually
+		# owns camera_cb_duration_ms's ~40-200ms wall-clock cost -- isolated
+		# benchmarking of Farneback (~2.5ms at this project's 120x80
+		# resolution) and target_acquisition's masks/contours (<1ms combined)
+		# accounts for only a small fraction of that, and disabling
+		# SHOW_CAMERA changed the total by ~4% (noise), ruling out imshow as
+		# the dominant cost too. These are diagnostics-only -- like
+		# camera_cb_duration_ms itself, never read by the controller -- and
+		# exist purely to find the real cost before trusting any wall-clock
+		# number as bee_node.py's VISION_PROCESSING_LATENCY_BUDGET_SEC.
+		self._latest_stage_bridge_ms = None
+		self._latest_stage_rotate_ms = None
+		self._latest_stage_show_camera_ms = None
+		self._latest_stage_body_rate_ms = None
+		self._latest_stage_target_acquisition_ms = None
+		self._latest_stage_optical_flow_ms = None
+		self._last_control_compute_start_wall = None
+		self._last_control_compute_end_wall = None
+		self._last_control_compute_duration_ms = None
+		self._last_control_period_wall_sec = None
+		self._last_control_dt_vision_sec = None
+		self._latest_setpoint_compute_wall = None
+		self._latest_setpoint_flow_timestamp = None
+		self._prev_px4_publish_wall = None
+		self._last_px4_publish_wall = None
+		self._last_px4_publish_period_wall_sec = None
+		self._last_px4_command_age_ms = None
+		self._last_px4_flow_age_ms = None
+		self._px4_publish_count = 0
+
 		self._control_dt_fallback_logged = False
 		self._image_stamp_fallback_logged = False
 
@@ -489,7 +576,15 @@ class BeeLandNode(Node):
 		self._rate_buffer = AngularRateBuffer()
 		self._prev_camera_stamp = None
 
-		self.optical_flow = OpticalFlowEstimator(derotator=self._derotator)
+		# DE-ROTATION DISABLED FOR NOW (see optical_flow.py's update() --
+		# derotation_active requires BOTH a derotator AND body_rates, so
+		# passing None here is enough to turn it off cleanly without touching
+		# anything else). self._derotator/_rate_buffer are still built above
+		# since on_camera still logs body rates regardless -- this only
+		# removes the ego-rotation subtraction from the divergence path.
+		# Re-enable by passing derotator=self._derotator once the light
+		# (downsampled) Farneback path has been re-validated with it.
+		self.optical_flow = OpticalFlowEstimator(derotator=None)
 		self.target_acquisition = TargetAcquisition()
 
 		self.diagnostics = DiagnosticsWriter(output_dir="logs", filename=None, flush_every_row=True)
@@ -605,6 +700,7 @@ class BeeLandNode(Node):
 	def on_camera(self, msg: Image):
 		self._image_count += 1
 		now = self.time.wall_sec()
+		self._latest_camera_cb_start_wall = now
 		if VERBOSE_STREAM_LOGS and now - self._last_image_log_time >= 1.0:
 			self._last_image_log_time = now
 			self.get_logger().info(f"image #{self._image_count}: {msg.width}x{msg.height}, encoding={msg.encoding}")
@@ -615,12 +711,17 @@ class BeeLandNode(Node):
 			self.get_logger().error(f"cv_bridge conversion failed: {exc}")
 			return
 
+		t_bridge = self.time.wall_sec()
+
 		# Keep camera orientation independent of whether the debug window is open.
 		frame = cv2.rotate(src, cv2.ROTATE_180)
+		t_rotate = self.time.wall_sec()
+
 		if SHOW_CAMERA:
 			with suppress_stderr_fd(True):
 				cv2.imshow("Bee Land - Camera", frame)
 				cv2.waitKey(1)
+		t_show = self.time.wall_sec()
 
 		stamp = self._image_timestamp_sec(msg)
 		self.time.observe_sim_timestamp(stamp)
@@ -639,15 +740,35 @@ class BeeLandNode(Node):
 			if ok:
 				body_rates = omega_mean
 		self._prev_camera_stamp = stamp
+		t_body_rate = self.time.wall_sec()
 
 		target = self.target_acquisition.update(frame, timestamp=stamp)
+		t_target = self.time.wall_sec()
+
 		flow = self.optical_flow.update(
 			frame, stamp, target=target, body_rates=body_rates
 		)
+		t_flow = self.time.wall_sec()
 
 		self._latest_frame = frame
 		self._latest_target = target
 		self._latest_flow = flow
+		self._latest_camera_cb_end_wall = self.time.wall_sec()
+		self._latest_camera_cb_duration_ms = (
+			1000.0 * (self._latest_camera_cb_end_wall - self._latest_camera_cb_start_wall)
+			if self._latest_camera_cb_start_wall is not None else None
+		)
+
+		# Per-stage breakdown -- diagnostics-only, see the constructor's
+		# comment above these attributes. These six numbers should sum to
+		# ~camera_cb_duration_ms; whichever one doesn't match its isolated
+		# micro-benchmark is the real trap, not a guess.
+		self._latest_stage_bridge_ms = 1000.0 * (t_bridge - now)
+		self._latest_stage_rotate_ms = 1000.0 * (t_rotate - t_bridge)
+		self._latest_stage_show_camera_ms = 1000.0 * (t_show - t_rotate)
+		self._latest_stage_body_rate_ms = 1000.0 * (t_body_rate - t_show)
+		self._latest_stage_target_acquisition_ms = 1000.0 * (t_target - t_body_rate)
+		self._latest_stage_optical_flow_ms = 1000.0 * (t_flow - t_target)
 
 	def on_platform_pose(self, msg: Pose):
 		"""
@@ -934,6 +1055,7 @@ class BeeLandNode(Node):
 			if self._px4_nav_state == PX4_NAV_STATE_OFFBOARD:
 				self._px4_offboard_started = True
 				self.control_law.reset_visual_integrators()
+				self._last_controlled_flow_timestamp = None
 				self.mission.start(
 					t=float(getattr(self._latest_flow, "timestamp", now)),
 					start_height_m=TAKEOFF_ALTITUDE_M-2,
@@ -969,6 +1091,7 @@ class BeeLandNode(Node):
 					)
 					self._px4_offboard_started = True
 					self.control_law.reset_visual_integrators()
+					self._last_controlled_flow_timestamp = None
 					self.mission.start(
 						t=float(getattr(self._latest_flow, "timestamp", now)),
 						start_height_m=TAKEOFF_ALTITUDE_M,
@@ -1002,11 +1125,10 @@ class BeeLandNode(Node):
 	def on_px4_setpoint_timer(self):
 		"""Publish the latest attitude/thrust setpoint directly to PX4.
 
-		This is the zero-order-hold output of the visual controller: the
-		controller recomputes _latest_setpoint at CONTROL_PERIOD_SEC, while this
-		timer republishes the last value at PX4_SETPOINT_PERIOD_SEC so PX4
-		keeps receiving OffboardControlMode and VehicleAttitudeSetpoint through
-		the uXRCE-DDS bridge.
+		This is the deliberately fixed-cadence zero-order-hold output of the
+		visual controller. The controller may poll for fresh vision faster than
+		this timer, but this timer is the single publication cadence used for
+		stabilization analysis and for PX4 offboard keepalive.
 		"""
 		if self._mission_phase not in (
 			PHASE_PRESTREAM,
@@ -1031,6 +1153,8 @@ class BeeLandNode(Node):
 			# One wall-clock instant for the whole cycle, shared by the
 			# heartbeat and the setpoint so PX4 sees them as one coherent pair.
 			tx_us = self.time.px4_tx_timestamp_us()
+			publish_wall = tx_us / 1e6
+
 			self.px4_interface.publish_heartbeat(tx_us)
 			self.px4_interface.publish_attitude_setpoint(
 				sp.roll,
@@ -1038,6 +1162,22 @@ class BeeLandNode(Node):
 				yaw_rad,
 				self._clamp(sp.thrust, 0.0, 1.0),
 				timestamp_us=tx_us,
+			)
+
+			if self._prev_px4_publish_wall is not None:
+				self._last_px4_publish_period_wall_sec = publish_wall - self._prev_px4_publish_wall
+			self._prev_px4_publish_wall = publish_wall
+			self._last_px4_publish_wall = publish_wall
+			self._px4_publish_count += 1
+
+			if self._latest_setpoint_compute_wall is not None:
+				self._last_px4_command_age_ms = 1000.0 * (
+					publish_wall - self._latest_setpoint_compute_wall
+				)
+
+			flow_wall = self.time.sim_to_wall_sec(getattr(self._latest_flow, "timestamp", None))
+			self._last_px4_flow_age_ms = (
+				1000.0 * (publish_wall - flow_wall) if flow_wall is not None else None
 			)
 		except Exception as exc:
 			self._px4_offboard_error = repr(exc)
@@ -1107,12 +1247,34 @@ class BeeLandNode(Node):
 		else:
 			self._lost_target_since = None
 
+		if COMPUTE_CONTROL_ONLY_ON_NEW_VISION:
+			flow_stamp = float(getattr(self._latest_flow, "timestamp", 0.0))
+			if flow_stamp <= 0.0:
+				return
+			if (
+				self._last_controlled_flow_timestamp is not None
+				and flow_stamp <= self._last_controlled_flow_timestamp + 1e-9
+			):
+				# The 100 Hz control timer has caught the same camera/flow sample
+				# again. Leave _latest_setpoint untouched; the PX4 setpoint timer
+				# will keep publishing it at its deliberately fixed 20 Hz cadence.
+				return
+			self._last_controlled_flow_timestamp = flow_stamp
+
+		control_compute_start_wall = self.time.wall_sec()
+		if self._last_control_compute_start_wall is not None:
+			self._last_control_period_wall_sec = (
+				control_compute_start_wall - self._last_control_compute_start_wall
+			)
+		self._last_control_compute_start_wall = control_compute_start_wall
+
 		# Mission routine: probe -> gate -> scheduled-gain descent. Feed it
 		# last cycle's ACTUAL commanded thrust (the efference copy of what has
 		# really been acting on the vehicle since the previous tick) before
 		# that field gets overwritten below by this tick's new setpoint.
 		t_vision = float(getattr(self._latest_flow, "timestamp", now))
 		dt = self._control_dt_sec()
+		self._last_control_dt_vision_sec = dt
 		previous_thrust = float(getattr(self._latest_setpoint, "thrust", self.control_law.hover_thrust))
 
 		previous_substate = self.mission.substate
@@ -1171,6 +1333,12 @@ class BeeLandNode(Node):
 			lateral_p_scale=mc.lateral_p_scale,
 			lateral_d_scale=mc.lateral_d_scale,
 			enable_integral=mc.enable_integral,
+		)
+		self._latest_setpoint_compute_wall = control_compute_start_wall
+		self._latest_setpoint_flow_timestamp = getattr(self._latest_flow, "timestamp", None)
+		self._last_control_compute_end_wall = self.time.wall_sec()
+		self._last_control_compute_duration_ms = (
+			1000.0 * (self._last_control_compute_end_wall - control_compute_start_wall)
 		)
 		self._write_diagnostics_row()
 
@@ -1297,7 +1465,41 @@ class BeeLandNode(Node):
 			px4_arming_state=self._px4_arming_state,
 			px4_failsafe=self._px4_failsafe,
 			divergence_integral=self.control_law.divergence_integral,
+			timing=self._timing_telemetry(),
 		)
+
+	def _timing_telemetry(self):
+		"""Timing/latency diagnostics only -- never feeds the controller."""
+		flow_wall = self.time.sim_to_wall_sec(getattr(self._latest_flow, "timestamp", None))
+		control_wall = self._last_control_compute_start_wall
+		flow_age_at_control_ms = (
+			1000.0 * (control_wall - flow_wall)
+			if control_wall is not None and flow_wall is not None else None
+		)
+		return {
+			"camera_cb_start_wall_sec": self._latest_camera_cb_start_wall,
+			"camera_cb_end_wall_sec": self._latest_camera_cb_end_wall,
+			"camera_cb_duration_ms": self._latest_camera_cb_duration_ms,
+			"stage_bridge_ms": self._latest_stage_bridge_ms,
+			"stage_rotate_ms": self._latest_stage_rotate_ms,
+			"stage_show_camera_ms": self._latest_stage_show_camera_ms,
+			"stage_body_rate_ms": self._latest_stage_body_rate_ms,
+			"stage_target_acquisition_ms": self._latest_stage_target_acquisition_ms,
+			"stage_optical_flow_ms": self._latest_stage_optical_flow_ms,
+			"control_compute_start_wall_sec": self._last_control_compute_start_wall,
+			"control_compute_end_wall_sec": self._last_control_compute_end_wall,
+			"control_compute_duration_ms": self._last_control_compute_duration_ms,
+			"control_period_wall_sec": self._last_control_period_wall_sec,
+			"control_dt_vision_sec": self._last_control_dt_vision_sec,
+			"flow_age_at_control_wall_ms": flow_age_at_control_ms,
+			"px4_publish_wall_sec": self._last_px4_publish_wall,
+			"px4_publish_period_wall_sec": self._last_px4_publish_period_wall_sec,
+			"command_age_at_px4_publish_ms": self._last_px4_command_age_ms,
+			"flow_age_at_px4_publish_wall_ms": self._last_px4_flow_age_ms,
+			"px4_publish_count": self._px4_publish_count,
+			"sim_rtf_estimate": self.time.sim_rtf_estimate(),
+			"px4_rtf_estimate": self.time.px4_rtf_estimate(),
+		}
 
 	def _mission_telemetry(self):
 		"""Flatten the latest MissionControl + mission bounds into a plain dict

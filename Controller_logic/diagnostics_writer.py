@@ -71,6 +71,7 @@ class DiagnosticsWriter:
 		px4_arming_state: Optional[int] = None,
 		px4_failsafe: Optional[bool] = None,
 		divergence_integral: Optional[float] = None,
+		timing: Optional[dict] = None,
 		**_: Any,
 	):
 		wall_timestamp = float(wall_timestamp)
@@ -196,6 +197,36 @@ class DiagnosticsWriter:
 				"mission_feasible": self._bool_int(mission.get("feasible", False)),
 			})
 
+		# Timing / latency telemetry. These columns separate the three relevant
+		# questions: (1) how old was the vision sample when the command was
+		# computed, (2) how regular is the deliberately fixed PX4 publication
+		# cadence, and (3) what real-time factor did the simulator/PX4 clock run at.
+		if timing is not None:
+			row.update({
+				"timing_camera_cb_start_wall_sec": self._num(timing.get("camera_cb_start_wall_sec")),
+				"timing_camera_cb_end_wall_sec": self._num(timing.get("camera_cb_end_wall_sec")),
+				"timing_camera_cb_duration_ms": self._num(timing.get("camera_cb_duration_ms")),
+				"timing_stage_bridge_ms": self._num(timing.get("stage_bridge_ms")),
+				"timing_stage_rotate_ms": self._num(timing.get("stage_rotate_ms")),
+				"timing_stage_show_camera_ms": self._num(timing.get("stage_show_camera_ms")),
+				"timing_stage_body_rate_ms": self._num(timing.get("stage_body_rate_ms")),
+				"timing_stage_target_acquisition_ms": self._num(timing.get("stage_target_acquisition_ms")),
+				"timing_stage_optical_flow_ms": self._num(timing.get("stage_optical_flow_ms")),
+				"timing_control_compute_start_wall_sec": self._num(timing.get("control_compute_start_wall_sec")),
+				"timing_control_compute_end_wall_sec": self._num(timing.get("control_compute_end_wall_sec")),
+				"timing_control_compute_duration_ms": self._num(timing.get("control_compute_duration_ms")),
+				"timing_control_period_wall_sec": self._num(timing.get("control_period_wall_sec")),
+				"timing_control_dt_vision_sec": self._num(timing.get("control_dt_vision_sec")),
+				"timing_flow_age_at_control_wall_ms": self._num(timing.get("flow_age_at_control_wall_ms")),
+				"timing_px4_publish_wall_sec": self._num(timing.get("px4_publish_wall_sec")),
+				"timing_px4_publish_period_wall_sec": self._num(timing.get("px4_publish_period_wall_sec")),
+				"timing_command_age_at_px4_publish_ms": self._num(timing.get("command_age_at_px4_publish_ms")),
+				"timing_flow_age_at_px4_publish_wall_ms": self._num(timing.get("flow_age_at_px4_publish_wall_ms")),
+				"timing_px4_publish_count": self._int_or_blank(timing.get("px4_publish_count", -1)),
+				"timing_sim_rtf_estimate": self._num(timing.get("sim_rtf_estimate")),
+				"timing_px4_rtf_estimate": self._num(timing.get("px4_rtf_estimate")),
+			})
+
 		# PX4 mode/arming: the ground truth for whether offboard is actually
 		# active. If commands look ignored, check px4_nav_state == 14 (OFFBOARD).
 		row["px4_nav_state"] = px4_nav_state if px4_nav_state is not None else ""
@@ -293,6 +324,28 @@ class DiagnosticsWriter:
 			"mission_h_pred_m",
 			"mission_peak_accel_m_s2",
 			"mission_feasible",
+			"timing_camera_cb_start_wall_sec",
+			"timing_camera_cb_end_wall_sec",
+			"timing_camera_cb_duration_ms",
+			"timing_stage_bridge_ms",
+			"timing_stage_rotate_ms",
+			"timing_stage_show_camera_ms",
+			"timing_stage_body_rate_ms",
+			"timing_stage_target_acquisition_ms",
+			"timing_stage_optical_flow_ms",
+			"timing_control_compute_start_wall_sec",
+			"timing_control_compute_end_wall_sec",
+			"timing_control_compute_duration_ms",
+			"timing_control_period_wall_sec",
+			"timing_control_dt_vision_sec",
+			"timing_flow_age_at_control_wall_ms",
+			"timing_px4_publish_wall_sec",
+			"timing_px4_publish_period_wall_sec",
+			"timing_command_age_at_px4_publish_ms",
+			"timing_flow_age_at_px4_publish_wall_ms",
+			"timing_px4_publish_count",
+			"timing_sim_rtf_estimate",
+			"timing_px4_rtf_estimate",
 			"px4_nav_state",
 			"px4_arming_state",
 			"px4_failsafe",

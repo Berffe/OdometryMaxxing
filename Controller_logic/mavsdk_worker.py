@@ -34,6 +34,29 @@ on that thread and read on the node's main thread. They are single-writer
 booleans/strings used only as one-way latches, so this is safe without a lock
 (the node never writes them; it only writes the request_* intents, which are
 likewise single-writer from its side).
+
+TOUCHDOWN-TO-MOTOR-STOP LATENCY. request_motor_stop()->motor_stop_done used to
+be gated purely by a fixed 50ms poll (`await asyncio.sleep(0.05)` in the main
+loop), and _try_motor_stop() always attempted a normal disarm() FIRST, even
+though on a moving platform PX4's own land detector is expected to refuse it
+-- meaning the common path paid for a full doomed MAVLink round-trip before
+ever reaching kill(), the command that actually works here. Both were real,
+stacking, previously unmeasured contributors to the gap between physical leg
+contact and motors actually stopping (see bee_node.py's touchdown handling +
+platform_motion.py's PLATFORM_TOP_SURFACE_OFFSET_M for how that gap was
+found: ~19cm of apparent leg interpenetration in one logged landing). Fixed
+here two ways:
+  1. An asyncio.Event wakes the worker loop the instant request_motor_stop()
+     fires, instead of waiting out the next poll tick -- see _wake_event.
+  2. When enable_kill_fallback is set (the SITL/moving-platform case this
+     whole mechanism exists for), the doomed disarm() attempt is skipped
+     entirely and kill() is issued directly -- see _try_motor_stop.
+  3. Every stage now gets a monotonic timestamp (self.timing_*), so the next
+     landing log can show which stage actually dominates rather than assume
+     it -- these are diagnostics-only, read by nothing in this file, plain
+     time.monotonic() (not clock.py's WALL/SIM/PX4 family: this is a
+     same-process duration measurement, not a cross-system correlation, so
+     it doesn't need that taxonomy).
 """
 
 import asyncio
@@ -41,6 +64,7 @@ import os
 import signal
 import subprocess
 import threading
+import time
 from typing import Callable, Optional
 
 try:
@@ -77,6 +101,11 @@ class MavsdkWorker:
 		self._enable_kill_fallback = bool(enable_kill_fallback)
 
 		self._thread: Optional[threading.Thread] = None
+		# Set once the worker's event loop is running (see _worker_async);
+		# lets request_motor_stop()/request_stop(), called from the node's
+		# thread, wake the worker immediately instead of waiting out a poll.
+		self._loop: Optional[asyncio.AbstractEventLoop] = None
+		self._wake_event: Optional[asyncio.Event] = None
 
 		# One-way status latches (written on the worker thread, read on main).
 		self.takeoff_started = False
@@ -91,6 +120,18 @@ class MavsdkWorker:
 		self.motor_stop_attempted = False
 		self.motor_stop_done = False
 		self.motor_stop_error: Optional[str] = None
+
+		# Diagnostics-only timing (time.monotonic() seconds; None until each
+		# stage happens). See module docstring's TOUCHDOWN-TO-MOTOR-STOP
+		# LATENCY note -- lets a landing log show which stage actually
+		# dominates the touchdown-to-motor-stop gap instead of assuming it.
+		self.timing_motor_stop_requested = None      # request_motor_stop() called
+		self.timing_motor_stop_picked_up = None      # worker loop woke and saw the request
+		self.timing_pre_motor_stop_done = None       # on_pre_motor_stop() callback returned
+		self.timing_disarm_attempted = None          # None if skipped (see _try_motor_stop)
+		self.timing_disarm_result = None
+		self.timing_kill_attempted = None
+		self.timing_kill_result = None
 
 	# ---- node-facing controls ------------------------------------------------
 	def start(self) -> None:
@@ -109,10 +150,24 @@ class MavsdkWorker:
 		self._thread.start()
 
 	def request_motor_stop(self) -> None:
+		self.timing_motor_stop_requested = time.monotonic()
 		self.motor_stop_requested = True
+		self._wake()
 
 	def request_stop(self) -> None:
 		self.stop_requested = True
+		self._wake()
+
+	def _wake(self) -> None:
+		"""Nudge the worker's poll loop to check intents immediately, from
+		whatever thread this is called on (the node's thread, normally).
+		Best-effort: the flags above remain the actual source of truth, so a
+		missed wake (e.g. called before the worker's loop exists yet) just
+		falls back to the loop's own short timeout poll -- never incorrect,
+		only possibly up to one poll period slower. See _worker_async."""
+		loop, event = self._loop, self._wake_event
+		if loop is not None and event is not None:
+			loop.call_soon_threadsafe(event.set)
 
 	# ---- worker thread -------------------------------------------------------
 	def _run_thread(self) -> None:
@@ -125,6 +180,12 @@ class MavsdkWorker:
 				self.motor_stop_error = repr(exc)
 
 	async def _worker_async(self) -> None:
+		# Created here (not in __init__) so it's bound to THIS running loop --
+		# request_motor_stop()/request_stop() reach it via call_soon_threadsafe
+		# from the node's thread (see _wake()).
+		self._wake_event = asyncio.Event()
+		self._loop = asyncio.get_running_loop()
+
 		self._free_port(self._port_to_free)
 		drone = System()
 		await drone.connect(system_address=self._system_address)
@@ -182,20 +243,42 @@ class MavsdkWorker:
 		# MAVSDK is kept only for takeoff and terminal motor-stop actions.
 		# Closed-loop attitude/thrust setpoints are published directly to PX4 via
 		# ROS 2/uXRCE-DDS by the node's setpoint timer.
+		#
+		# Woken immediately by request_motor_stop()/request_stop() via
+		# _wake_event (see module docstring) instead of waiting out a fixed
+		# poll; the 0.05s timeout below is now only a safety net for the
+		# (should-never-happen) case of a missed wake, so this is never
+		# SLOWER than the old fixed-poll design, only potentially faster.
 		while not self.stop_requested:
 			if self.motor_stop_requested and not self.motor_stop_done:
+				self.timing_motor_stop_picked_up = time.monotonic()
 				await self._try_motor_stop(drone)
 				if self.motor_stop_done:
 					break
-			await asyncio.sleep(0.05)
+			try:
+				await asyncio.wait_for(self._wake_event.wait(), timeout=0.05)
+			except asyncio.TimeoutError:
+				pass
+			self._wake_event.clear()
 
 	async def _try_motor_stop(self, drone) -> None:
 		"""Stop motors after confirmed Gazebo touchdown.
 
-		Normal disarm is tried first. In SITL, kill() is used as a fallback when
-		PX4's internal land detector refuses the disarm on the moving platform.
+		When enable_kill_fallback is set -- the SITL/moving-platform case this
+		mechanism exists for -- disarm() is SKIPPED entirely and kill() is
+		issued directly. This used to try disarm() first always, but PX4's own
+		land detector is expected to refuse a normal disarm on a moving deck
+		(that expectation is exactly WHY the kill fallback exists), so trying
+		it first on this path was paying for one full doomed MAVLink
+		round-trip, serially, before the command that actually works -- a
+		real, previously unmeasured contributor to the gap between physical
+		leg contact and motors actually stopping. When enable_kill_fallback is
+		NOT set (the real-hardware-oriented default, where forcibly killing
+		motors is a much bigger deal than in sim), the original disarm-only
+		behavior is unchanged -- there is no fallback to skip to.
+
 		This method attempts motor stop only once to avoid spamming MAVSDK/PX4
-		with repeated commands if both methods fail.
+		with repeated commands if it fails.
 		"""
 		if self.motor_stop_attempted:
 			return
@@ -204,35 +287,41 @@ class MavsdkWorker:
 		if self._on_pre_motor_stop is not None:
 			# Node latches its outgoing setpoint to a zero-thrust hold.
 			self._on_pre_motor_stop()
-
-		try:
-			self._logger.warning("MAVSDK: touchdown confirmed, requesting disarm.")
-			await drone.action.disarm()
-			self._logger.warning("MAVSDK: disarm accepted after touchdown.")
-			self.motor_stop_done = True
-			self.stop_requested = True
-			return
-		except Exception as exc:
-			self.motor_stop_error = repr(exc)
-			self._logger.error(
-				f"MAVSDK: disarm failed after touchdown: {self.motor_stop_error}"
-			)
+		self.timing_pre_motor_stop_done = time.monotonic()
 
 		if not self._enable_kill_fallback:
-			self._logger.error(
-				"MAVSDK: kill fallback disabled; keeping zero-thrust offboard stream alive."
-			)
+			try:
+				self._logger.warning("MAVSDK: touchdown confirmed, requesting disarm.")
+				self.timing_disarm_attempted = time.monotonic()
+				await drone.action.disarm()
+				self.timing_disarm_result = time.monotonic()
+				self._logger.warning("MAVSDK: disarm accepted after touchdown.")
+				self.motor_stop_done = True
+				self.stop_requested = True
+			except Exception as exc:
+				self.timing_disarm_result = time.monotonic()
+				self.motor_stop_error = repr(exc)
+				self._logger.error(
+					f"MAVSDK: disarm failed after touchdown: {self.motor_stop_error}"
+				)
+				self._logger.error(
+					"MAVSDK: kill fallback disabled; keeping zero-thrust offboard stream alive."
+				)
 			return
 
+		# enable_kill_fallback is set: go straight to kill(), see docstring.
 		try:
 			self._logger.error(
 				"MAVSDK: using kill fallback after confirmed Gazebo contact. SITL only."
 			)
+			self.timing_kill_attempted = time.monotonic()
 			await drone.action.kill()
+			self.timing_kill_result = time.monotonic()
 			self._logger.warning("MAVSDK: kill accepted after touchdown.")
 			self.motor_stop_done = True
 			self.stop_requested = True
 		except Exception as kill_exc:
+			self.timing_kill_result = time.monotonic()
 			self.motor_stop_error = repr(kill_exc)
 			self._logger.error(
 				f"MAVSDK: kill fallback failed: {self.motor_stop_error}"

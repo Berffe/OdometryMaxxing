@@ -84,6 +84,16 @@ class TimeManager:
 		self._px4_to_wall_offset_sec = None
 		self._sim_to_wall_offset_sec = None
 
+		# Rate diagnostics: remote clock seconds advanced per wall second.
+		# In SITL, sim_rtf_estimate is the measured real-time factor. PX4 should
+		# normally track the same time base as SITL; a px4_rtf_estimate that drifts
+		# away from sim_rtf_estimate is a clock/timesync diagnostic, not a control
+		# input.
+		self._px4_rtf_estimate = None
+		self._sim_rtf_estimate = None
+		self._last_px4_rate_sample = None  # (remote_sec, wall_sec)
+		self._last_sim_rate_sample = None  # (remote_sec, wall_sec)
+
 	# ---- WALL: the clock for PX4 I/O and diagnostics origin ------------------
 
 	def wall_ns(self) -> int:
@@ -108,31 +118,74 @@ class TimeManager:
 
 	def observe_px4_timestamp(self, px4_timestamp_us) -> None:
 		"""Feed an incoming /fmu/out msg.timestamp (microseconds) to track the
-		WALL<->PX4 offset. No-op for missing/zero stamps."""
-		self._px4_to_wall_offset_sec = self._update_offset(
-			self._px4_to_wall_offset_sec, px4_timestamp_us, scale=1e-6
+		WALL<->PX4 offset and PX4-clock rate relative to wall time. No-op for
+		missing/zero stamps."""
+		parsed = self._parse_remote_seconds(px4_timestamp_us, scale=1e-6)
+		if parsed is None:
+			return
+		remote_sec = parsed
+		wall_sec = self.wall_sec()
+		self._px4_to_wall_offset_sec = self._update_offset_at_wall(
+			self._px4_to_wall_offset_sec, remote_sec, wall_sec
+		)
+		self._px4_rtf_estimate, self._last_px4_rate_sample = self._update_rate_estimate(
+			self._px4_rtf_estimate, self._last_px4_rate_sample, remote_sec, wall_sec
 		)
 
 	def observe_sim_timestamp(self, sim_sec) -> None:
 		"""Feed a vision/sim timestamp (seconds, e.g. the image stamp) to track
-		the WALL<->SIM offset. No-op for missing/zero stamps."""
-		self._sim_to_wall_offset_sec = self._update_offset(
-			self._sim_to_wall_offset_sec, sim_sec, scale=1.0
+		the WALL<->SIM offset and measured simulator real-time factor. No-op for
+		missing/zero stamps."""
+		parsed = self._parse_remote_seconds(sim_sec, scale=1.0)
+		if parsed is None:
+			return
+		remote_sec = parsed
+		wall_sec = self.wall_sec()
+		self._sim_to_wall_offset_sec = self._update_offset_at_wall(
+			self._sim_to_wall_offset_sec, remote_sec, wall_sec
+		)
+		self._sim_rtf_estimate, self._last_sim_rate_sample = self._update_rate_estimate(
+			self._sim_rtf_estimate, self._last_sim_rate_sample, remote_sec, wall_sec
 		)
 
-	def _update_offset(self, current, raw_remote, scale):
+	@staticmethod
+	def _parse_remote_seconds(raw_remote, scale):
 		try:
 			remote_sec = float(raw_remote) * scale
 		except (TypeError, ValueError):
-			return current
-		if remote_sec <= 0.0:
-			return current
+			return None
+		return remote_sec if remote_sec > 0.0 else None
 
-		observed = self.wall_sec() - remote_sec
+	def _update_offset_at_wall(self, current, remote_sec, wall_sec):
+		observed = wall_sec - remote_sec
 		if current is None:
 			return observed
 		a = self._offset_smoothing
 		return a * current + (1.0 - a) * observed
+
+	def _update_rate_estimate(self, current, last_sample, remote_sec, wall_sec):
+		if last_sample is None:
+			return current, (remote_sec, wall_sec)
+
+		last_remote, last_wall = last_sample
+		d_remote = remote_sec - last_remote
+		d_wall = wall_sec - last_wall
+
+		# Ignore duplicate/out-of-order stamps and tiny wall intervals. This is
+		# diagnostics-only, so it is better to leave the previous estimate untouched
+		# than to inject a spike.
+		if d_remote <= 0.0 or d_wall <= 1e-4:
+			return current, last_sample
+
+		instant = d_remote / d_wall
+		if not (0.0 < instant < 10.0):
+			return current, last_sample
+
+		if current is None:
+			return instant, (remote_sec, wall_sec)
+
+		a = self._offset_smoothing
+		return a * current + (1.0 - a) * instant, (remote_sec, wall_sec)
 
 	# ---- Cross-family conversion (diagnostics) ------------------------------
 
@@ -162,3 +215,11 @@ class TimeManager:
 	def sim_wall_offset_sec(self):
 		"""Smoothed (WALL - SIM) in seconds, or None if unseeded."""
 		return self._sim_to_wall_offset_sec
+
+	def px4_rtf_estimate(self):
+		"""Smoothed PX4-clock seconds per wall second, or None if unseeded."""
+		return self._px4_rtf_estimate
+
+	def sim_rtf_estimate(self):
+		"""Smoothed SIM seconds per wall second: the measured real-time factor."""
+		return self._sim_rtf_estimate

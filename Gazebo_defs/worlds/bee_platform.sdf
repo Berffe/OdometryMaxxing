@@ -194,12 +194,12 @@
 		<x_frequency>0.0</x_frequency>
 		<x_phase>0.0</x_phase>
 
-		<y_amplitude>0.1</y_amplitude>
-		<y_frequency>0.3</y_frequency>
+		<y_amplitude>0.0</y_amplitude>
+		<y_frequency>0.0</y_frequency>
 		<y_phase>0.0</y_phase>
 
-		<z_amplitude>0.3</z_amplitude>
-		<z_frequency>0.2</z_frequency>
+		<z_amplitude>0.8</z_amplitude>
+		<z_frequency>0.1</z_frequency>
 		<z_phase>0.0</z_phase>
 	</plugin>
 

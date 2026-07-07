@@ -109,10 +109,10 @@ class ControlLaw:
 		# the theory here: do not raise kd further as the next lever. See the
 		# comment block above for what WAS validated (the kp/kd(sqrt2) step
 		# and the gain blend, both measured as improvements).
-		roll_kp: float = 0.83,
-		roll_kd: float = 0.65,
-		pitch_kp: float = 0.83,
-		pitch_kd: float = 0.65,
+		roll_kp: float = 0.22,
+		roll_kd: float = 0.1,
+		pitch_kp: float = 0.15,
+		pitch_kd: float = 0.075,
 
 		# --- Error-magnitude gain blend (large-offset transient damping) ---
 		# roll_kp/kd/pitch_kp/kd above are the FULL gains, used once |offset|
