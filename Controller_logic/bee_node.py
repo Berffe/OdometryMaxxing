@@ -88,7 +88,7 @@ PX4_OFFBOARD_SWITCH_SETTLE_SEC = 0.5
 # (and so h_crit smaller / more likely feasible), at the cost of less time to
 # react to vision dropouts. 0.15 1/s is a starting point, not tuned.
 # *** SOURCE OF TRUTH for the flown value -- see the WARNING above. ***
-DESCENT_DIVERGENCE_SETPOINT = 0.50
+DESCENT_DIVERGENCE_SETPOINT = 0.30
 # Ramp the commanded D* linearly from 0 to DESCENT_DIVERGENCE_SETPOINT over
 # this many seconds at descent entry, instead of stepping it instantly. Fixes
 # the thrust/vz transient measured at PROBE->DESCEND (a real step in the
@@ -270,7 +270,7 @@ VERBOSE_STREAM_LOGS = False
 
 # Start the attempt already airborne. 5 m corresponds to the cleanest far-range
 # calibration operating point (area_fraction around 0.066 in the last batch).
-TAKEOFF_ALTITUDE_M = 7.0
+TAKEOFF_ALTITUDE_M = 5.0
 EKF2_SETTLE_TIME = 5.0
 MAVSDK_SYSTEM_ADDRESS = "udpin://0.0.0.0:14540"
 MAVSDK_PORT_TO_FREE = 14540

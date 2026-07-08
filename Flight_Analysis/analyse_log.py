@@ -397,6 +397,7 @@ def compute_summary(
 			)
 
 	_append_mission_summary(df, t, lines)
+	_append_latency_summary(df, lines)
 
 	return "\n".join(lines) + "\n"
 
@@ -480,6 +481,97 @@ def _append_mission_summary(df: pd.DataFrame, t: np.ndarray, lines: list):
 			lines.append(
 				"Divergence/kinematics decorrelation: none detected -- flow_divergence "
 				"tracked relative_vz/|relative_z| to the end of the log."
+			)
+
+
+def _select_latency_rows(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
+	"""Restrict to the regime that actually drives VISION_PROCESSING_LATENCY_
+	BUDGET_SEC: DESCEND phase, pre-touchdown. Far-field/on-ground/post-
+	touchdown frames are systematically cheaper (smaller or trivial ROI, no
+	real motion) and would understate the number that matters if left in.
+	Falls back gracefully to the whole log if mission_substate/command_thrust
+	aren't present (older logs, or logs from phases before descent)."""
+	subset = df
+	description = f"all {len(df)} rows"
+
+	if "mission_substate" in df.columns:
+		mask = df["mission_substate"].astype(str) == "descend"
+		if mask.any():
+			subset = df.loc[mask]
+			description = f"{len(subset)} DESCEND-phase rows"
+			if "command_thrust" in subset.columns:
+				thrust = numeric_column(subset, "command_thrust")
+				pre_touchdown = thrust > 0
+				# Only narrow further if this actually excludes something --
+				# an all-True or all-NaN thrust column means the filter has
+				# nothing to add, so leave description as just DESCEND.
+				if 0 < int(np.sum(pre_touchdown)) < len(subset):
+					subset = subset.loc[pre_touchdown]
+					description = f"{len(subset)} DESCEND-phase rows, pre-touchdown (command_thrust>0)"
+
+	return subset, description
+
+
+# Stage-by-stage on_camera timing (see diagnostics_writer.py's timing_stage_*
+# columns / bee_node.py's on_camera instrumentation). This is a PERMANENT
+# instrumentation feature, not one of the removed investigation-only
+# diagnostics -- every log going forward should have these columns.
+LATENCY_STAGE_COLUMNS = [
+	("timing_stage_bridge_ms", "cv_bridge conversion"),
+	("timing_stage_rotate_ms", "cv2.rotate"),
+	("timing_stage_show_camera_ms", "imshow/waitKey debug window"),
+	("timing_stage_body_rate_ms", "body-rate buffer lookup"),
+	("timing_stage_target_acquisition_ms", "target_acquisition.update()"),
+	("timing_stage_optical_flow_ms", "optical_flow.update()"),
+	("timing_camera_cb_duration_ms", "on_camera TOTAL"),
+]
+
+
+def _append_latency_summary(df: pd.DataFrame, lines: list):
+	"""Per-stage vision-pipeline latency: mean/median/p95/max in ms, over the
+	DESCEND-phase pre-touchdown rows when available (see _select_latency_rows).
+	No-op (nothing appended) for older logs that predate this instrumentation."""
+	if not any(col in df.columns for col, _ in LATENCY_STAGE_COLUMNS):
+		return
+
+	subset, region_description = _select_latency_rows(df)
+
+	table_rows = []
+	for col, label in LATENCY_STAGE_COLUMNS:
+		if col not in subset.columns:
+			continue
+		values = numeric_column(subset, col)
+		finite = values[np.isfinite(values)]
+		if len(finite) == 0:
+			continue
+		table_rows.append(
+			f"{label:40s}{np.mean(finite):8.2f}{np.median(finite):8.2f}"
+			f"{np.percentile(finite, 95):8.2f}{np.max(finite):8.2f}"
+		)
+	if not table_rows:
+		return
+
+	lines.append("")
+	lines.append("Vision pipeline latency (on_camera stage breakdown, ms)")
+	lines.append("--------------------------------------------------------")
+	lines.append(f"Computed over: {region_description}")
+	lines.append(f"{'stage':40s}{'mean':>8}{'median':>8}{'p95':>8}{'max':>8}")
+	lines.extend(table_rows)
+
+	# Legacy scheduling-delay diagnostic (camera interarrival jitter): only
+	# present in logs captured during the in-process-contention investigation
+	# and since removed from live instrumentation. Included opportunistically
+	# if an old log still has it, so nothing is silently dropped when
+	# re-analysing past runs, but absent from current/future logs.
+	if "timing_camera_interarrival_jitter_ms" in subset.columns:
+		values = numeric_column(subset, "timing_camera_interarrival_jitter_ms")
+		finite = values[np.isfinite(values)]
+		if len(finite):
+			lines.append("")
+			lines.append(
+				f"(legacy, this log only) camera interarrival jitter: "
+				f"mean={np.mean(finite):.2f} median={np.median(finite):.2f} "
+				f"p95={np.percentile(finite, 95):.2f} max={np.max(finite):.2f} ms"
 			)
 
 

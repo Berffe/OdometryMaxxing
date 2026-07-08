@@ -60,6 +60,7 @@ here two ways:
 """
 
 import asyncio
+import contextlib
 import os
 import signal
 import subprocess
@@ -255,8 +256,9 @@ class MavsdkWorker:
 				await self._try_motor_stop(drone)
 				if self.motor_stop_done:
 					break
+			poll_timeout = 0.05
 			try:
-				await asyncio.wait_for(self._wake_event.wait(), timeout=0.05)
+				await asyncio.wait_for(self._wake_event.wait(), timeout=poll_timeout)
 			except asyncio.TimeoutError:
 				pass
 			self._wake_event.clear()
@@ -333,18 +335,37 @@ class MavsdkWorker:
 		async_iterable, condition, timeout: float, label: str,
 		progress_fn=None, progress_interval: float = 5.0,
 	):
+		"""
+		FIX: each caller passes a live MAVSDK telemetry stream (connection_
+		state(), health(), position()) and this returns as soon as condition()
+		is met, breaking out of the `async for` early. That never explicitly
+		closed the underlying stream -- it relied on garbage collection to
+		eventually call aclose() on the abandoned async generator, which is
+		non-deterministic and, if anything still holds a reference (the event
+		loop's own task bookkeeping), might not happen at all. An unclosed
+		MAVSDK stream keeps its gRPC channel receiving and dispatching
+		messages nobody is consuming, indefinitely -- exactly the kind of
+		background, GIL-touching activity that could explain vision work
+		running slower in-process than standalone (see the
+        vision-latency investigation this fixes a real candidate for).
+		contextlib.aclosing guarantees aclose() runs on every exit path --
+		condition met, timeout (asyncio.wait_for cancels _inner(), which
+		propagates as CancelledError through the `async for`, still
+		triggering __aexit__), or any other exception.
+		"""
 		async def _inner():
 			loop = asyncio.get_event_loop()
 			start = loop.time()
 			last_progress = start
-			async for item in async_iterable:
-				if condition(item):
-					return item
-				if progress_fn is not None:
-					now = loop.time()
-					if now - last_progress >= progress_interval:
-						last_progress = now
-						progress_fn(item, now - start)
+			async with contextlib.aclosing(async_iterable):
+				async for item in async_iterable:
+					if condition(item):
+						return item
+					if progress_fn is not None:
+						now = loop.time()
+						if now - last_progress >= progress_interval:
+							last_progress = now
+							progress_fn(item, now - start)
 		try:
 			return await asyncio.wait_for(_inner(), timeout=timeout)
 		except asyncio.TimeoutError:
