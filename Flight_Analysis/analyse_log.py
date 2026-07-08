@@ -688,7 +688,7 @@ def plot_lateral_control(df: pd.DataFrame, t: np.ndarray, output_dir: str):
 	save_current_figure(output_dir, "lateral_control.png")
 
 
-def plot_vertical_control(df: pd.DataFrame, t: np.ndarray, output_dir: str, divergence_setpoint: Optional[float]):
+def plot_vertical_control(df: pd.DataFrame, t: np.ndarray, output_dir: str, divergence_setpoint: Optional[float] = None):
 	available = any(c in df.columns for c in ["flow_divergence_1_s", "relative_vz_m_s", "vehicle_vz_m_s", "command_thrust", "relative_z_m"])
 	if not available:
 		print("Skipping vertical control plot. Missing vertical/divergence/command columns.")
@@ -1534,7 +1534,7 @@ def make_default_plots(df: pd.DataFrame, t: np.ndarray, output_dir: str | Path, 
 	plot_target_detection_summary(df, t, output_dir)
 	plot_detection_boxes_fov(df, t, args.image_width, args.image_height, output_dir, args.max_boxes)
 	plot_lateral_control(df, t, output_dir)
-	plot_vertical_control(df, t, output_dir, divergence_setpoint=args.divergence_setpoint)
+	plot_vertical_control(df, t, output_dir, divergence_setpoint=None)
 	plot_flow_derotation(df, t, output_dir)
 	plot_gain_schedule(df, t, output_dir)
 	plot_divergence_consistency(df, t, output_dir)
@@ -1664,12 +1664,6 @@ def parse_args():
 		type=float,
 		default=0.2,
 		help="Expected platform frequency for reference/fitting. Default: 0.2 Hz. Pass 0 to disable reference fit.",
-	)
-	parser.add_argument(
-		"--divergence-setpoint",
-		type=float,
-		default=0.01,
-		help="Divergence setpoint drawn on vertical_control.png. Default: 0.01.",
 	)
 	parser.add_argument(
 		"--max-duration-sec",

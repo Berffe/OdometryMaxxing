@@ -10,9 +10,9 @@ This file summarizes the terminals needed to launch the current BEE_LAND simulat
 
 ---
 
-## Commandes à retenir
+## Commands to remember
 
-Pour copier les fichiers de Windows à Linux (dans le terminal Linux) :
+To copy files from Windows to Linux (in the Linux terminal):
 
 ```bash
 cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Gazebo_defs/* ~/PX4-Autopilot/BEE_LAND/
@@ -29,9 +29,12 @@ cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Controller_logic/*.p
 
 cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/OpenLoop_Test/*.py ~/PX4-Autopilot/BEE_LAND/openloop/
 ```
-cp -r ~/PX4-Autopilot/BEE_LAND/logs/* /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Flight_Analysis/logs_new/
 
-Parfois il faut rebuild l'environnement :
+```bash
+cp -r ~/PX4-Autopilot/BEE_LAND/logs/* /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Flight_Analysis/logs_new/
+```
+
+Sometimes the environment needs to be rebuilt:
 
 ```bash
 cd ~/PX4-Autopilot

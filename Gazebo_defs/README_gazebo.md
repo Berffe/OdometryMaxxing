@@ -1,7 +1,8 @@
-# Plateforme Abeille 
+# Bee Environment
 
-## Commandes à retenir
-Pour copier les fichiers de Windows à Linux (dans le terminal Linux!) :
+## Commands to remember
+
+To copy files from Windows to Linux (in the Linux terminal!):
 
 ```bash
 cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Gazebo_defs/* ~/PX4-Autopilot/BEE_LAND/
@@ -17,24 +18,26 @@ cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Controller_logic/*.p
 cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/OpenLoop_Test/*.py ~/PX4-Autopilot/BEE_LAND/openloop/
 ```
 
-Le contraire, Linux à Windows (dans le terminal Windows!) :
+The reverse, Linux to Windows (in the Windows terminal!):
 
 ```bash
 scp -r ~/PX4-Autopilot/BEE_LAND/plugins/oscillating_platform_controller C:\Users\Pipef\OneDrive\Academiques\Stage\CodeGit\Gazebo_defs\*
 ```
-## Définition de la plateforme
-On définit la plateforme dans un fichier centralisé (BEE_LAND), mais il faut le synchroniser aux fichiers internes de l'environnement PX4 :
+
+## Platform definition
+
+The platform is defined in a centralized file (BEE_LAND), but it needs to be synced to PX4's internal environment files:
 
 ```text
 ~/PX4-Autopilot/BEE_LAND/
 ├── worlds/
-│   └── bee_platform.sdf              # définition du 'world'
+│   └── bee_platform.sdf              # world definition
 ├── plugins/
-│   └── oscillating_platform_controller/   # contrôleur de la plateforme (oscillatoire)
-└── README.md                         # quelques justifications
+│   └── oscillating_platform_controller/   # oscillating platform controller
+└── README.md                         # a few notes/justifications
 ```
 
-Ainsi, la synchronisation se fait par :
+The sync is done via:
 
 ```bash
 ln -s ~/PX4-Autopilot/BEE_LAND/worlds/bee_platform.sdf  ~/PX4-Autopilot/Tools/simulation/gz/worlds/bee_platform.sdf
@@ -45,28 +48,28 @@ ln -s ~/PX4-Autopilot/BEE_LAND/plugins/oscillating_platform_controller \
       ~/PX4-Autopilot/src/modules/simulation/gz_plugins/oscillating_platform_controller
 ```
 
-Le plugin ci-dessous a été construit :
+The following plugin has been built:
 
 ```text
 libOscillatingPlatformController.so
 custom::OscillatingPlatformController
 ```
 
-Et le  `bee_platform.sdf` world lance ce plugin directement.
+And the `bee_platform.sdf` world launches this plugin directly.
 
-De plus, il a fallu modifier le fichier qui définit les plugins disponibles pour le projet. Dans le fichier :
+In addition, the file defining the plugins available to the project had to be modified. In the file:
 
 ```bash
 src/modules/simulation/gz_plugins/CMakeLists.txt
 ```
 
-on ajoute juste en dessous de toutes les autres inclusions de 'subdirectory' : 
+add this just below all the other `subdirectory` inclusions:
 
 ```cmake
 add_subdirectory(oscillating_platform_controller)
 ```
 
-Finalement, on relance le 'build' de l'environnement :
+Finally, rebuild the environment:
 
 ```bash
 export GZ_SIM_SYSTEM_PLUGIN_PATH=$HOME/PX4-Autopilot/build/px4_sitl_default/src/modules/simulation/gz_plugins:$GZ_SIM_SYSTEM_PLUGIN_PATH
@@ -74,27 +77,29 @@ cd ~/PX4-Autopilot
 make px4_sitl
 ```
 
-Une petite vérification peut aussi être fait : 
+A quick check can also be done:
 
 ```bash
 find build/px4_sitl_default -name 'libOscillatingPlatformController.so'
 ```
 
-## Lancement de la plateforme 
-Plateforme seule :
+## Launching the platform
+
+Platform alone:
 
 ```bash
 gz sim Tools/simulation/gz/worlds/bee_platform.sdf
 ```
 
-Plateforme avec le modèle du drone (en lui positionant ou vous voulez) : 
+Platform with the drone model (positioning it wherever you want):
 
 ```bash
 PX4_GZ_MODEL_POSE="0,0,2.4,0,0,0" \  ## (x, y, z, roll, pitch, yaw)
 PX4_GZ_WORLD=bee_platform \
 make px4_sitl gz_x500
 ```
-Une fois la simulation marche, il faut configurer les paramètres du quadricopteur : 
+
+Once the simulation is running, the quadrotor parameters need to be configured:
 
 ```bash
 param set SYS_HAS_BARO 1
@@ -136,8 +141,9 @@ NAV_DLL_ACT, COM_DLL_EXCEPT: allow operation without QGroundControl.
 COM_ARM_*: relax GPS/OpenDroneID/mag arming blockers for simulation.
 COM_CPU_MAX, COM_RAM_MAX, COM_POWER_COUNT, CBRK_*: remove SITL/WSL system-power health blockers.
 
-## Modification des oscillations
-Pour modifier les frequences (en Hz) et les amplitudes des oscillations (en m), il faut ouvrir le 'world' bee_platform.sdf :
+## Changing the oscillations
+
+To change the oscillation frequencies (in Hz) and amplitudes (in m), open the `bee_platform.sdf` world file:
 
 ```xml
 <x_amplitude>1.0</x_amplitude>
@@ -147,8 +153,9 @@ Pour modifier les frequences (en Hz) et les amplitudes des oscillations (en m), 
 <z_frequency>0.20</z_frequency>
 ```
 
-## Inclusion du modèle-abeille
-Le modèle utilisé est une modification du x500, modèle très connu et utilisé. Sa modification nous permets d'ajouter des senseurs (comme une caméra) pour estimer le flux optique. 
+## Including the bee model
+
+The model used is a modification of the x500, a well-known and widely used model. This modification lets us add sensors (like a camera) to estimate optical flow.
 
 ```bash
 PX4_SYS_AUTOSTART=4001 \
