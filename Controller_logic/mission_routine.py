@@ -6,7 +6,7 @@ probe_min_duration_sec, d_star_ramp_in_sec, the gain schedule's elapsed time,
 h_pred) is measured on ONE clock: `t`, the argument passed into update(), which
 bee_node.py feeds from the vision/image timestamp -- i.e. SIMULATION time, not
 wall-clock. This is deliberate, not an oversight: the gain schedule and h_pred
-are derived from h(t)=h0*exp(-D* t), a statement about physical descent
+are derived from h(t)=h0*exp(-integral(D*_cmd dt)), a statement about physical descent
 dynamics, and the physics itself evolves in lockstep with sim time -- so
 tying the WHOLE mission state machine to that same clock keeps every timer
 physically consistent with the dynamics it reasons about, rather than each
@@ -65,10 +65,11 @@ formula evaluated every tick:
 
 3. DESCEND: schedule the thrust gain as an EXPLICIT FUNCTION OF TIME -- the
 	descent reads a stopwatch, never a height estimate:
-		K(t) = clamp( k_explore * exp(-D* * t),  k_min,  k_explore )
+		K(t) = clamp( k_explore * exp(-integral_0^t D*_cmd(tau) dtau),
+	              k_min,  k_explore )
 	where t is the elapsed time since descent began. This is identical to
-	clamp(safety*2*h(t)/dt, ...) with the open-loop trajectory
-	h(t)=h0*exp(-D* t) (Herisse section V / Ho eq. 3) substituted in and the
+	clamp(safety*2*h(t)/dt, ...) with the ramp-aware open-loop trajectory
+	h(t)=h0*exp(-integral_0^t D*_cmd(tau) dtau) (Herisse section V / Ho eq. 3) substituted in and the
 	height cancelled out: h0 enters ONCE, frozen inside
 	k_explore = safety*2*h0/dt at descent start. So the live path needs only
 	the clock and the two frozen constants k_min, k_explore -- no runtime
@@ -78,14 +79,10 @@ formula evaluated every tick:
 	The lateral axes ride the same ramp, normalized to k(t)/k_explore.
 
 	The COMMANDED D* itself ramps smoothly (raised-cosine, zero slope at both
-	endpoints) from 0 over d_star_ramp_in_sec at
-	descent entry, rather than stepping instantly to its target. The step was
-	found to be the actual source of a "violent" transient at PROBE->DESCEND:
-	k(t) was already smooth, but the error (D_measured - D*) snapping from ~0
-	to the full target in one tick drove a sharp thrust cut (and, with a
-	nonzero thrust_integral_gain_const, risked integral saturation on that same
-	step). See the constructor's d_star_ramp_in_sec docstring for why this is
-	applied only to the commanded setpoint, not to k(t)'s decay rate.
+	endpoints) from 0 over d_star_ramp_in_sec at descent entry, rather than
+	stepping instantly to its target. The gain schedule uses the integral of this
+	actual D*_cmd ramp, so the controller does not lose gain before the commanded
+	descent has really reached the final D*.
 
 	CLOCK-FOLLOWING TRADE (accepted for now). Scheduling on time assumes the
 	real descent tracks h(t). If it LAGS (you are higher than predicted), the
@@ -177,18 +174,17 @@ class ProbeResult:
 
 
 class PlatformProbe:
-	"""Watches thrust commands during a D*=0 hold; reports peak |acceleration|.
+	"""Watches thrust commands during a D*=0 hold; reports |acceleration| envelope.
 
-	High-passes with a running EMA mean before tracking the peak, so a
+	High-passes with a running EMA mean before estimating the envelope, so a
 	mis-calibrated hover_thrust (a slow bias, not a platform oscillation)
 	does not inflate the estimate -- only deviations from the hold's own
 	running mean count as "the platform moved".
 
-	Peak, not a percentile: simplest possible first version. A single noisy
-	spike only makes the gate MORE conservative (raises k_min, which is the
-	safe direction), so this is an acceptable place to start; consider a
-	robust percentile (e.g. P95) later if probe noise causes too many false
-	"infeasible" calls.
+	The reported value is not the largest single sample ever observed. It is a
+	leaky upper envelope of the rolling 95th percentile of the high-pass residual.
+	This keeps the feasibility gate conservative while preventing isolated thrust,
+	timestamp, or model spikes from becoming the acceleration bound forever.
 	"""
 
 	def __init__(self, thrust_model: ThrustModel, highpass_tau_sec: float = 7):
@@ -208,14 +204,31 @@ class PlatformProbe:
 		self._n = 0
 		self._elapsed = 0.0
 
+		# Robust envelope estimator settings. Kept internal so MissionRoutine's
+		# public constructor and call sites do not change.
+		self._percentile_window_sec = 2.0
+		self._peak_percentile = 0.95
+		self._peak_decay_tau = 80.0
+		self._residual_window: Deque[tuple[float, float]] = deque()
+
 	def reset(self) -> None:
 		self._mean = 0.0
 		self._has_mean = False
 		self._peak = 0.0
 		self._n = 0
 		self._elapsed = 0.0
+		self._residual_window.clear()
 
-	def update(self, thrust_cmd: float, dt: float, safe_accel : float = 0.1) -> None:
+	def update(self, thrust_cmd: float, dt: float, safe_accel: float = 0.1) -> None:
+		"""Update the high-pass residual envelope from the latest thrust command.
+
+		`safe_accel` is intentionally kept in the signature for backward
+		compatibility with existing MissionRoutine call sites, but is no longer
+		applied here. Safety padding should be added outside the raw probe estimate
+		if needed, not multiplied into every noisy sample before envelope tracking.
+		"""
+		_ = safe_accel  # legacy argument; kept so existing calls remain unchanged
+
 		dt = max(1e-3, float(dt))
 		a = self._tm.accel_from_thrust(thrust_cmd)
 
@@ -226,10 +239,42 @@ class PlatformProbe:
 			alpha = math.exp(-dt / max(1e-3, self._tau))
 			self._mean = alpha * self._mean + (1.0 - alpha) * a
 
-		ac = abs(a - self._mean)*(1 + safe_accel)
-		self._peak = max(self._peak, ac)
+		# High-pass residual: no safety margin applied here.
+		ac = abs(a - self._mean)
+
 		self._n += 1
 		self._elapsed += dt
+		self._residual_window.append((self._elapsed, ac))
+
+		window_sec = max(1e-3, self._percentile_window_sec)
+		while (
+			self._residual_window
+			and self._elapsed - self._residual_window[0][0] > window_sec
+		):
+			self._residual_window.popleft()
+
+		values = sorted(v for _, v in self._residual_window)
+		if not values:
+			target_peak = ac
+		elif len(values) == 1:
+			target_peak = values[0]
+		else:
+			# Linear-interpolated rolling percentile, avoiding a numpy dependency in
+			# the flight-side mission code.
+			q = min(1.0, max(0.0, self._peak_percentile))
+			idx = q * (len(values) - 1)
+			lo = int(math.floor(idx))
+			hi = int(math.ceil(idx))
+			if lo == hi:
+				target_peak = values[lo]
+			else:
+				w = idx - lo
+				target_peak = (1.0 - w) * values[lo] + w * values[hi]
+
+		# Leaky peak: rises immediately to the robust envelope, but decays slowly
+		# when recent residuals no longer justify the previous bound.
+		decay = math.exp(-dt / max(1e-3, self._peak_decay_tau))
+		self._peak = max(target_peak, decay * self._peak)
 
 	def result(self, min_duration_sec: float) -> ProbeResult:
 		return ProbeResult(
@@ -292,60 +337,118 @@ def compute_gate(
 	return GateResult(k_min=k_min, h_crit=h_crit, k_explore=k_explore, feasible=feasible)
 
 
+def commanded_divergence_integral(
+	elapsed_sec: float,
+	descent_divergence_setpoint: float,
+	d_star_ramp_in_sec: float = 0.0,
+) -> float:
+	"""Integral of the actually commanded divergence during descent.
+
+	D*_cmd ramps with the same raised-cosine profile used in _do_descend:
+
+		D*_cmd(t) = D* * 0.5 * (1 - cos(pi*t/T)), 0 <= t < T
+		D*_cmd(t) = D*,                              t >= T
+
+	The gain schedule should decay with exp(-integral(D*_cmd dt)), not with
+	exp(-D* t), otherwise it gives away gain during the ramp before the descent
+	setpoint has actually reached its final value.
+	"""
+	t = max(0.0, float(elapsed_sec))
+	d = max(0.0, float(descent_divergence_setpoint))
+	T = max(0.0, float(d_star_ramp_in_sec))
+	if d <= 1e-12 or t <= 0.0:
+		return 0.0
+	if T <= 1e-9:
+		return d * t
+	if t < T:
+		return d * (0.5 * t - 0.5 * T / math.pi * math.sin(math.pi * t / T))
+	return d * (t - 0.5 * T)
+
+
 def scheduled_gain_at_time(
 	elapsed_sec: float,
 	descent_divergence_setpoint: float,
 	k_min: float,
 	k_explore: float,
 	safety: float = 0.5,
+	d_star_ramp_in_sec: float = 0.0,
 ) -> float:
 	"""The live descent gain, as an EXPLICIT FUNCTION OF TIME -- no height.
 
-		K(t) = clamp( k_explore * exp(-D* * t),  k_min,  k_explore )
+		K(t) = clamp( k_explore * exp(- integral_0^t D*_cmd(tau) dtau),
+		              k_min,
+		              k_explore )
 
-	This is exactly clamp(safety*2*h(t)/dt, ...) with h(t)=h0*exp(-D* t)
-	substituted in, but written so it is obvious that the only live input is
-	the elapsed-time clock since descent began. h0 enters once, frozen inside
-	k_explore (= safety*2*h0/dt, computed at descent start); the schedule reads
-	NO height estimate at runtime. It is the Ho eq. 20 / de Croon
-	gain-proportional-to-height law, expressed on a stopwatch.
+	For d_star_ramp_in_sec=0 this reduces to the previous schedule
+	K(t)=clamp(k_explore*exp(-D* t), k_min, k_explore). With a finite D* ramp,
+	the decay follows the ACTUAL commanded divergence rather than the final D*,
+	so the controller does not lose gain before the descent command has really
+	reached its target.
 
-	Safe-but-slow by construction: if the real descent lags the ideal
-	exponential, the clock has decayed the gain more than the true height
-	warrants, so K is conservatively low. The dangerous case (descending AHEAD
-	of prediction) is backstopped by the k_min clamp, below which the gain stops
-	following the exponential and holds the Herisse floor.
+	The schedule still reads no live height estimate and changes no control law:
+	it only makes the stopwatch schedule consistent with the ramped D* command.
 	"""
-	decay = math.exp(-float(descent_divergence_setpoint) * max(0.0, float(elapsed_sec)))
+	exponent = commanded_divergence_integral(
+		elapsed_sec, descent_divergence_setpoint, d_star_ramp_in_sec
+	)
+	decay = math.exp(-exponent)
 	return max(float(k_min), min(float(k_explore), float(k_explore) * decay))
 
 
 def critical_time(
-	h0: float, descent_divergence_setpoint: float, h_crit: float
+	h0: float,
+	descent_divergence_setpoint: float,
+	h_crit: float,
+	d_star_ramp_in_sec: float = 0.0,
 ) -> float:
 	"""Elapsed descent time at which K(t) reaches the k_min floor, i.e. when the
-	predicted height crosses h_crit:  t_crit = (1/D*) * ln(h0 / h_crit).
+	predicted height crosses h_crit under the same ramp-aware D*_cmd schedule
+	used by scheduled_gain_at_time().
 
-	Known BEFORE descent from frozen constants. Use it to cap descent duration:
-	if touchdown has not fired by some margin past t_crit, the open-loop clock
-	has drifted from the true descent (you are higher than predicted) -- a clean
-	place to abort or re-probe rather than keep trusting a stale h0. Returns inf
-	if h_crit is non-positive or >= h0 (floor never reached on the way down)."""
+	Returns inf if h_crit is non-positive or >= h0 (floor never reached on the
+	way down), or if D* is non-positive. Uses a small bisection only for the
+	inside-ramp case because the raised-cosine integral has no simple inverse.
+	"""
 	d = float(descent_divergence_setpoint)
 	if h_crit <= 0.0 or h_crit >= h0 or d <= 1e-9:
 		return float("inf")
-	return (1.0 / d) * math.log(float(h0) / float(h_crit))
+
+	target_integral = math.log(float(h0) / float(h_crit))
+	T = max(0.0, float(d_star_ramp_in_sec))
+	if T <= 1e-9:
+		return target_integral / d
+
+	ramp_integral = commanded_divergence_integral(T, d, T)  # = d*T/2
+	if target_integral >= ramp_integral:
+		return (target_integral / d) + 0.5 * T
+
+	lo, hi = 0.0, T
+	for _ in range(40):
+		mid = 0.5 * (lo + hi)
+		if commanded_divergence_integral(mid, d, T) < target_integral:
+			lo = mid
+		else:
+			hi = mid
+	return 0.5 * (lo + hi)
 
 
-def predicted_height(h0: float, descent_divergence_setpoint: float, elapsed_sec: float) -> float:
-	"""h(t) = h0 * exp(-D* t): the exact trajectory of a perfectly-tracked
-	constant-divergence descent (Herisse section V / Ho eq. 3).
+def predicted_height(
+	h0: float,
+	descent_divergence_setpoint: float,
+	elapsed_sec: float,
+	d_star_ramp_in_sec: float = 0.0,
+) -> float:
+	"""h(t) = h0 * exp(- integral_0^t D*_cmd(tau) dtau).
 
-	DERIVATION / DIAGNOSTIC ONLY -- not used by the live gain schedule, which is
-	now a pure function of time (see scheduled_gain_at_time). Kept so the log
+	DERIVATION / DIAGNOSTIC ONLY -- not used by the live gain schedule, which
+	uses the same integral directly (see scheduled_gain_at_time). Kept so the log
 	can record the height the clock-based schedule IMPLIES, for offline
-	comparison against SITL ground truth (height_prediction.png)."""
-	return max(0.0, float(h0)) * math.exp(-float(descent_divergence_setpoint) * max(0.0, elapsed_sec))
+	comparison against SITL ground truth (height_prediction.png).
+	"""
+	exponent = commanded_divergence_integral(
+		elapsed_sec, descent_divergence_setpoint, d_star_ramp_in_sec
+	)
+	return max(0.0, float(h0)) * math.exp(-exponent)
 
 
 # --------------------------------------------------------------------------- #
@@ -481,16 +584,11 @@ class MissionRoutine:
 		# BOTH endpoints, removing that corner while keeping the same total
 		# ramp duration and reaching the exact target at elapsed>=this value.
 		#
-		# Deliberately NOT applied to the gain schedule's decay rate (still
-		# scheduled_gain_at_time(..., self._d_star, ...), the FINAL target) or
-		# to h_pred's prediction: during the ramp the true physical descent is
-		# slightly slower than h0*exp(-d_star*t) assumes (since the commanded
-		# D* is briefly below its target), so using the final d_star for k(t)'s
-		# decay makes k(t) decay slightly FASTER than strictly necessary in
-		# that window -- conservative, consistent with the project's existing
-		# "safe-but-slow" clock-following choice, not a new risk. Expect
-		# height_prediction.png to show a small, self-correcting bias during
-		# just the ramp window; that is this trade-off made visible, not a bug.
+		# Applied consistently to the gain schedule and to h_pred: k(t) now decays
+		# with exp(-integral(D*_cmd dt)), so the stopwatch schedule follows the
+		# same commanded descent that the controller is actually asked to track.
+		# This keeps the proportional divergence controller unchanged while removing
+		# the artificial early gain loss caused by using the final D* from t=0.
 		d_star_ramp_in_sec: float = 3.0,
 		# CENTER's vertical (thrust) loop runs at the SAME gain as everywhere
 		# else (k_explore) -- no reduced CENTER-phase thrust gain and no
@@ -846,11 +944,12 @@ class MissionRoutine:
 	def _do_descend(self, t: float, just_entered: bool = False) -> MissionControl:
 		elapsed = t - (self._t_descend_start if self._t_descend_start is not None else t)
 		# LIVE gain: explicit function of the descent clock only -- no height.
-		# Decay rate uses the FINAL d_star even during the D* ramp below -- see
-		# the d_star_ramp_in_sec constructor note for why that is the safe
-		# choice, not an oversight.
+		# Decay follows the integral of the ACTUAL commanded D* ramp, not the
+		# final D* value from t=0. This preserves gain during the smooth setpoint
+		# ramp without changing the proportional divergence controller itself.
 		k = scheduled_gain_at_time(
-			elapsed, self._d_star, self.gate.k_min, self.gate.k_explore, self._safety
+			elapsed, self._d_star, self.gate.k_min, self.gate.k_explore, self._safety,
+			self._d_star_ramp_in
 		)
 		# Lateral rides the SAME normalized ramp fraction as thrust: 1.0 at
 		# t=0 -> k_min/k_explore at t_crit (de Croon App. B -- same 2Z/dt
@@ -864,9 +963,9 @@ class MissionRoutine:
 		# DESCEND entry -- an unintended step at exactly the handoff this
 		# design otherwise takes care to smooth).
 		scale = (k / self.gate.k_explore) if self.gate.k_explore > 1e-9 else 1.0
-		# Diagnostic only: the height this clock-based schedule IMPLIES, logged
-		# for offline comparison against ground truth. NOT used to compute k.
-		h_pred = predicted_height(self._h0, self._d_star, elapsed)
+		# Diagnostic only: the height this ramp-aware clock schedule IMPLIES,
+		# logged for offline comparison against ground truth. NOT used to compute k.
+		h_pred = predicted_height(self._h0, self._d_star, elapsed, self._d_star_ramp_in)
 
 		# COMMANDED D*: ramps 0 -> self._d_star over d_star_ramp_in_sec, instead
 		# of stepping instantly at descent entry (see constructor note). Shaped
@@ -929,7 +1028,7 @@ class MissionRoutine:
 				"k_explore": self.gate.k_explore,
 				"h_crit": self.gate.h_crit,
 				"elapsed_sec": elapsed,
-				"t_crit_sec": critical_time(self._h0, self._d_star, self.gate.h_crit),
+				"t_crit_sec": critical_time(self._h0, self._d_star, self.gate.h_crit, self._d_star_ramp_in),
 				"d_star_ramp_frac": ramp_frac,
 				"d_star_ramp_linear_frac": linear_frac,
 				"d_star_target": self._d_star,

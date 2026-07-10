@@ -28,10 +28,8 @@ cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Gazebo_defs/models/*
 cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Controller_logic/*.py ~/PX4-Autopilot/BEE_LAND/controller/
 
 cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/OpenLoop_Test/*.py ~/PX4-Autopilot/BEE_LAND/openloop/
-```
 
-```bash
-cp -r ~/PX4-Autopilot/BEE_LAND/logs/* /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Flight_Analysis/logs_new/
+cp -r ~/PX4-Autopilot/BEE_LAND/logs/* /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Flight_Analysis/logs/valid.csv
 ```
 
 Sometimes the environment needs to be rebuilt:
@@ -60,7 +58,7 @@ source build/px4_sitl_default/rootfs/gz_env.sh
 PX4_SYS_AUTOSTART=4001 \
 PX4_SIMULATOR=gz \
 PX4_SIM_MODEL=bee_x500 \
-PX4_GZ_MODEL_POSE="1.5,1.5,0.4,0,0,0" \
+PX4_GZ_MODEL_POSE="1.2,1.2,0.4,0,0,0" \
 PX4_GZ_WORLD=bee_platform \
 ./build/px4_sitl_default/bin/px4
 ```

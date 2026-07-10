@@ -1,6 +1,8 @@
 import contextlib
 import math
+import multiprocessing as mp
 import os
+import queue
 import time
 
 import cv2
@@ -30,15 +32,21 @@ from px4_msgs.msg import (
 from cv_bridge import CvBridge, CvBridgeError
 
 from .state import VehicleState, PlatformState, AttitudeSetpoint, TargetEstimate
-from .optical_flow import OpticalFlowEstimator
+# v2.0: TargetAcquisition + OpticalFlowEstimator are no longer constructed or
+# called here -- they run in a separate process (see vision_worker.py). bee_node
+# ships frames to it and drains results back, so it only needs the worker entry
+# point. CameraGeometry/Derotator/AngularRateBuffer stay: on_camera still
+# computes the per-interval mean body rate and ships it (the derotator itself is
+# built but currently unused, same as before -- de-rotation, when re-enabled,
+# moves into the worker).
 from .derotation import CameraGeometry, Derotator, AngularRateBuffer
-from .target_acquisition import TargetAcquisition
 from .control_law import ControlLaw
 from .mission_routine import MissionRoutine, INFEASIBLE as MISSION_INFEASIBLE
 from .diagnostics_writer import DiagnosticsWriter
 from .px4_interface import PX4Interface
 from .mavsdk_worker import MavsdkWorker
 from .clock import TimeManager
+from .vision_worker import run_vision_worker
 
 
 # Control computation is intentionally faster than the PX4 publication stream:
@@ -49,6 +57,14 @@ MISSION_PERIOD_SEC = 0.05
 PX4_SETPOINT_PERIOD_SEC = 0.05
 COMPUTE_CONTROL_ONLY_ON_NEW_VISION = True
 PX4_OFFBOARD_SWITCH_SETTLE_SEC = 0.5
+
+# Depth of the bee_node -> vision_worker frame queue (v2.0). Kept shallow on
+# purpose: under load, on_camera drops the OLDEST queued frame (see
+# _ship_frame_to_vision) so the worker always resumes on a FRESH frame instead
+# of draining a stale backlog -- for a divergence-based landing loop, freshness
+# beats processing every frame. 2 gives a little jitter slack without letting
+# latency build up in the queue.
+VISION_INPUT_QUEUE_MAX = 2
 
 # ============================================================================
 # WARNING -- READ BEFORE TUNING descent_divergence_setpoint / initial_thrust_gain
@@ -95,7 +111,7 @@ DESCENT_DIVERGENCE_SETPOINT = 0.30
 # control_law error term, not in k(t) which was already smooth). 0 recovers
 # the old instant-step behavior. See mission_routine.py's constructor
 # docstring for why this does not also affect k(t)'s decay rate.
-D_STAR_RAMP_IN_SEC = 3.0
+D_STAR_RAMP_IN_SEC = 5.0
 # CENTER's vertical (thrust) loop runs at the full exploration gain
 # (k_explore) throughout -- the earlier reduced-CENTER-thrust-gain mechanism
 # (which decoupled the vertical loop from CENTER's heavy lateral banking) has
@@ -108,7 +124,7 @@ D_STAR_RAMP_IN_SEC = 3.0
 # matter at). The probe's own peak_accel/min-duration measurement does not
 # start until this completes. 0 recovers an instant restore. Thrust is NOT
 # part of this ramp (see above).
-CENTER_TO_PROBE_LATERAL_RAMP_SEC = 2
+CENTER_TO_PROBE_LATERAL_RAMP_SEC = 0.1
 # LATERAL gain during CENTER, mission-PHASE-based (fixed for the whole phase)
 # rather than instantaneous-|offset|-based (control_law's large_offset_gain_
 # scale, which restores full gain every time the vehicle swings near center
@@ -163,7 +179,7 @@ PROBE_LATERAL_D_SCALE = 1
 # through a representative excursion. 15s is a generous starting guess with no
 # real-platform validation yet; tighten or extend once logged against an
 # actual oscillating deck.
-PROBE_MIN_DURATION_SEC = 15.0
+PROBE_MIN_DURATION_SEC = 10.0
 
 # dt fed into the de Croon feasibility gate -- see mission_routine.py's
 # stability_dt_sec constructor docstring for the base reasoning (why this must
@@ -504,8 +520,30 @@ class BeeLandNode(Node):
 		self._latest_stage_rotate_ms = None
 		self._latest_stage_show_camera_ms = None
 		self._latest_stage_body_rate_ms = None
+		# v2.0: target_acquisition/optical_flow no longer run in on_camera, so
+		# these two PARENT-process stage slots are structurally empty now (they
+		# stay None). The worker's own measurements of those two calls are
+		# reported separately below (worker_*), NOT back through these fields --
+		# that back-fill was the v2.0-first-test bug where a 16ms "sub-stage"
+		# appeared under a 0.38ms on_camera parent.
 		self._latest_stage_target_acquisition_ms = None
 		self._latest_stage_optical_flow_ms = None
+		# v2.0 out-of-process vision instrumentation. worker_* are the worker's
+		# own perf_counter timings of the two calls (durations, comparable across
+		# processes). frame_to_available/frame_to_command/result_period are the
+		# real cross-boundary latencies the v1.0-era stage timers never captured,
+		# all measured in THIS process's wall clock (see _drain_vision_results /
+		# on_control_timer).
+		self._latest_worker_target_acquisition_ms = None
+		self._latest_worker_optical_flow_ms = None
+		self._latest_frame_to_available_ms = None
+		self._latest_frame_to_command_ms = None
+		self._latest_vision_result_period_ms = None
+		# Frame-arrival wall time of the flow currently in _latest_flow, carried
+		# across the process boundary so on_control_timer can close the
+		# frame->command measurement when this sample actually produces a command.
+		self._latest_flow_frame_wall = None
+		self._prev_vision_result_frame_wall = None
 		self._last_control_compute_start_wall = None
 		self._last_control_compute_end_wall = None
 		self._last_control_compute_duration_ms = None
@@ -576,16 +614,27 @@ class BeeLandNode(Node):
 		self._rate_buffer = AngularRateBuffer()
 		self._prev_camera_stamp = None
 
-		# DE-ROTATION DISABLED FOR NOW (see optical_flow.py's update() --
-		# derotation_active requires BOTH a derotator AND body_rates, so
-		# passing None here is enough to turn it off cleanly without touching
-		# anything else). self._derotator/_rate_buffer are still built above
-		# since on_camera still logs body rates regardless -- this only
-		# removes the ego-rotation subtraction from the divergence path.
-		# Re-enable by passing derotator=self._derotator once the light
-		# (downsampled) Farneback path has been re-validated with it.
-		self.optical_flow = OpticalFlowEstimator(derotator=None)
-		self.target_acquisition = TargetAcquisition()
+		# DE-ROTATION DISABLED FOR NOW. self._derotator/_rate_buffer are still
+		# built above because on_camera still computes and ships the per-interval
+		# mean body rate regardless. The flow estimator that would consume the
+		# derotator now lives in vision_worker (built there with derotator=None,
+		# matching this disabled state); to re-enable, construct the Derotator in
+		# vision_worker and pass it in -- body_rates already arrive on the queue,
+		# so nothing here changes.
+
+		# --- Out-of-process vision pipeline (v2.0) ---------------------------
+		# The two heavy vision stages (TargetAcquisition + OpticalFlowEstimator)
+		# used to run INLINE in on_camera, on the single ROS executor thread,
+		# starving the 20 Hz PX4 setpoint publisher for the 40-200 ms each frame
+		# took. They now run in vision_worker.run_vision_worker in a SEPARATE
+		# process: on_camera only ships (frame, timestamp, body_rates) and
+		# returns immediately, and on_control_timer drains (target, flow) results
+		# back. This frees the executor to keep publishing setpoints on cadence
+		# while the worker crunches in parallel on another core. See
+		# vision_worker.py for the loop itself.
+		self._vision_dropped_frames = 0
+		self._vision_worker_dead_logged = False
+		self._start_vision_worker()
 
 		self.diagnostics = DiagnosticsWriter(output_dir="logs", filename=None, flush_every_row=True)
 		self.get_logger().info(f"Diagnostics CSV: {self.diagnostics.filepath}")
@@ -697,6 +746,177 @@ class BeeLandNode(Node):
 		self.get_logger().info("bee_land_node started.")
 		self.get_logger().info("Waiting for required streams: local_position and camera.")
 
+	# ------------------------------------------------------------------ vision
+	# Out-of-process vision pipeline plumbing (v2.0). on_camera ships frames in;
+	# on_control_timer drains results out. The ROS executor is single-threaded,
+	# so on_camera and on_control_timer never run concurrently -- the only
+	# cross-boundary handoff is the two multiprocessing.Queues, which are
+	# process-safe, so no locking is needed around _latest_target/_latest_flow.
+
+	def _start_vision_worker(self):
+		"""Spawn the vision worker process and its two queues, once at startup.
+
+		Uses the 'spawn' start method deliberately, NOT the Linux-default
+		'fork': the child must not inherit this node's rclpy/DDS threads and
+		locks (forking a process with live background threads is a classic
+		source of deadlocks). spawn gives the worker a clean interpreter that
+		imports only vision_worker's algorithm dependencies -- never rclpy.
+		"""
+		ctx = mp.get_context("spawn")
+		# Shallow input queue + drop-oldest in _ship_frame_to_vision: under load
+		# we would rather the worker resume on a fresh frame than drain a stale
+		# backlog.
+		self._vision_in_q = ctx.Queue(maxsize=VISION_INPUT_QUEUE_MAX)
+		# Output queue is emptied every control tick (100 Hz) while the worker
+		# produces at <=30 Hz, so it never backs up; left unbounded so the
+		# worker never blocks on put().
+		self._vision_out_q = ctx.Queue()
+		self._vision_worker = ctx.Process(
+			target=run_vision_worker,
+			args=(self._vision_in_q, self._vision_out_q),
+			name="bee_vision_worker",
+			daemon=True,
+		)
+		self._vision_worker.start()
+		self.get_logger().info(
+			f"Vision worker started (pid={self._vision_worker.pid}, "
+			"start_method=spawn). target_acquisition + optical_flow now run "
+			"out-of-process; on_camera no longer blocks the control/setpoint "
+			"timers on vision."
+		)
+
+	def _ship_frame_to_vision(self, frame, timestamp, body_rates, frame_wall):
+		"""Hand one camera frame to the vision worker. Non-blocking.
+
+		If the worker is momentarily behind and the shallow input queue is full,
+		discard the OLDEST queued frame and enqueue this one, so the worker
+		always resumes on the freshest frame rather than a stale backlog.
+		Skipping a frame is safe for the divergence loop: OpticalFlowEstimator
+		works in px/s off each frame's own timestamp, so a skipped frame simply
+		widens the baseline for the next one.
+
+		frame_wall is this process's wall clock at frame arrival; it rides along
+		and is echoed back in the VisionResult so _drain_vision_results can
+		measure the true frame->available round trip without any cross-process
+		clock comparison.
+		"""
+		payload = (frame, timestamp, body_rates, frame_wall)
+		try:
+			self._vision_in_q.put_nowait(payload)
+		except queue.Full:
+			try:
+				self._vision_in_q.get_nowait()  # drop the stale frame
+				self._vision_dropped_frames += 1
+			except queue.Empty:
+				pass
+			try:
+				self._vision_in_q.put_nowait(payload)
+			except queue.Full:
+				# Worker refilled it between our get and put -- skip this frame.
+				self._vision_dropped_frames += 1
+
+	def _drain_vision_results(self):
+		"""Pull the freshest (target, flow) the worker has produced and publish
+		it into _latest_target/_latest_flow for the controller.
+
+		Called at the top of on_control_timer (100 Hz), far faster than the
+		<=30 Hz the worker can produce, so the output queue is emptied every
+		tick and the controller always acts on the newest result.
+
+		INSTRUMENTATION (v2.0): this is where the real cross-boundary numbers are
+		measured. frame_to_available_ms is the full round trip -- frame arrival
+		in on_camera, IPC send, queue wait, worker compute, IPC return, until
+		drained here -- computed purely in THIS process's wall clock via the
+		echoed frame_wall (no cross-process clock comparison). The worker's own
+		per-call timings land in worker_* fields, NOT in on_camera's stage
+		fields; on_camera no longer runs those two stages, so folding worker
+		numbers back through its stage schema is exactly the arithmetic-
+		impossibility bug the first v2.0 test surfaced.
+		"""
+		newest = None
+		while True:
+			try:
+				newest = self._vision_out_q.get_nowait()
+			except queue.Empty:
+				break
+
+		if newest is not None:
+			drain_wall = self.time.wall_sec()
+			self._latest_target = newest.target
+			self._latest_flow = newest.flow
+
+			# Worker-side compute cost (honest, separate from on_camera stages).
+			self._latest_worker_target_acquisition_ms = newest.target_acquisition_ms
+			self._latest_worker_optical_flow_ms = newest.optical_flow_ms
+
+			# True frame->available round trip (parent wall clock throughout).
+			if newest.frame_wall is not None:
+				self._latest_frame_to_available_ms = 1000.0 * (drain_wall - newest.frame_wall)
+			# Effective processed-frame period: gap between the arrival times of
+			# consecutive results the worker actually returned. If this grows
+			# well past the camera period, the worker is not keeping up (frames
+			# dropped at the shallow input queue) and _latest_flow is going
+			# stale -- the second thing the first test could not see.
+			if (
+				self._prev_vision_result_frame_wall is not None
+				and newest.frame_wall is not None
+			):
+				self._latest_vision_result_period_ms = 1000.0 * (
+					newest.frame_wall - self._prev_vision_result_frame_wall
+				)
+			self._prev_vision_result_frame_wall = newest.frame_wall
+			# Held so on_control_timer can close the frame->command measurement
+			# when THIS sample actually drives a new command.
+			self._latest_flow_frame_wall = newest.frame_wall
+
+		# Liveness: if the worker process has died, results silently stop and the
+		# controller would coast on a stale sample until LOST_TARGET_TIMEOUT_SEC
+		# aborts to a neutral hover. Surface it loudly, exactly once.
+		if (
+			not self._vision_worker_dead_logged
+			and self._vision_worker is not None
+			and not self._vision_worker.is_alive()
+		):
+			self._vision_worker_dead_logged = True
+			self.get_logger().error(
+				"Vision worker process is no longer alive; target/flow updates "
+				"have stopped. The controller will hit LOST_TARGET_TIMEOUT and "
+				"hold a neutral visual hover. Check the worker's stderr for the "
+				"cause (e.g. an unpicklable TargetEstimate/FlowResult field)."
+			)
+
+	def shutdown_vision_worker(self):
+		"""Stop the vision worker cleanly. Safe to call more than once.
+
+		Sends the stop sentinel, lets the worker finish any queued frames, joins
+		with a timeout, and terminates only as a last resort. Called from main()'s
+		finally clause alongside the other subsystem teardown.
+		"""
+		worker = getattr(self, "_vision_worker", None)
+		if worker is None:
+			return
+		try:
+			if worker.is_alive():
+				try:
+					# Blocking put with a short timeout so the sentinel is
+					# actually delivered even if a frame is queued ahead of it.
+					self._vision_in_q.put(None, timeout=0.5)
+				except Exception:
+					pass
+				worker.join(timeout=2.0)
+			if worker.is_alive():
+				self.get_logger().warning(
+					"Vision worker did not exit on request; terminating it."
+				)
+				worker.terminate()
+				worker.join(timeout=1.0)
+		except Exception as exc:
+			self.get_logger().warning(
+				f"Error while shutting down vision worker: {repr(exc)}"
+			)
+		finally:
+			self._vision_worker = None
+
 	def on_camera(self, msg: Image):
 		self._image_count += 1
 		now = self.time.wall_sec()
@@ -742,33 +962,37 @@ class BeeLandNode(Node):
 		self._prev_camera_stamp = stamp
 		t_body_rate = self.time.wall_sec()
 
-		target = self.target_acquisition.update(frame, timestamp=stamp)
-		t_target = self.time.wall_sec()
-
-		flow = self.optical_flow.update(
-			frame, stamp, target=target, body_rates=body_rates
-		)
-		t_flow = self.time.wall_sec()
-
+		# v2.0: hand the frame to the out-of-process vision pipeline instead of
+		# running target_acquisition/optical_flow inline. This returns almost
+		# immediately (a queue put), so the single ROS executor thread is no
+		# longer held for the 40-200 ms the two vision stages take -- that work
+		# now happens in vision_worker, in parallel. The (target, flow) result
+		# lands back in _latest_target/_latest_flow when on_control_timer calls
+		# _drain_vision_results. _latest_frame is set here (not from the result)
+		# so the "have we ever received a frame" gates (_ready_to_start and the
+		# top of on_control_timer) fire as soon as the first frame arrives, just
+		# as before.
 		self._latest_frame = frame
-		self._latest_target = target
-		self._latest_flow = flow
+		self._ship_frame_to_vision(frame, stamp, body_rates, now)
+
 		self._latest_camera_cb_end_wall = self.time.wall_sec()
 		self._latest_camera_cb_duration_ms = (
 			1000.0 * (self._latest_camera_cb_end_wall - self._latest_camera_cb_start_wall)
 			if self._latest_camera_cb_start_wall is not None else None
 		)
 
-		# Per-stage breakdown -- diagnostics-only, see the constructor's
-		# comment above these attributes. These six numbers should sum to
-		# ~camera_cb_duration_ms; whichever one doesn't match its isolated
-		# micro-benchmark is the real trap, not a guess.
+		# Per-stage breakdown -- diagnostics-only. bridge/rotate/show/body_rate
+		# still happen HERE and are timed here; the target_acquisition and
+		# optical_flow stages now run in the worker and are filled into
+		# _latest_stage_target_acquisition_ms / _latest_stage_optical_flow_ms
+		# from the worker's own measurements when _drain_vision_results runs. So
+		# these on_camera stages NO LONGER sum to camera_cb_duration_ms (which is
+		# now just the light ship-the-frame path, and should be small) -- that is
+		# the whole point of the v2.0 split.
 		self._latest_stage_bridge_ms = 1000.0 * (t_bridge - now)
 		self._latest_stage_rotate_ms = 1000.0 * (t_rotate - t_bridge)
 		self._latest_stage_show_camera_ms = 1000.0 * (t_show - t_rotate)
 		self._latest_stage_body_rate_ms = 1000.0 * (t_body_rate - t_show)
-		self._latest_stage_target_acquisition_ms = 1000.0 * (t_target - t_body_rate)
-		self._latest_stage_optical_flow_ms = 1000.0 * (t_flow - t_target)
 
 	def on_platform_pose(self, msg: Pose):
 		"""
@@ -1186,6 +1410,14 @@ class BeeLandNode(Node):
 	def on_control_timer(self):
 		now = self.time.wall_sec()
 
+		# v2.0: pick up whatever the vision worker has produced since the last
+		# tick before doing anything else -- this is what advances
+		# _latest_target/_latest_flow now that on_camera only ships frames.
+		# Drained unconditionally (every phase) so the output queue never backs
+		# up, and BEFORE the have-a-frame gate below so _latest_flow can leave
+		# None once the first result arrives.
+		self._drain_vision_results()
+
 		if self._latest_flow is None or self._latest_frame is None:
 			return
 
@@ -1267,6 +1499,18 @@ class BeeLandNode(Node):
 				control_compute_start_wall - self._last_control_compute_start_wall
 			)
 		self._last_control_compute_start_wall = control_compute_start_wall
+
+		# v2.0 headline latency: frame arrival (on_camera) -> this command,
+		# spanning the whole out-of-process vision round trip PLUS the wait for a
+		# control tick to pick the result up. Measured only on the ticks that
+		# actually consume a NEW vision sample (this point is past the
+		# COMPUTE_CONTROL_ONLY_ON_NEW_VISION gate), in this process's wall clock.
+		# This is the number that decides whether v2.0 helped the loop -- compare
+		# it against v1.0's blocking on_camera duration (~11-18ms).
+		if self._latest_flow_frame_wall is not None:
+			self._latest_frame_to_command_ms = 1000.0 * (
+				control_compute_start_wall - self._latest_flow_frame_wall
+			)
 
 		# Mission routine: probe -> gate -> scheduled-gain descent. Feed it
 		# last cycle's ACTUAL commanded thrust (the efference copy of what has
@@ -1484,8 +1728,26 @@ class BeeLandNode(Node):
 			"stage_rotate_ms": self._latest_stage_rotate_ms,
 			"stage_show_camera_ms": self._latest_stage_show_camera_ms,
 			"stage_body_rate_ms": self._latest_stage_body_rate_ms,
+			# v2.0: these two on_camera sub-stages are structurally empty now
+			# (target_acquisition/optical_flow moved out of process). Kept as
+			# columns so the on_camera decomposition schema is unchanged; the
+			# real per-call cost is in worker_* below.
 			"stage_target_acquisition_ms": self._latest_stage_target_acquisition_ms,
 			"stage_optical_flow_ms": self._latest_stage_optical_flow_ms,
+			# v2.0 out-of-process vision measurements. worker_* = the worker's own
+			# perf_counter cost of each call (compute moved, not reduced -- expect
+			# ~v1.0 numbers here). frame_to_available/frame_to_command = the true
+			# cross-boundary latencies the v1.0-era stage timers never captured;
+			# frame_to_command is the one to compare against v1.0's blocking
+			# on_camera (~11-18ms). vision_result_period_ms >> camera period means
+			# the worker is falling behind; vision_dropped_frames counts frames
+			# shed at the shallow input queue under load.
+			"worker_target_acquisition_ms": self._latest_worker_target_acquisition_ms,
+			"worker_optical_flow_ms": self._latest_worker_optical_flow_ms,
+			"frame_to_available_wall_ms": self._latest_frame_to_available_ms,
+			"frame_to_command_wall_ms": self._latest_frame_to_command_ms,
+			"vision_result_period_wall_ms": self._latest_vision_result_period_ms,
+			"vision_dropped_frames": self._vision_dropped_frames,
 			"control_compute_start_wall_sec": self._last_control_compute_start_wall,
 			"control_compute_end_wall_sec": self._last_control_compute_end_wall,
 			"control_compute_duration_ms": self._last_control_compute_duration_ms,
@@ -1622,12 +1884,28 @@ def main(args=None):
 	except KeyboardInterrupt:
 		pass
 	finally:
-		node.mavsdk.request_stop()
-		node.diagnostics.close()
-		node.destroy_node()
+		# Best-effort teardown. On a Ctrl+C shutdown some subsystems may already
+		# be partway down -- notably the MAVSDK asyncio loop, whose request_stop()
+		# can raise "Event loop is closed". Isolate each step so a late error
+		# neither dumps a traceback after a clean landing nor skips the rest of
+		# teardown (previously request_stop() ran first, so that RuntimeError
+		# aborted shutdown_vision_worker/diagnostics.close/destroy_node entirely).
+		for teardown in (
+			node.mavsdk.request_stop,
+			node.shutdown_vision_worker,
+			node.diagnostics.close,
+			node.destroy_node,
+		):
+			try:
+				teardown()
+			except Exception:
+				pass
 		if SHOW_CAMERA:
-			with suppress_stderr_fd(True):
-				cv2.destroyAllWindows()
+			try:
+				with suppress_stderr_fd(True):
+					cv2.destroyAllWindows()
+			except Exception:
+				pass
 		try:
 			if rclpy.ok():
 				rclpy.shutdown()

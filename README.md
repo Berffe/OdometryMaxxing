@@ -8,6 +8,10 @@ velocity estimate, no platform model.
 This page is a map. Each linked README goes deep on its own piece; this one
 stays short on purpose.
 
+We also reinforce the research motivation of the current repo! Don't go in expecting neat 
+readible and beautiful code. It's more like "it get's the job done" and we encorage you
+to optimize wherever you see the possibility!!
+
 ---
 
 ## Start here

@@ -212,6 +212,19 @@ class DiagnosticsWriter:
 				"timing_stage_body_rate_ms": self._num(timing.get("stage_body_rate_ms")),
 				"timing_stage_target_acquisition_ms": self._num(timing.get("stage_target_acquisition_ms")),
 				"timing_stage_optical_flow_ms": self._num(timing.get("stage_optical_flow_ms")),
+				# v2.0 out-of-process vision. The two stage_* columns above are
+				# blank now (those calls left on_camera); worker_* below are the
+				# worker's own perf_counter cost of the same two calls, and the
+				# frame_to_* / result_period / dropped columns are the real
+				# cross-process latencies (see bee_node._drain_vision_results and
+				# on_control_timer). frame_to_command is the number to compare
+				# against v1.0's blocking on_camera duration (~11-18ms).
+				"timing_worker_target_acquisition_ms": self._num(timing.get("worker_target_acquisition_ms")),
+				"timing_worker_optical_flow_ms": self._num(timing.get("worker_optical_flow_ms")),
+				"timing_frame_to_available_wall_ms": self._num(timing.get("frame_to_available_wall_ms")),
+				"timing_frame_to_command_wall_ms": self._num(timing.get("frame_to_command_wall_ms")),
+				"timing_vision_result_period_wall_ms": self._num(timing.get("vision_result_period_wall_ms")),
+				"timing_vision_dropped_frames": self._int_or_blank(timing.get("vision_dropped_frames", -1)),
 				"timing_control_compute_start_wall_sec": self._num(timing.get("control_compute_start_wall_sec")),
 				"timing_control_compute_end_wall_sec": self._num(timing.get("control_compute_end_wall_sec")),
 				"timing_control_compute_duration_ms": self._num(timing.get("control_compute_duration_ms")),
@@ -333,6 +346,12 @@ class DiagnosticsWriter:
 			"timing_stage_body_rate_ms",
 			"timing_stage_target_acquisition_ms",
 			"timing_stage_optical_flow_ms",
+			"timing_worker_target_acquisition_ms",
+			"timing_worker_optical_flow_ms",
+			"timing_frame_to_available_wall_ms",
+			"timing_frame_to_command_wall_ms",
+			"timing_vision_result_period_wall_ms",
+			"timing_vision_dropped_frames",
 			"timing_control_compute_start_wall_sec",
 			"timing_control_compute_end_wall_sec",
 			"timing_control_compute_duration_ms",

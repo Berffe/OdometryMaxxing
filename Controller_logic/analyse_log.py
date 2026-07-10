@@ -247,130 +247,6 @@ def estimate_rtf(df: pd.DataFrame, analysis_t: np.ndarray) -> Optional[float]:
 
 
 # ---------------------------------------------------------------------------
-# TOuchdown helpers
-# ---------------------------------------------------------------------------
-
-def _first_true_index(mask: np.ndarray) -> Optional[int]:
-	idx = np.where(np.asarray(mask, dtype=bool))[0]
-	return int(idx[0]) if len(idx) else None
-
-
-def _after_descend_start_mask(df: pd.DataFrame) -> np.ndarray:
-	"""Rows at/after the first DESCEND sample, or all rows for older logs.
-
-	Touchdown heuristics should not accidentally trigger on a pre-flight zero
-	thrust sample, so when mission_substate is available we only search once the
-	mission has actually entered DESCEND.
-	"""
-	mask = np.ones(len(df), dtype=bool)
-	if "mission_substate" not in df.columns:
-		return mask
-	sub = df["mission_substate"].astype(str).fillna("").to_numpy()
-	descend_idxs = np.where(sub == "descend")[0]
-	if len(descend_idxs) == 0:
-		return mask
-	mask[:] = False
-	mask[int(descend_idxs[0]):] = True
-	return mask
-
-
-def _detect_touchdown(df: pd.DataFrame, t: np.ndarray) -> Optional[dict]:
-	"""Best-effort touchdown detector for log analysis.
-
-	Preferred signal is an explicit touchdown/landed boolean if present. The
-	current logs usually expose touchdown indirectly by command_thrust dropping
-	to zero after DESCEND, so that is the main fallback. If neither is available,
-	use |relative_z| approaching zero after DESCEND.
-	"""
-	after_descend = _after_descend_start_mask(df)
-
-	for col in (
-		"touchdown",
-		"touchdown_detected",
-		"landed",
-		"vehicle_landed",
-		"contact_detected",
-		"in_contact",
-	):
-		if col in df.columns:
-			idx = _first_true_index(bool_column(df, col) & after_descend)
-			if idx is not None:
-				return {"idx": idx, "t": float(t[idx]), "source": col}
-
-	if "command_thrust" in df.columns:
-		thrust = numeric_column(df, "command_thrust")
-		finite = np.isfinite(thrust)
-		seen_positive = np.maximum.accumulate(finite & (thrust > 1e-4))
-		mask = finite & seen_positive & after_descend & (thrust <= 1e-6)
-		idx = _first_true_index(mask)
-		if idx is not None:
-			return {"idx": idx, "t": float(t[idx]), "source": "command_thrust<=0"}
-
-	if "relative_z_m" in df.columns:
-		relz = numeric_column(df, "relative_z_m")
-		height = np.abs(relz)
-		finite = np.isfinite(height)
-		seen_above = np.maximum.accumulate(finite & after_descend & (height > 0.10))
-		mask = finite & after_descend & seen_above & (height <= 0.03)
-		idx = _first_true_index(mask)
-		if idx is not None:
-			return {"idx": idx, "t": float(t[idx]), "source": "|relative_z|<=0.03m"}
-
-	return None
-
-
-def _smooth_until_index(t: np.ndarray, y: np.ndarray, end_idx: Optional[int], window_sec: float = 0.6) -> np.ndarray:
-	"""Smooth y only up to end_idx inclusive; keep the rest NaN.
-
-	For touchdown velocity, this deliberately prevents post-contact samples from
-	being used by the centered rolling window at the end of the pre-contact trace.
-	"""
-	y = np.asarray(y, dtype=float)
-	y_smooth = np.full_like(y, np.nan, dtype=float)
-	if len(y) == 0:
-		return y_smooth
-	end = len(y) if end_idx is None else max(0, min(len(y), int(end_idx) + 1))
-	if end <= 0:
-		return y_smooth
-	y_smooth[:end] = _rolling_smooth(np.asarray(t[:end], dtype=float), y[:end], window_sec=window_sec)
-	return y_smooth
-
-
-def _touchdown_velocity(df: pd.DataFrame, t: np.ndarray, window_sec: float = 0.6) -> Optional[dict]:
-	"""Return raw and smoothed relative z-velocity at touchdown, if detectable."""
-	touch = _detect_touchdown(df, t)
-	if touch is None or "relative_vz_m_s" not in df.columns:
-		return None
-	vz = numeric_column(df, "relative_vz_m_s")
-	vz_s = _smooth_until_index(t, vz, touch["idx"], window_sec=window_sec)
-	idx = int(touch["idx"])
-	raw = float(vz[idx]) if idx < len(vz) and np.isfinite(vz[idx]) else float("nan")
-	smoothed = float(vz_s[idx]) if idx < len(vz_s) and np.isfinite(vz_s[idx]) else raw
-	out = dict(touch)
-	out.update({"relative_vz_raw": raw, "relative_vz_smoothed": smoothed, "smooth_window_sec": float(window_sec)})
-	if "relative_z_m" in df.columns:
-		relz = numeric_column(df, "relative_z_m")
-		if idx < len(relz) and np.isfinite(relz[idx]):
-			out["relative_z_m"] = float(relz[idx])
-	return out
-
-
-def _append_touchdown_summary(df: pd.DataFrame, t: np.ndarray, lines: list):
-	touch = _touchdown_velocity(df, t)
-	if touch is None:
-		return
-
-	z_note = ""
-	if "relative_z_m" in touch:
-		z_note = f", relative_z={touch['relative_z_m']:+.3f} m"
-	lines.append(
-		f"Touchdown relative z-velocity (closing +, smoothed {touch['smooth_window_sec']:.1f}s): "
-		f"{touch['relative_vz_smoothed']:+.4f} m/s "
-		f"(raw {touch['relative_vz_raw']:+.4f} m/s, t={touch['t']:.3f}s, "
-		f"source={touch['source']}{z_note})"
-	)
-
-# ---------------------------------------------------------------------------
 # Frequency helpers
 # ---------------------------------------------------------------------------
 
@@ -533,6 +409,129 @@ def _last_finite(df: pd.DataFrame, col: str) -> Optional[float]:
 	y = numeric_column(df, col)
 	y = y[np.isfinite(y)]
 	return float(y[-1]) if len(y) else None
+
+
+def _first_true_index(mask: np.ndarray) -> Optional[int]:
+	idx = np.where(np.asarray(mask, dtype=bool))[0]
+	return int(idx[0]) if len(idx) else None
+
+
+def _after_descend_start_mask(df: pd.DataFrame) -> np.ndarray:
+	"""Rows at/after the first DESCEND sample, or all rows for older logs.
+
+	Touchdown heuristics should not accidentally trigger on a pre-flight zero
+	thrust sample, so when mission_substate is available we only search once the
+	mission has actually entered DESCEND.
+	"""
+	mask = np.ones(len(df), dtype=bool)
+	if "mission_substate" not in df.columns:
+		return mask
+	sub = df["mission_substate"].astype(str).fillna("").to_numpy()
+	descend_idxs = np.where(sub == "descend")[0]
+	if len(descend_idxs) == 0:
+		return mask
+	mask[:] = False
+	mask[int(descend_idxs[0]):] = True
+	return mask
+
+
+def _detect_touchdown(df: pd.DataFrame, t: np.ndarray) -> Optional[dict]:
+	"""Best-effort touchdown detector for log analysis.
+
+	Preferred signal is an explicit touchdown/landed boolean if present. The
+	current logs usually expose touchdown indirectly by command_thrust dropping
+	to zero after DESCEND, so that is the main fallback. If neither is available,
+	use |relative_z| approaching zero after DESCEND.
+	"""
+	after_descend = _after_descend_start_mask(df)
+
+	for col in (
+		"touchdown",
+		"touchdown_detected",
+		"landed",
+		"vehicle_landed",
+		"contact_detected",
+		"in_contact",
+	):
+		if col in df.columns:
+			idx = _first_true_index(bool_column(df, col) & after_descend)
+			if idx is not None:
+				return {"idx": idx, "t": float(t[idx]), "source": col}
+
+	if "command_thrust" in df.columns:
+		thrust = numeric_column(df, "command_thrust")
+		finite = np.isfinite(thrust)
+		seen_positive = np.maximum.accumulate(finite & (thrust > 1e-4))
+		mask = finite & seen_positive & after_descend & (thrust <= 1e-6)
+		idx = _first_true_index(mask)
+		if idx is not None:
+			return {"idx": idx, "t": float(t[idx]), "source": "command_thrust<=0"}
+
+	if "relative_z_m" in df.columns:
+		relz = numeric_column(df, "relative_z_m")
+		height = np.abs(relz)
+		finite = np.isfinite(height)
+		# Avoid triggering on a log that begins already close to zero by requiring
+		# that the same post-DESCEND segment previously had a meaningful gap.
+		seen_above = np.maximum.accumulate(finite & after_descend & (height > 0.10))
+		mask = finite & after_descend & seen_above & (height <= 0.03)
+		idx = _first_true_index(mask)
+		if idx is not None:
+			return {"idx": idx, "t": float(t[idx]), "source": "|relative_z|<=0.03m"}
+
+	return None
+
+
+def _smooth_until_index(t: np.ndarray, y: np.ndarray, end_idx: Optional[int], window_sec: float = 0.6) -> np.ndarray:
+	"""Smooth y only up to end_idx inclusive; keep the rest NaN.
+
+	For touchdown velocity, this deliberately prevents post-contact samples from
+	being used by the centered rolling window at the end of the pre-contact trace.
+	"""
+	y = np.asarray(y, dtype=float)
+	y_smooth = np.full_like(y, np.nan, dtype=float)
+	if len(y) == 0:
+		return y_smooth
+	end = len(y) if end_idx is None else max(0, min(len(y), int(end_idx) + 1))
+	if end <= 0:
+		return y_smooth
+	y_smooth[:end] = _rolling_smooth(np.asarray(t[:end], dtype=float), y[:end], window_sec=window_sec)
+	return y_smooth
+
+
+def _touchdown_velocity(df: pd.DataFrame, t: np.ndarray, window_sec: float = 0.6) -> Optional[dict]:
+	"""Return raw and smoothed relative z-velocity at touchdown, if detectable."""
+	touch = _detect_touchdown(df, t)
+	if touch is None or "relative_vz_m_s" not in df.columns:
+		return None
+	vz = numeric_column(df, "relative_vz_m_s")
+	vz_s = _smooth_until_index(t, vz, touch["idx"], window_sec=window_sec)
+	idx = int(touch["idx"])
+	raw = float(vz[idx]) if idx < len(vz) and np.isfinite(vz[idx]) else float("nan")
+	smoothed = float(vz_s[idx]) if idx < len(vz_s) and np.isfinite(vz_s[idx]) else raw
+	out = dict(touch)
+	out.update({"relative_vz_raw": raw, "relative_vz_smoothed": smoothed, "smooth_window_sec": float(window_sec)})
+	if "relative_z_m" in df.columns:
+		relz = numeric_column(df, "relative_z_m")
+		if idx < len(relz) and np.isfinite(relz[idx]):
+			out["relative_z_m"] = float(relz[idx])
+	return out
+
+
+def _append_touchdown_summary(df: pd.DataFrame, t: np.ndarray, lines: list):
+	touch = _touchdown_velocity(df, t)
+	if touch is None:
+		return
+
+	z_note = ""
+	if "relative_z_m" in touch:
+		z_note = f", relative_z={touch['relative_z_m']:+.3f} m"
+	lines.append(
+		f"Touchdown relative z-velocity (closing +, smoothed {touch['smooth_window_sec']:.1f}s): "
+		f"{touch['relative_vz_smoothed']:+.4f} m/s "
+		f"(raw {touch['relative_vz_raw']:+.4f} m/s, t={touch['t']:.3f}s, "
+		f"source={touch['source']}{z_note})"
+	)
 
 
 def _append_mission_summary(df: pd.DataFrame, t: np.ndarray, lines: list):
@@ -930,6 +929,8 @@ def plot_vertical_control(df: pd.DataFrame, t: np.ndarray, output_dir: str, dive
 	elif divergence_setpoint is not None:
 		axes[0].axhline(divergence_setpoint, linestyle=":", linewidth=1.4, label=f"setpoint {divergence_setpoint:g}")
 	shade_mission_phases(axes[0], df, t)
+	if touch is not None:
+		axes[0].axvline(touch["t"], linestyle="--", linewidth=1.1, alpha=0.75)
 	axes[0].axhline(0.0, linestyle="--", linewidth=1)
 	axes[0].set_ylabel("divergence [1/s]")
 	axes[0].grid(True)
@@ -946,6 +947,7 @@ def plot_vertical_control(df: pd.DataFrame, t: np.ndarray, output_dir: str, dive
 		left_handles.extend([line_raw, line_smooth])
 		left_labels.extend([line_raw.get_label(), line_smooth.get_label()])
 		if touch is not None and np.isfinite(touch.get("relative_vz_smoothed", np.nan)):
+			idx = int(touch["idx"])
 			marker = axes[1].scatter(
 				[touch["t"]], [touch["relative_vz_smoothed"]],
 				marker="o", s=42, zorder=5, label="touchdown vz"
@@ -983,6 +985,8 @@ def plot_vertical_control(df: pd.DataFrame, t: np.ndarray, output_dir: str, dive
 		axes[2].plot(t, numeric_column(df, "command_thrust"), label="thrust command")
 		axes[2].axhline(0.73, linestyle="--", linewidth=1, label="hover ref 0.73")
 	shade_mission_phases(axes[2], df, t)
+	if touch is not None:
+		axes[2].axvline(touch["t"], linestyle="--", linewidth=1.1, alpha=0.75)
 	axes[2].set_ylabel("thrust [-]")
 	axes[2].grid(True)
 	axes[2].legend(loc="best")
@@ -991,6 +995,8 @@ def plot_vertical_control(df: pd.DataFrame, t: np.ndarray, output_dir: str, dive
 		integral = numeric_column(df, "command_thrust_integral")
 		axes[3].plot(t, integral, color="tab:purple", label="divergence integral (raw)")
 		shade_mission_phases(axes[3], df, t)
+		if touch is not None:
+			axes[3].axvline(touch["t"], linestyle="--", linewidth=1.1, alpha=0.75)
 		axes[3].axhline(0.0, linestyle="--", linewidth=1, color="0.4")
 		finite = integral[np.isfinite(integral)]
 		if len(finite):
