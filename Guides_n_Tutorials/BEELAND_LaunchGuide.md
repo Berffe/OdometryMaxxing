@@ -55,6 +55,7 @@ cd ~/PX4-Autopilot
 
 source build/px4_sitl_default/rootfs/gz_env.sh
 
+HEADLESS=1 \
 PX4_SYS_AUTOSTART=4001 \
 PX4_SIMULATOR=gz \
 PX4_SIM_MODEL=bee_x500 \

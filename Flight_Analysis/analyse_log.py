@@ -16,22 +16,28 @@ Usage:
 	python analyse_log.py logs/bee_diagnostics_XXXXXXXX.csv results/test9 \
 		--platform-frequency-hz 0.2
 
-Default generated files:
+Default generated files -- the core loop: did we SEE the target, did the PROBE
+measure the platform, did the GATE pick a sane gain window, did the DESCENT do
+what was asked:
 
 	- summary.txt
+	- target_detection_summary.png        target offsets/area/confidence (phase-shaded)
 	- detection_boxes_fov.png             field-of-view reconstruction
-	- target_detection_summary.png
-	- lateral_control.png
-	- vertical_control.png
-	- flow_derotation.png                 raw vs de-rotated optical flow (ego-rotation removal)
-	- gain_schedule.png
-	- divergence_consistency.png          vision divergence vs. kinematic ground truth
-	- platform_motion_frequency.png       when platform_z_m is available
-	- drone_platform_position_xyz.png      drone and platform positions on x/y/z
+	- probe_acceleration.png              what peak_accel is built from, step by step
+	- gain_schedule.png                   k(t) inside the [k_min, k_ceiling] window
+	- vertical_divergence.png             the loop's ERROR signal: D vs D*, + integral
+	- vertical_descent.png                the PHYSICAL outcome: closing rate, height, thrust
 	- closing_rate_spectrum.png           when relative_vz_m_s or vehicle_vz_m_s is available
 
-Optional with --full:
+Optional with --full -- narrower or more diagnostic questions. Not less useful,
+just not what you look at on every run:
 
+	- lateral_control.png
+	- flow_derotation.png                 raw vs de-rotated optical flow (ego-rotation removal)
+	- divergence_consistency.png          vision divergence vs. kinematic ground truth
+	- height_prediction.png               open-loop h_pred vs measured (diagnostic only)
+	- platform_motion_frequency.png       when platform_z_m is available
+	- drone_platform_position_xyz.png     drone and platform positions on x/y/z (phase-shaded)
 	- vehicle_position_xyz.png
 	- platform_position_xyz.png
 	- platform_velocity_xyz.png
@@ -59,6 +65,91 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from matplotlib.patches import Rectangle
+
+
+# ---------------------------------------------------------------------------
+# Display labels
+# ---------------------------------------------------------------------------
+#
+# ONE place that maps a CSV column to the words that appear on a figure. Plots
+# call label_for("mission_k_floor") rather than hardcoding a string, so a name
+# is chosen once and every figure agrees. Anything not listed falls back to a
+# readable de-snake_cased version of the column, so a new column still plots
+# sensibly before it gets a curated name here.
+#
+# Conventions: state what the quantity IS, then its role in parentheses where
+# the role is the reason it is on the plot ("k_min (Herisse floor)"). Units go
+# on the axis label, not the series label.
+
+COLUMN_LABELS: dict[str, str] = {
+	# --- target / vision ---
+	"target_offset_x": "horizontal offset (P-term input)",
+	"target_offset_y": "vertical offset (P-term input)",
+	"target_area_fraction": "target area fraction",
+	"target_confidence": "detection confidence",
+	"target_fov_saturated": "FOV saturated (area no longer tracks range)",
+	"target_detection_width_px": "detection width",
+	"target_detection_height_px": "detection height",
+
+	# --- optical flow ---
+	"flow_divergence_1_s": "divergence (filtered, control input)",
+	"flow_raw_divergence_1_s": "divergence (raw, unfiltered)",
+	"flow_divergence_prederotation_1_s": "divergence before de-rotation",
+	"flow_mean_x_norm_s": "horizontal flow (D-term input)",
+	"flow_mean_y_norm_s": "vertical flow (D-term input)",
+	"flow_mean_x_px_s": "horizontal flow",
+	"flow_mean_y_px_s": "vertical flow",
+	"flow_mean_x_raw_px_s": "horizontal flow before de-rotation",
+	"flow_mean_y_raw_px_s": "vertical flow before de-rotation",
+	"flow_fit_quality": "divergence fit quality (weighted R\u00b2)",
+
+	# --- commands ---
+	"command_thrust": "thrust command",
+	"command_thrust_integral": "divergence integral",
+	"command_roll_rad": "roll command",
+	"command_pitch_rad": "pitch command",
+
+	# --- vehicle / platform ---
+	"vehicle_vz_m_s": "vehicle vertical velocity",
+	"relative_z_m": "height above platform (measured)",
+	"relative_vz_m_s": "closing rate (measured)",
+	"platform_z_m": "platform height",
+	"platform_vz_m_s": "platform vertical velocity",
+
+	# --- mission: gain window ---
+	# The descent gain rides the de Croon ceiling AT LEG HEIGHT; k_min survives
+	# only as a hard floor beneath it. Naming keeps that hierarchy legible.
+	"mission_thrust_gain_k": "k(t) (scheduled thrust gain)",
+	"mission_k_explore": "k_explore (exploration gain, schedule start)",
+	"mission_k_min": "k_min (Herisse floor: peak accel / D*)",
+	"mission_k_ceiling_leg": "k_ceiling (de Croon limit at leg height)",
+	"mission_k_target": "k_target (margin \u00d7 ceiling: what k(t) aims for)",
+	"mission_k_floor": "k_floor (schedule asymptote = max(k_min, k_target))",
+	"mission_k_probe": "k_probe (near-field probe gain; descent starts here)",
+	"mission_k_descend_start": "k_descend_start (= k_probe)",
+	"mission_k_over_ceiling_leg": "k(t) / k_ceiling (fraction of the limit used)",
+	"mission_ceiling_margin": "ceiling margin",
+	"mission_h_crit_m": "h_crit (height where ceiling meets floor)",
+	"mission_h_pred_m": "h_pred (open-loop prediction, diagnostic only)",
+	"mission_divergence_setpoint_1_s": "D* (commanded divergence)",
+	"mission_lateral_p_scale": "lateral P scale",
+	"mission_lateral_d_scale": "lateral D scale",
+
+	# --- mission: platform probe ---
+	"mission_peak_accel_m_s2": "peak accel (envelope \u2192 gate)",
+	"mission_probe_accel_m_s2": "commanded accel",
+	"mission_probe_mean_accel_m_s2": "EMA bias removed (hover trim + descent term)",
+	"mission_probe_residual_accel_m_s2": "residual |accel \u2212 bias| (the measurement)",
+	"mission_probe_percentile_accel_m_s2": "window percentile (envelope target)",
+	"mission_probe_peak_accel_at_handoff_m_s2": "peak at far\u2192near handoff",
+}
+
+
+def label_for(column: str) -> str:
+	"""Figure label for a CSV column. Falls back to a de-snake_cased name."""
+	if column in COLUMN_LABELS:
+		return COLUMN_LABELS[column]
+	return column.replace("_", " ")
 
 
 # ---------------------------------------------------------------------------
@@ -255,6 +346,22 @@ def _first_true_index(mask: np.ndarray) -> Optional[int]:
 	return int(idx[0]) if len(idx) else None
 
 
+def _flying_mask(df: pd.DataFrame) -> np.ndarray:
+	"""Rows where the vehicle is actually FLYING -- i.e. not the post-touchdown
+	LANDED hold.
+
+	Any statistic about the descent (achieved divergence, thrust, tracking error,
+	touchdown velocity) must exclude LANDED rows, which are the vehicle sitting on
+	the platform at zero thrust. Before the LANDED substate existed those rows were
+	labelled "descend" and silently dominated: in one run 1437 of 2065 "descend"
+	rows were post-touchdown, and the descent's achieved divergence read 0.012
+	instead of its true 0.238.
+	"""
+	if "mission_substate" not in df.columns:
+		return np.ones(len(df), dtype=bool)
+	return df["mission_substate"].astype(str).fillna("").to_numpy() != "landed"
+
+
 def _after_descend_start_mask(df: pd.DataFrame) -> np.ndarray:
 	"""Rows at/after the first DESCEND sample, or all rows for older logs.
 
@@ -283,6 +390,17 @@ def _detect_touchdown(df: pd.DataFrame, t: np.ndarray) -> Optional[dict]:
 	use |relative_z| approaching zero after DESCEND.
 	"""
 	after_descend = _after_descend_start_mask(df)
+
+	# BEST signal: the explicit LANDED substate. bee_node latches it via
+	# MissionRoutine.mark_landed() the instant its own touchdown detector fires, so
+	# this is the node's own verdict rather than a heuristic reconstructed from the
+	# thrust trace. Everything below is a fallback for logs written before the
+	# substate existed.
+	if "mission_substate" in df.columns:
+		sub = df["mission_substate"].astype(str).fillna("").to_numpy()
+		idx = _first_true_index(sub == "landed")
+		if idx is not None:
+			return {"idx": idx, "t": float(t[idx]), "source": "mission_substate=landed"}
 
 	for col in (
 		"touchdown",
@@ -559,6 +677,40 @@ def _append_mission_summary(df: pd.DataFrame, t: np.ndarray, lines: list):
 		lines.append(f"k_min (Herisse floor): {k_min:.4f}   k_explore (hand-tuned initial gain): {k_explore:.4f}")
 	if h_crit is not None:
 		lines.append(f"h_crit (gain hits floor): {h_crit:.4f} m")
+
+	# --- CALIBRATION READOUT for NEAR_FIELD_HEIGHT_M ---------------------------
+	# The whole gain schedule is anchored on the height at which the near-field
+	# trigger fires (bee_node.NEAR_FIELD_HEIGHT_M): k_probe = margin *
+	# k_ceiling(that height). It is a camera-geometry constant, so unlike h0 it is
+	# directly measurable -- here it is, from relative_z_m at the FINAL_PROBE
+	# transition. Copy the measured number back into NEAR_FIELD_HEIGHT_M.
+	if "relative_z_m" in df.columns:
+		entry_idx = _first_true_index(sub == "final_probe")
+		if entry_idx is not None:
+			h_meas = numeric_column(df, "relative_z_m")[entry_idx]
+			if np.isfinite(h_meas):
+				h_meas = abs(float(h_meas))
+				assumed = _last_finite(df, "mission_near_field_height_m")
+				line = f"Height at FINAL_PROBE entry (MEASURED): {h_meas:.3f} m"
+				if assumed is not None and np.isfinite(assumed) and assumed > 0.0:
+					err = 100.0 * (assumed - h_meas) / h_meas
+					line += f"   vs NEAR_FIELD_HEIGHT_M = {assumed:.3f} m ({err:+.0f}%)"
+					if assumed > h_meas * 1.15:
+						line += "\n  WARNING: the anchor is HIGHER than reality -> k_probe was set"
+						line += "\n  above the true ceiling at the probe height. Lower it."
+				lines.append(line)
+
+	k_probe = _last_finite(df, "mission_k_probe")
+	k_ceiling = _last_finite(df, "mission_k_ceiling_leg")
+	k_floor = _last_finite(df, "mission_k_floor")
+	if k_probe is not None and k_floor is not None:
+		lines.append(
+			f"Gain walk-down: k_explore {k_explore:.2f} -> k_probe {k_probe:.2f} "
+			f"(flat through FINAL_PROBE) -> k_floor {k_floor:.2f}"
+		)
+	if k_ceiling is not None:
+		lines.append(f"k_ceiling at leg height: {k_ceiling:.4f}")
+
 	if feasible is not None:
 		lines.append(f"Feasibility verdict: {'FEASIBLE' if feasible >= 0.5 else 'INFEASIBLE'}")
 
@@ -817,10 +969,17 @@ def plot_target_detection_summary(df: pd.DataFrame, t: np.ndarray, output_dir: s
 	fig, axes = plt.subplots(3, 1, figsize=(11, 8), sharex=True)
 	fig.suptitle("Target detection summary")
 
+	# Phase shading: detection quality is only interpretable against WHICH PHASE
+	# it happened in -- e.g. area_fraction crossing FOV_NEAR_AREA_FRACTION is what
+	# TRIGGERS the FINAL_PROBE boundary drawn here, so the two must be read
+	# together.
+	for ax in axes:
+		shade_mission_phases(ax, df, t, label_once=(ax is axes[0]))
+
 	if "target_offset_x" in df.columns:
-		axes[0].plot(t, numeric_column(df, "target_offset_x"), label="offset x")
+		axes[0].plot(t, numeric_column(df, "target_offset_x"), label=label_for("target_offset_x"))
 	if "target_offset_y" in df.columns:
-		axes[0].plot(t, numeric_column(df, "target_offset_y"), label="offset y")
+		axes[0].plot(t, numeric_column(df, "target_offset_y"), label=label_for("target_offset_y"))
 	_mark_bool_false(axes[0], t, ~target_found, "target not found")
 	axes[0].axhline(0.0, linestyle="--", linewidth=1)
 	axes[0].set_ylabel("offset [-]")
@@ -828,15 +987,15 @@ def plot_target_detection_summary(df: pd.DataFrame, t: np.ndarray, output_dir: s
 	axes[0].legend(loc="best")
 
 	if "target_area_fraction" in df.columns:
-		axes[1].plot(t, numeric_column(df, "target_area_fraction"), label="area fraction")
+		axes[1].plot(t, numeric_column(df, "target_area_fraction"), label=label_for("target_area_fraction"))
 	if np.any(fov_sat):
-		axes[1].scatter(t[fov_sat], numeric_column(df, "target_area_fraction")[fov_sat], marker="o", s=18, label="FOV saturated")
+		axes[1].scatter(t[fov_sat], numeric_column(df, "target_area_fraction")[fov_sat], marker="o", s=18, label=label_for("target_fov_saturated"))
 	axes[1].set_ylabel("area fraction [-]")
 	axes[1].grid(True)
 	axes[1].legend(loc="best")
 
 	if "target_confidence" in df.columns:
-		axes[2].plot(t, numeric_column(df, "target_confidence"), label="confidence")
+		axes[2].plot(t, numeric_column(df, "target_confidence"), label=label_for("target_confidence"))
 	axes[2].fill_between(t, 0, 1, where=~target_found, alpha=0.15, label="not found")
 	axes[2].set_ylim(-0.05, 1.05)
 	axes[2].set_ylabel("confidence [-]")
@@ -859,9 +1018,9 @@ def plot_lateral_control(df: pd.DataFrame, t: np.ndarray, output_dir: str):
 
 	shade_mission_phases(axes[0], df, t)
 	if "target_offset_x" in df.columns:
-		axes[0].plot(t, numeric_column(df, "target_offset_x"), label="target_offset_x")
+		axes[0].plot(t, numeric_column(df, "target_offset_x"), label=label_for("target_offset_x"))
 	if "target_offset_y" in df.columns:
-		axes[0].plot(t, numeric_column(df, "target_offset_y"), label="target_offset_y")
+		axes[0].plot(t, numeric_column(df, "target_offset_y"), label=label_for("target_offset_y"))
 	axes[0].axhline(0.0, linestyle="--", linewidth=1)
 	axes[0].set_ylabel("image offset [-]\n(P-term input)")
 	axes[0].grid(True)
@@ -872,9 +1031,9 @@ def plot_lateral_control(df: pd.DataFrame, t: np.ndarray, output_dir: str):
 		ax = axes[1]
 		shade_mission_phases(ax, df, t)
 		if "flow_mean_x_norm_s" in df.columns:
-			ax.plot(t, numeric_column(df, "flow_mean_x_norm_s"), label="flow_mean_x_norm", color="tab:green")
+			ax.plot(t, numeric_column(df, "flow_mean_x_norm_s"), label=label_for("flow_mean_x_norm_s"), color="tab:green")
 		if "flow_mean_y_norm_s" in df.columns:
-			ax.plot(t, numeric_column(df, "flow_mean_y_norm_s"), label="flow_mean_y_norm", color="tab:red")
+			ax.plot(t, numeric_column(df, "flow_mean_y_norm_s"), label=label_for("flow_mean_y_norm_s"), color="tab:red")
 		ax.axhline(0.0, linestyle="--", linewidth=1)
 		# Same [-1,1]-per-frame-half-width/height normalization as offset_x/y
 		# above (see optical_flow.py / target_acquisition.py) -- units here are
@@ -888,9 +1047,9 @@ def plot_lateral_control(df: pd.DataFrame, t: np.ndarray, output_dir: str):
 
 	cmd_axis = axes[-1]
 	if "command_roll_rad" in df.columns:
-		cmd_axis.plot(t, numeric_column(df, "command_roll_rad"), label="roll command")
+		cmd_axis.plot(t, numeric_column(df, "command_roll_rad"), label=label_for("command_roll_rad"))
 	if "command_pitch_rad" in df.columns:
-		cmd_axis.plot(t, numeric_column(df, "command_pitch_rad"), label="pitch command")
+		cmd_axis.plot(t, numeric_column(df, "command_pitch_rad"), label=label_for("command_pitch_rad"))
 	shade_mission_phases(cmd_axis, df, t)
 	cmd_axis.axhline(0.0, linestyle="--", linewidth=1)
 	cmd_axis.set_ylabel("command [rad]")
@@ -901,97 +1060,70 @@ def plot_lateral_control(df: pd.DataFrame, t: np.ndarray, output_dir: str):
 	save_current_figure(output_dir, "lateral_control.png")
 
 
-def plot_vertical_control(df: pd.DataFrame, t: np.ndarray, output_dir: str, divergence_setpoint: Optional[float] = None):
-	available = any(c in df.columns for c in ["flow_divergence_1_s", "relative_vz_m_s", "vehicle_vz_m_s", "command_thrust", "relative_z_m"])
+def plot_vertical_divergence(df: pd.DataFrame, t: np.ndarray, output_dir: str, divergence_setpoint: Optional[float] = None):
+	"""The vertical loop's ERROR SIGNAL: what divergence we asked for, what we
+	measured, and what the integrator did about the gap.
+
+	Split out of the old 4-panel vertical_control figure, which crammed the loop's
+	input and its physical outcome onto one unreadable axis stack. This is the
+	"what did the controller SEE" half; plot_vertical_descent is the "what did the
+	vehicle DO" half.
+	"""
+	available = any(c in df.columns for c in ["flow_divergence_1_s", "mission_divergence_setpoint_1_s", "command_thrust_integral"])
 	if not available:
-		print("Skipping vertical control plot. Missing vertical/divergence/command columns.")
+		print("Skipping vertical divergence plot. Missing divergence columns.")
 		return
 
 	have_integral = "command_thrust_integral" in df.columns and np.any(
 		np.isfinite(numeric_column(df, "command_thrust_integral"))
 	)
-	n_rows = 4 if have_integral else 3
-	fig, axes = plt.subplots(n_rows, 1, figsize=(11, 8 + (2 if have_integral else 0)), sharex=True)
-	fig.suptitle("Vertical / divergence control")
-	touch = _touchdown_velocity(df, t)
+	n_rows = 2 if have_integral else 1
+	fig, axes = plt.subplots(n_rows, 1, figsize=(11, 4.5 * n_rows), sharex=True, squeeze=False)
+	axes = axes[:, 0]
+	fig.suptitle("Vertical loop: divergence tracking")
 
+	ax = axes[0]
 	if "flow_divergence_1_s" in df.columns:
-		axes[0].plot(t, numeric_column(df, "flow_divergence_1_s"), label="filtered divergence")
+		ax.plot(t, numeric_column(df, "flow_divergence_1_s"), label=label_for("flow_divergence_1_s"))
 	if "flow_raw_divergence_1_s" in df.columns:
-		axes[0].plot(t, numeric_column(df, "flow_raw_divergence_1_s"), label="raw divergence", alpha=0.75)
+		ax.plot(t, numeric_column(df, "flow_raw_divergence_1_s"), label=label_for("flow_raw_divergence_1_s"), alpha=0.75)
 	# Prefer the actual per-tick commanded setpoint (probe D*=0 -> descent D*,
-	# possibly ramping -- see mission_divergence_setpoint_1_s), falling back to
-	# the static CLI value for old logs.
+	# possibly ramping), falling back to the static CLI value for old logs.
 	if "mission_divergence_setpoint_1_s" in df.columns and np.any(
 		np.isfinite(numeric_column(df, "mission_divergence_setpoint_1_s"))
 	):
-		axes[0].plot(t, numeric_column(df, "mission_divergence_setpoint_1_s"),
-		             linestyle=":", linewidth=1.6, label="commanded D* (logged)")
+		ax.plot(t, numeric_column(df, "mission_divergence_setpoint_1_s"),
+		        linestyle=":", linewidth=1.8, color="k", label=label_for("mission_divergence_setpoint_1_s"))
 	elif divergence_setpoint is not None:
-		axes[0].axhline(divergence_setpoint, linestyle=":", linewidth=1.4, label=f"setpoint {divergence_setpoint:g}")
-	shade_mission_phases(axes[0], df, t)
-	axes[0].axhline(0.0, linestyle="--", linewidth=1)
-	axes[0].set_ylabel("divergence [1/s]")
-	axes[0].grid(True)
-	axes[0].legend(loc="best")
+		ax.axhline(divergence_setpoint, linestyle=":", linewidth=1.4, label=f"setpoint {divergence_setpoint:g}")
+	shade_mission_phases(ax, df, t)
+	ax.axhline(0.0, linestyle="--", linewidth=1, color="0.4")
+	ax.set_ylabel("divergence [1/s]")
+	ax.grid(True)
+	ax.legend(loc="best", fontsize=8)
 
-	left_handles = []
-	left_labels = []
-	if "relative_vz_m_s" in df.columns:
-		vz = numeric_column(df, "relative_vz_m_s")
-		touch_idx = touch["idx"] if touch is not None else None
-		vz_smooth = _smooth_until_index(t, vz, touch_idx, window_sec=0.6)
-		line_raw, = axes[1].plot(t, vz, label="relative_vz raw", alpha=0.35)
-		line_smooth, = axes[1].plot(t, vz_smooth, label="relative_vz smoothed until touchdown", linewidth=1.9)
-		left_handles.extend([line_raw, line_smooth])
-		left_labels.extend([line_raw.get_label(), line_smooth.get_label()])
-		if touch is not None and np.isfinite(touch.get("relative_vz_smoothed", np.nan)):
-			marker = axes[1].scatter(
-				[touch["t"]], [touch["relative_vz_smoothed"]],
-				marker="o", s=42, zorder=5, label="touchdown vz"
-			)
-			axes[1].axvline(touch["t"], linestyle="--", linewidth=1.1, alpha=0.75)
-			axes[1].annotate(
-				f"touchdown\n{touch['relative_vz_smoothed']:+.2f} m/s",
-				xy=(touch["t"], touch["relative_vz_smoothed"]),
-				xytext=(8, 12), textcoords="offset points", fontsize=8,
-			)
-			left_handles.append(marker)
-			left_labels.append(marker.get_label())
-	elif "vehicle_vz_m_s" in df.columns:
-		line, = axes[1].plot(t, numeric_column(df, "vehicle_vz_m_s"), label="vehicle_vz")
-		left_handles.append(line)
-		left_labels.append(line.get_label())
-
-	right_handles = []
-	right_labels = []
-	if "relative_z_m" in df.columns:
-		ax_alt = axes[1].twinx()
-		line, = ax_alt.plot(t, numeric_column(df, "relative_z_m"), label="relative_z", alpha=0.45)
-		right_handles.append(line)
-		right_labels.append(line.get_label())
-		ax_alt.set_ylabel("relative z [m]")
-
-	shade_mission_phases(axes[1], df, t)
-	axes[1].axhline(0.0, linestyle="--", linewidth=1)
-	axes[1].set_ylabel("velocity [m/s]")
-	axes[1].grid(True)
-	if left_handles or right_handles:
-		axes[1].legend(left_handles + right_handles, left_labels + right_labels, loc="best")
-
-	if "command_thrust" in df.columns:
-		axes[2].plot(t, numeric_column(df, "command_thrust"), label="thrust command")
-		axes[2].axhline(0.73, linestyle="--", linewidth=1, label="hover ref 0.73")
-	shade_mission_phases(axes[2], df, t)
-	axes[2].set_ylabel("thrust [-]")
-	axes[2].grid(True)
-	axes[2].legend(loc="best")
+	# Achieved-vs-commanded, stated numerically, over the FLYING descend rows only
+	# (post-touchdown LANDED rows would otherwise drag the mean to zero).
+	if {"mission_substate", "mission_divergence_setpoint_1_s", "flow_divergence_1_s"}.issubset(df.columns):
+		sub = df["mission_substate"].astype(str).fillna("").to_numpy()
+		d = (sub == "descend") & _flying_mask(df)
+		if np.any(d):
+			meas = numeric_column(df, "flow_divergence_1_s")[d]
+			cmd = numeric_column(df, "mission_divergence_setpoint_1_s")[d]
+			meas_m, cmd_m = np.nanmedian(meas), np.nanmedian(cmd)
+			if np.isfinite(meas_m) and np.isfinite(cmd_m) and abs(cmd_m) > 1e-6:
+				ax.set_title(
+					f"DESCEND: measured D = {meas_m:+.3f} /s  vs  commanded D* = {cmd_m:+.3f} /s "
+					f"({100.0 * meas_m / cmd_m:.0f}%)",
+					fontsize=9,
+				)
 
 	if have_integral:
+		ax = axes[1]
 		integral = numeric_column(df, "command_thrust_integral")
-		axes[3].plot(t, integral, color="tab:purple", label="divergence integral (raw)")
-		shade_mission_phases(axes[3], df, t)
-		axes[3].axhline(0.0, linestyle="--", linewidth=1, color="0.4")
+		ax.plot(t, integral, color="tab:purple", label=label_for("command_thrust_integral"))
+		shade_mission_phases(ax, df, t)
+		ax.axhline(0.0, linestyle="--", linewidth=1, color="0.4")
 		finite = integral[np.isfinite(integral)]
 		if len(finite):
 			# Flag likely clamp saturation: sustained runs pinned at the series'
@@ -1004,11 +1136,87 @@ def plot_vertical_control(df: pd.DataFrame, t: np.ndarray, output_dir: str, dive
 			note = ""
 			if frac_pinned > 0.05 and (hi - lo) > 1e-6:
 				note = f"  ({frac_pinned*100:.0f}% of samples pinned near an extreme -- possible clamp saturation)"
-			axes[3].set_title(f"range=[{lo:+.3f}, {hi:+.3f}]{note}", fontsize=9)
-		axes[3].set_ylabel("thrust_integral_gain_const *\nintegral(divergence error)")
-	axes[-1].set_xlabel("time [s]")
+			ax.set_title(f"range=[{lo:+.3f}, {hi:+.3f}]{note}", fontsize=9)
+		ax.set_ylabel("thrust_integral_gain_const *\nintegral(divergence error)")
+		ax.grid(True)
+		ax.legend(loc="best", fontsize=8)
 
-	save_current_figure(output_dir, "vertical_control.png")
+	axes[-1].set_xlabel("time [s]")
+	save_current_figure(output_dir, "vertical_divergence.png")
+
+
+def plot_vertical_descent(df: pd.DataFrame, t: np.ndarray, output_dir: str):
+	"""The vertical loop's PHYSICAL OUTCOME: closing rate, height, touchdown, and
+	the thrust command that produced them.
+
+	The other half of the old vertical_control figure (see plot_vertical_divergence).
+	"""
+	available = any(c in df.columns for c in ["relative_vz_m_s", "vehicle_vz_m_s", "relative_z_m", "command_thrust"])
+	if not available:
+		print("Skipping vertical descent plot. Missing velocity/height/thrust columns.")
+		return
+
+	fig, axes = plt.subplots(2, 1, figsize=(11, 9), sharex=True)
+	fig.suptitle("Vertical loop: descent profile and thrust")
+	touch = _touchdown_velocity(df, t)
+
+	# --- closing rate + height, with touchdown marked ---
+	ax = axes[0]
+	left_handles, left_labels = [], []
+	if "relative_vz_m_s" in df.columns:
+		vz = numeric_column(df, "relative_vz_m_s")
+		touch_idx = touch["idx"] if touch is not None else None
+		vz_smooth = _smooth_until_index(t, vz, touch_idx, window_sec=0.6)
+		line_raw, = ax.plot(t, vz, label="closing rate (raw)", alpha=0.35)
+		line_smooth, = ax.plot(t, vz_smooth, label="closing rate (smoothed to touchdown)", linewidth=1.9)
+		left_handles.extend([line_raw, line_smooth])
+		left_labels.extend([line_raw.get_label(), line_smooth.get_label()])
+		if touch is not None and np.isfinite(touch.get("relative_vz_smoothed", np.nan)):
+			marker = ax.scatter(
+				[touch["t"]], [touch["relative_vz_smoothed"]],
+				marker="o", s=48, zorder=5, color="tab:red", label="touchdown",
+			)
+			ax.axvline(touch["t"], linestyle="--", linewidth=1.1, alpha=0.75, color="tab:red")
+			ax.annotate(
+				f"touchdown\n{touch['relative_vz_smoothed']:+.3f} m/s",
+				xy=(touch["t"], touch["relative_vz_smoothed"]),
+				xytext=(8, 12), textcoords="offset points", fontsize=8,
+			)
+			left_handles.append(marker)
+			left_labels.append(marker.get_label())
+	elif "vehicle_vz_m_s" in df.columns:
+		line, = ax.plot(t, numeric_column(df, "vehicle_vz_m_s"), label=label_for("vehicle_vz_m_s"))
+		left_handles.append(line)
+		left_labels.append(line.get_label())
+
+	right_handles, right_labels = [], []
+	if "relative_z_m" in df.columns:
+		ax_alt = ax.twinx()
+		line, = ax_alt.plot(t, numeric_column(df, "relative_z_m"), label=label_for("relative_z_m"),
+		                    alpha=0.55, color="tab:green")
+		right_handles.append(line)
+		right_labels.append(line.get_label())
+		ax_alt.set_ylabel("height above platform [m]")
+
+	shade_mission_phases(ax, df, t)
+	ax.axhline(0.0, linestyle="--", linewidth=1, color="0.4")
+	ax.set_ylabel("closing rate [m/s]")
+	ax.grid(True)
+	if left_handles or right_handles:
+		ax.legend(left_handles + right_handles, left_labels + right_labels, loc="best", fontsize=8)
+
+	# --- thrust command ---
+	ax = axes[1]
+	if "command_thrust" in df.columns:
+		ax.plot(t, numeric_column(df, "command_thrust"), label=label_for("command_thrust"))
+		ax.axhline(0.73, linestyle="--", linewidth=1, color="0.4", label="hover ref 0.73")
+	shade_mission_phases(ax, df, t)
+	ax.set_ylabel("thrust [-]")
+	ax.set_xlabel("time [s]")
+	ax.grid(True)
+	ax.legend(loc="best", fontsize=8)
+
+	save_current_figure(output_dir, "vertical_descent.png")
 
 
 def plot_platform_motion_frequency(
@@ -1090,6 +1298,9 @@ def plot_drone_platform_position_xyz(df: pd.DataFrame, t: np.ndarray, output_dir
 	fig.suptitle("Drone and platform position by axis")
 
 	for ax, (axis_name, vehicle_col, platform_col, vehicle_transform, ylabel) in zip(axes, axis_specs):
+		# Shade first so the traces draw on top of it (shade_mission_phases uses
+		# zorder=0, but fill order still matters for the legend).
+		shade_mission_phases(ax, df, t, label_once=(ax is axes[0]))
 		plotted = False
 
 		if vehicle_col in df.columns:
@@ -1474,12 +1685,28 @@ def _mission_phase_spans(df: pd.DataFrame, t: np.ndarray):
 	return spans
 
 
+# Mission substates, in the order they occur. "probe"/"probe_hold" are kept for
+# older logs written before the approach/final split.
 _PHASE_COLORS = {
 	"center": ("tab:purple", 0.06),
-	"probe": ("tab:blue", 0.06),
-	"probe_hold": ("tab:cyan", 0.08),
+	"approach_probe": ("tab:blue", 0.06),
+	"final_probe": ("tab:cyan", 0.09),
 	"descend": ("tab:green", 0.06),
+	"landed": ("tab:gray", 0.12),
 	"infeasible": ("tab:red", 0.10),
+	"probe": ("tab:blue", 0.06),        # legacy
+	"probe_hold": ("tab:cyan", 0.08),   # legacy
+}
+
+_PHASE_LABELS = {
+	"center": "CENTER (acquire + centre)",
+	"approach_probe": "APPROACH_PROBE (descend at D*>0 while probing)",
+	"final_probe": "FINAL_PROBE (near-field hold at D*=0)",
+	"descend": "DESCEND (committed landing)",
+	"landed": "LANDED (touchdown; zero thrust)",
+	"infeasible": "INFEASIBLE (gate refused; holding)",
+	"probe": "PROBE (legacy)",
+	"probe_hold": "PROBE_HOLD (legacy)",
 }
 
 
@@ -1490,7 +1717,7 @@ def shade_mission_phases(ax, df: pd.DataFrame, t: np.ndarray, label_once: bool =
 		color, alpha = _PHASE_COLORS.get(sub, ("tab:gray", 0.06))
 		lbl = None
 		if label_once and sub not in seen:
-			lbl = f"phase: {sub}"
+			lbl = _PHASE_LABELS.get(sub, sub)
 			seen.add(sub)
 		ax.axvspan(t0, t1, color=color, alpha=alpha, label=lbl, zorder=0)
 
@@ -1515,10 +1742,16 @@ def plot_gain_schedule(df: pd.DataFrame, t: np.ndarray, output_dir: str):
 	ax = axes[0]
 	shade_mission_phases(ax, df, t)
 	if "mission_thrust_gain_k" in df.columns:
-		ax.plot(t, numeric_column(df, "mission_thrust_gain_k"), label="k(t) thrust gain", linewidth=1.8)
+		ax.plot(t, numeric_column(df, "mission_thrust_gain_k"), label=label_for("mission_thrust_gain_k"), linewidth=1.8)
+	# The gain WINDOW, top to bottom: k_explore (start) / k_ceiling at leg height
+	# (the de Croon limit k(t) now aims just under) / k_floor (the asymptote it
+	# actually settles on) / k_min (the Herisse floor, now only a hard backstop).
 	for col, style, lbl in (
-		("mission_k_explore", (0, (4, 3)), "k_explore (hand-tuned initial gain)"),
-		("mission_k_min", (0, (1, 2)), "k_min (Herisse floor)"),
+		("mission_k_explore", (0, (4, 3)), label_for("mission_k_explore")),
+		("mission_k_probe", (0, (8, 2, 2, 2)), label_for("mission_k_probe")),
+		("mission_k_ceiling_leg", (0, (6, 2)), label_for("mission_k_ceiling_leg")),
+		("mission_k_floor", (0, (3, 1, 1, 1)), label_for("mission_k_floor")),
+		("mission_k_min", (0, (1, 2)), label_for("mission_k_min")),
 	):
 		if col in df.columns:
 			y = numeric_column(df, col)
@@ -1537,9 +1770,9 @@ def plot_gain_schedule(df: pd.DataFrame, t: np.ndarray, output_dir: str):
 	ax = axes[1]
 	shade_mission_phases(ax, df, t)
 	if "mission_lateral_p_scale" in df.columns:
-		ax.plot(t, numeric_column(df, "mission_lateral_p_scale"), label="lateral P scale", linewidth=1.8)
+		ax.plot(t, numeric_column(df, "mission_lateral_p_scale"), label=label_for("mission_lateral_p_scale"), linewidth=1.8)
 	if "mission_lateral_d_scale" in df.columns:
-		ax.plot(t, numeric_column(df, "mission_lateral_d_scale"), label="lateral D scale", linewidth=1.4, linestyle="--")
+		ax.plot(t, numeric_column(df, "mission_lateral_d_scale"), label=label_for("mission_lateral_d_scale"), linewidth=1.4, linestyle="--")
 	# overlay normalized thrust gain as a cross-check that DESCEND's lateral
 	# scales ride the same ramp as thrust (should overlap P/D there)
 	if {"mission_thrust_gain_k", "mission_k_explore"}.issubset(df.columns):
@@ -1554,6 +1787,149 @@ def plot_gain_schedule(df: pd.DataFrame, t: np.ndarray, output_dir: str):
 	ax.legend(loc="best", fontsize=8)
 
 	save_current_figure(output_dir, "gain_schedule.png")
+
+
+def plot_probe_acceleration(df: pd.DataFrame, t: np.ndarray, output_dir: str):
+	"""What the platform probe actually measured, step by step.
+
+	The feasibility gate rests on ONE number -- peak_accel -- via k_min =
+	peak_accel / D*. That number is a leaky-max envelope over a rolling percentile
+	of |commanded accel - EMA bias|, so it can sit high for reasons that have
+	nothing to do with the platform. This figure shows the whole chain it is built
+	from, so the envelope can be judged instead of trusted.
+
+	Top: the raw commanded accel and the EMA bias being subtracted from it.
+	     If the BIAS visibly oscillates rather than sitting flat, the highpass tau
+	     is short enough to be tracking -- and therefore cancelling -- the very
+	     platform motion being measured, and peak_accel is biased LOW.
+	     During APPROACH_PROBE the bias legitimately carries the slow contribution
+	     of the D*>0 descent itself; that is what it is there to remove.
+
+	Bottom: the residual (the actual measurement), the rolling-window percentile
+	     the envelope chases, and the envelope itself.
+	     The envelope should sit ON TOP of the residual's excursions. If it
+	     visibly COASTS above them -- decaying smoothly, never re-raised by a
+	     fresh sample -- the probe is running on a stale measurement: either the
+	     window is too short to catch the platform's slow swing, or
+	     peak_decay_tau is too long.
+
+	The far->near handoff is marked: that is where the time constants are retuned
+	and the near-field samples (better synchronized, hence more trustworthy) are
+	expected to REVISE the carried-over far-field estimate. peak_accel_at_handoff
+	is drawn as a reference line so the size and direction of that revision is one
+	subtraction. If the two never separate, either the near hold is too short to
+	see an excursion or NEAR_PROBE_DECAY_TAU_SEC is too long.
+	"""
+	needed = ("mission_probe_residual_accel_m_s2", "mission_peak_accel_m_s2")
+	if not any(c in df.columns for c in needed):
+		print("Skipping probe acceleration plot. No mission_probe_* columns (old log?).")
+		return
+
+	fig, axes = plt.subplots(2, 1, figsize=(11, 7.5), sharex=True)
+	fig.suptitle("Platform probe: what peak_accel is built from")
+
+	# --- raw commanded accel vs the bias being removed ---
+	ax = axes[0]
+	shade_mission_phases(ax, df, t)
+	for col, kwargs in (
+		("mission_probe_accel_m_s2", dict(linewidth=1.0, alpha=0.65)),
+		("mission_probe_mean_accel_m_s2", dict(linewidth=1.8, linestyle="--")),
+	):
+		if col in df.columns:
+			ax.plot(t, numeric_column(df, col), label=label_for(col), **kwargs)
+	ax.axhline(0.0, color="k", linewidth=0.6, alpha=0.4)
+	ax.set_ylabel("acceleration [m/s$^2$]")
+	ax.grid(True)
+	ax.legend(loc="best", fontsize=8)
+
+	# --- the measurement, the percentile, and the envelope the gate consumes ---
+	ax = axes[1]
+	shade_mission_phases(ax, df, t)
+	if "mission_probe_residual_accel_m_s2" in df.columns:
+		ax.plot(
+			t, numeric_column(df, "mission_probe_residual_accel_m_s2"),
+			label=label_for("mission_probe_residual_accel_m_s2"),
+			linewidth=0.9, alpha=0.55,
+		)
+	if "mission_probe_percentile_accel_m_s2" in df.columns:
+		ax.plot(
+			t, numeric_column(df, "mission_probe_percentile_accel_m_s2"),
+			label=label_for("mission_probe_percentile_accel_m_s2"),
+			linewidth=1.2, linestyle=":",
+		)
+	if "mission_peak_accel_m_s2" in df.columns:
+		ax.plot(
+			t, numeric_column(df, "mission_peak_accel_m_s2"),
+			label=label_for("mission_peak_accel_m_s2"),
+			linewidth=2.0, color="tab:red",
+		)
+
+	# Mark the far->near retune and the estimate it carried across.
+	handoff_t = _probe_handoff_time(df, t)
+	if handoff_t is not None:
+		for a in axes:
+			a.axvline(handoff_t, color="k", linestyle="-.", linewidth=1.2, alpha=0.7)
+		axes[1].annotate(
+			"far \u2192 near handoff\n(probe retuned, estimate kept)",
+			xy=(handoff_t, ax.get_ylim()[1]),
+			xytext=(6, -12), textcoords="offset points",
+			fontsize=8, va="top",
+		)
+
+	handoff_peak = _last_finite(df, "mission_probe_peak_accel_at_handoff_m_s2")
+	if handoff_peak is not None and np.isfinite(handoff_peak) and handoff_peak > 0.0:
+		ax.axhline(
+			handoff_peak, color="tab:orange", linestyle=(0, (5, 2)), linewidth=1.3,
+			label=label_for("mission_probe_peak_accel_at_handoff_m_s2"),
+		)
+
+	# Where the envelope is COASTING: it is above the percentile it chases, i.e.
+	# no fresh sample is holding it up and it is purely decaying off an old one.
+	# Shaded because it is the single most important failure mode to catch -- a
+	# probe that spends most of its life coasting is reporting a measurement it
+	# took once, not one it keeps making.
+	if {"mission_peak_accel_m_s2", "mission_probe_percentile_accel_m_s2"}.issubset(df.columns):
+		peak = numeric_column(df, "mission_peak_accel_m_s2")
+		pct = numeric_column(df, "mission_probe_percentile_accel_m_s2")
+		active = bool_column(df, "mission_probe_active")
+		coasting = active & np.isfinite(peak) & np.isfinite(pct) & (peak > pct * 1.02)
+		if np.any(coasting):
+			ax.fill_between(
+				t, 0, 1, where=coasting, transform=ax.get_xaxis_transform(),
+				color="tab:red", alpha=0.07, zorder=0,
+				label=f"envelope coasting ({100.0 * np.mean(coasting[active]):.0f}% of probe)",
+			)
+
+	ax.set_ylabel("acceleration [m/s$^2$]")
+	ax.set_xlabel("time [s]")
+	ax.grid(True)
+	ax.legend(loc="best", fontsize=8)
+
+	# The gate's arithmetic, spelled out, so the figure is self-contained.
+	final_peak = _last_finite(df, "mission_peak_accel_m_s2")
+	k_min = _last_finite(df, "mission_k_min")
+	bits = []
+	if final_peak is not None and np.isfinite(final_peak):
+		bits.append(f"peak_accel = {final_peak:.3f} m/s$^2$")
+	if handoff_peak is not None and np.isfinite(handoff_peak) and handoff_peak > 0.0 \
+			and final_peak is not None and np.isfinite(final_peak):
+		delta = 100.0 * (final_peak - handoff_peak) / handoff_peak
+		bits.append(f"near-field revision {delta:+.0f}%")
+	if k_min is not None and np.isfinite(k_min):
+		bits.append(f"k_min = {k_min:.2f}")
+	if bits:
+		ax.set_title("  |  ".join(bits), fontsize=9)
+
+	save_current_figure(output_dir, "probe_acceleration.png")
+
+
+def _probe_handoff_time(df: pd.DataFrame, t: np.ndarray) -> Optional[float]:
+	"""Time of the far->near probe retune (first sample of the FINAL_PROBE hold)."""
+	if "mission_probe_phase" not in df.columns:
+		return None
+	phase = df["mission_probe_phase"].astype(str).fillna("").to_numpy()
+	idx = _first_true_index(phase == "near")
+	return float(t[idx]) if idx is not None else None
 
 
 def plot_height_prediction(df: pd.DataFrame, t: np.ndarray, output_dir: str):
@@ -1762,20 +2138,36 @@ def plot_flow_derotation(df: pd.DataFrame, t: np.ndarray, output_dir: str | Path
 
 
 def make_default_plots(df: pd.DataFrame, t: np.ndarray, output_dir: str | Path, args):
+	"""The core loop: did we SEE the target, did the PROBE measure the platform,
+	did the GATE pick a sane gain window, and did the DESCENT do what was asked.
+
+	Everything that answers a narrower or more diagnostic question -- lateral
+	control, de-rotation, height prediction, cross-checks against ground truth,
+	platform/vehicle kinematics -- now lives behind --full. Those plots are not
+	less useful, they are just not what you look at on every run, and having a
+	dozen figures open by default made the four that matter harder to find.
+	"""
 	plot_target_detection_summary(df, t, output_dir)
 	plot_detection_boxes_fov(df, t, args.image_width, args.image_height, output_dir, args.max_boxes)
-	plot_lateral_control(df, t, output_dir)
-	plot_vertical_control(df, t, output_dir, divergence_setpoint=None)
-	plot_flow_derotation(df, t, output_dir)
+	plot_probe_acceleration(df, t, output_dir)
 	plot_gain_schedule(df, t, output_dir)
+	# vertical_control.png was one 4-panel stack mixing the loop's error signal with
+	# its physical outcome. Split into the two questions it was really answering.
+	plot_vertical_divergence(df, t, output_dir, divergence_setpoint=None)
+	plot_vertical_descent(df, t, output_dir)
+	plot_closing_rate_spectrum(df, t, output_dir, expected_frequency_hz=args.platform_frequency_hz)
+	plot_drone_platform_position_xyz(df, t, output_dir)
+
+
+def make_full_plots(df: pd.DataFrame, t: np.ndarray, output_dir: str | Path, args):
+	# --- Moved out of the default set (see make_default_plots' docstring). ---
+	plot_lateral_control(df, t, output_dir)
+	plot_flow_derotation(df, t, output_dir)
 	plot_divergence_consistency(df, t, output_dir)
 	plot_height_prediction(df, t, output_dir)
 	plot_platform_motion_frequency(df, t, output_dir, expected_frequency_hz=args.platform_frequency_hz)
 	plot_drone_platform_position_xyz(df, t, output_dir)
-	plot_closing_rate_spectrum(df, t, output_dir, expected_frequency_hz=args.platform_frequency_hz)
 
-
-def make_full_plots(df: pd.DataFrame, t: np.ndarray, output_dir: str | Path, args):
 	plot_multi_column(
 		df,
 		t,

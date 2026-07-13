@@ -687,7 +687,7 @@ if __name__ == "__main__":
 	cfg = FrequencyConfig(
 		# Choose the frozen height you want to inspect.
 		# Repeat the analysis for several heights to see how the descent changes.
-		height_m=2.0,
+		height_m=0.5,
 
 		# Use 0.0 for hover/probe interpretation.
 		# Use your descent D* value, e.g. 0.30, for descent frozen-point analysis.

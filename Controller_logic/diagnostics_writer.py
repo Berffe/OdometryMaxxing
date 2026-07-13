@@ -197,6 +197,54 @@ class DiagnosticsWriter:
 				"mission_feasible": self._bool_int(mission.get("feasible", False)),
 			})
 
+			# The gain WINDOW the descent rides. k(t) now decays toward k_floor =
+			# max(k_min, ceiling_margin * k_ceiling_leg) -- the de Croon ceiling at
+			# leg height -- NOT toward k_min. k_over_ceiling_leg is the headline
+			# number for that change: it used to sit near 0.065 for the whole
+			# descent and should now approach ceiling_margin.
+			row.update({
+				"mission_k_ceiling_leg": self._num(mission.get("k_ceiling_leg")),
+				"mission_k_target": self._num(mission.get("k_target")),
+				"mission_k_floor": self._num(mission.get("k_floor")),
+				# k_probe: the gain held flat through FINAL_PROBE and the value the
+				# descent starts from. k_explore is FAR-FIELD only -- above the de
+				# Croon ceiling in the near field, where probing at it would feed
+				# self-induced oscillation into peak_accel.
+				"mission_k_probe": self._num(mission.get("k_probe")),
+				"mission_k_descend_start": self._num(mission.get("k_descend_start")),
+				"mission_near_field_height_m": self._num(mission.get("near_field_height_m")),
+				"mission_ceiling_margin": self._num(mission.get("ceiling_margin")),
+				"mission_k_over_ceiling_leg": self._num(mission.get("k_over_ceiling_leg")),
+			})
+
+			# PLATFORM PROBE, per step. mission_peak_accel_m_s2 (above) is the
+			# leaky-max envelope the feasibility gate consumes (k_min = peak/D*);
+			# the columns below are the quantities it is BUILT FROM, logged every
+			# step so the envelope can be judged rather than trusted:
+			#   *_accel_m_s2          : commanded vertical accel from the thrust cmd
+			#   *_mean_accel_m_s2     : the EMA bias removed (hover trim + the slow
+			#                           contribution of the D*>0 approach descent)
+			#   *_residual_accel_m_s2 : |accel - mean|, the de-biased signal
+			#   *_percentile_accel_m_s2: the rolling-window percentile the peak chases
+			# The envelope itself keeps its established name, mission_peak_accel_m_s2
+			# (unchanged, so existing analyses keep working).
+			# probe_phase is far/near (which time constants are live); the retune at
+			# the far->near handoff is where the estimate is expected to be revised,
+			# and mission_probe_peak_accel_at_handoff_m_s2 freezes its pre-handoff
+			# value so the revision is visible in one subtraction.
+			row.update({
+				"mission_probe_active": self._bool_int(mission.get("probe_active", False)),
+				"mission_probe_phase": mission.get("probe_phase", "") or "",
+				"mission_probe_accel_m_s2": self._num(mission.get("probe_accel")),
+				"mission_probe_mean_accel_m_s2": self._num(mission.get("probe_mean_accel")),
+				"mission_probe_residual_accel_m_s2": self._num(mission.get("probe_residual_accel")),
+				"mission_probe_percentile_accel_m_s2": self._num(mission.get("probe_percentile_accel")),
+				"mission_probe_peak_accel_at_handoff_m_s2": self._num(mission.get("probe_peak_accel_at_handoff")),
+				"mission_probe_peak_decay_tau_sec": self._num(mission.get("probe_peak_decay_tau_sec")),
+				"mission_probe_elapsed_sec": self._num(mission.get("probe_elapsed_sec")),
+				"mission_probe_total_elapsed_sec": self._num(mission.get("probe_total_elapsed_sec")),
+			})
+
 		# Timing / latency telemetry. These columns separate the three relevant
 		# questions: (1) how old was the vision sample when the command was
 		# computed, (2) how regular is the deliberately fixed PX4 publication
@@ -221,6 +269,8 @@ class DiagnosticsWriter:
 				# against v1.0's blocking on_camera duration (~11-18ms).
 				"timing_worker_target_acquisition_ms": self._num(timing.get("worker_target_acquisition_ms")),
 				"timing_worker_optical_flow_ms": self._num(timing.get("worker_optical_flow_ms")),
+				"timing_ipc_in_ms": self._num(timing.get("ipc_in_ms")),
+				"timing_ipc_out_ms": self._num(timing.get("ipc_out_ms")),
 				"timing_frame_to_available_wall_ms": self._num(timing.get("frame_to_available_wall_ms")),
 				"timing_frame_to_command_wall_ms": self._num(timing.get("frame_to_command_wall_ms")),
 				"timing_vision_result_period_wall_ms": self._num(timing.get("vision_result_period_wall_ms")),
@@ -337,6 +387,24 @@ class DiagnosticsWriter:
 			"mission_h_pred_m",
 			"mission_peak_accel_m_s2",
 			"mission_feasible",
+			"mission_k_ceiling_leg",
+			"mission_k_target",
+			"mission_k_floor",
+			"mission_k_probe",
+			"mission_k_descend_start",
+			"mission_near_field_height_m",
+			"mission_ceiling_margin",
+			"mission_k_over_ceiling_leg",
+			"mission_probe_active",
+			"mission_probe_phase",
+			"mission_probe_accel_m_s2",
+			"mission_probe_mean_accel_m_s2",
+			"mission_probe_residual_accel_m_s2",
+			"mission_probe_percentile_accel_m_s2",
+			"mission_probe_peak_accel_at_handoff_m_s2",
+			"mission_probe_peak_decay_tau_sec",
+			"mission_probe_elapsed_sec",
+			"mission_probe_total_elapsed_sec",
 			"timing_camera_cb_start_wall_sec",
 			"timing_camera_cb_end_wall_sec",
 			"timing_camera_cb_duration_ms",
@@ -348,6 +416,8 @@ class DiagnosticsWriter:
 			"timing_stage_optical_flow_ms",
 			"timing_worker_target_acquisition_ms",
 			"timing_worker_optical_flow_ms",
+			"timing_ipc_in_ms",
+			"timing_ipc_out_ms",
 			"timing_frame_to_available_wall_ms",
 			"timing_frame_to_command_wall_ms",
 			"timing_vision_result_period_wall_ms",

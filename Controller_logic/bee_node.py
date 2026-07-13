@@ -3,6 +3,7 @@ import math
 import multiprocessing as mp
 import os
 import queue
+import threading
 import time
 
 import cv2
@@ -41,7 +42,11 @@ from .state import VehicleState, PlatformState, AttitudeSetpoint, TargetEstimate
 # moves into the worker).
 from .derotation import CameraGeometry, Derotator, AngularRateBuffer
 from .control_law import ControlLaw
-from .mission_routine import MissionRoutine, INFEASIBLE as MISSION_INFEASIBLE
+from .mission_routine import (
+	MissionRoutine,
+	INFEASIBLE as MISSION_INFEASIBLE,
+	LANDED as MISSION_LANDED,
+)
 from .diagnostics_writer import DiagnosticsWriter
 from .px4_interface import PX4Interface
 from .mavsdk_worker import MavsdkWorker
@@ -54,7 +59,7 @@ from .vision_worker import run_vision_worker
 # - PX4 setpoint timer: fixed, predictable offboard publication cadence
 CONTROL_PERIOD_SEC = 0.01
 MISSION_PERIOD_SEC = 0.05
-PX4_SETPOINT_PERIOD_SEC = 0.05
+PX4_SETPOINT_PERIOD_SEC = 0.03
 COMPUTE_CONTROL_ONLY_ON_NEW_VISION = True
 PX4_OFFBOARD_SWITCH_SETTLE_SEC = 0.5
 
@@ -112,6 +117,27 @@ DESCENT_DIVERGENCE_SETPOINT = 0.30
 # the old instant-step behavior. See mission_routine.py's constructor
 # docstring for why this does not also affect k(t)'s decay rate.
 D_STAR_RAMP_IN_SEC = 5.0
+# New bio-inspired mission routine: after CENTER, approach gently while probing
+# until TargetAcquisition reports a near-field visual cue, then run a short
+# D*=0 final probe before committing to the final descent.
+#
+# The near-field cue is now area_fraction ALONE. It used to be
+# "fov_saturated OR area_fraction >= threshold", and fov_saturated dominated --
+# badly: in the last run it went True at area_fraction = 0.49 while still at
+# h = 2.1 m, and was set on 55% of all rows. A bounding box touching all four
+# borders at half the frame area is not a target filling the view; it is a
+# frame-spanning contour, which the Canny edge channel produces readily.
+#
+# That mistrigger is not a cosmetic mistiming: the near-field probe IS the
+# paradigm (probe close in, where the loop synchronizes with the platform and the
+# acceleration estimate is trustworthy). Firing it at 2.1 m means it never
+# happened. area_fraction is the direct, monotone measurement, so it is now the
+# whole trigger; fov_saturated stays logged, and still means what state.py says
+# (area_fraction has stopped tracking range), it is just no longer trusted to say
+# WHEN we are close.
+APPROACH_DIVERGENCE_SETPOINT = 0.12
+FINAL_PROBE_ENTRY_RAMP_SEC = 1.5
+FOV_NEAR_AREA_FRACTION = 0.85
 # CENTER's vertical (thrust) loop runs at the full exploration gain
 # (k_explore) throughout -- the earlier reduced-CENTER-thrust-gain mechanism
 # (which decoupled the vertical loop from CENTER's heavy lateral banking) has
@@ -173,13 +199,132 @@ CENTER_LATERAL_D_SCALE = 1
 # diagnostic on the next log. 1.0 disables this (PROBE unchanged).
 PROBE_LATERAL_P_SCALE = 1
 PROBE_LATERAL_D_SCALE = 1
-# How long to hold the D*=0 probe before computing peak_accel/k_min/h_crit.
-# No periodicity assumption is needed (unlike the dropped mode-estimator
-# design) -- this only needs to be long enough to see the platform swing
-# through a representative excursion. 15s is a generous starting guess with no
-# real-platform validation yet; tighten or extend once logged against an
-# actual oscillating deck.
-PROBE_MIN_DURATION_SEC = 10.0
+# --- ONE continuous probe, retuned at the far->near handoff -------------------
+# The mission runs a SINGLE PlatformProbe from APPROACH_PROBE entry through the
+# end of FINAL_PROBE. Its time constants switch at the handoff
+# (PlatformProbe.retune()) but its accumulated estimate CARRIES THROUGH: the
+# near-field samples are more trustworthy (the loop synchronizes to the platform
+# far better close in), so they progressively supersede the far-field estimate.
+#
+# EVERY constant below is derived from ONE number: PROBE_DESIGN_PERIOD_SEC. The
+# probe's job is to catch the peak of a periodic disturbance, so its memory has
+# to be measured in PLATFORM PERIODS, not in control ticks. Deriving them keeps
+# that relationship explicit and makes retuning for a different platform a
+# one-line change instead of five independent guesses.
+#
+# CHOOSING PROBE_DESIGN_PERIOD_SEC -- size it for the SLOWEST platform you want
+# to survive, not the one you happen to be flying. The asymmetry is the whole
+# point:
+#   - a window sized for a LONG period still catches a fast oscillation (it just
+#     spans several of its cycles -- a 95th-percentile over many cycles is still
+#     a good peak);
+#   - a window sized for a SHORT period CANNOT see a slow one. It observes a
+#     fraction of a cycle, reports whatever it happened to catch, and the peak it
+#     returns depends on where in the cycle the probe stopped.
+# Under-reporting peak_accel is the UNSAFE direction (low peak -> low k_min ->
+# too-permissive feasibility gate), so err LONG.
+#
+# The measured platform is 0.30 Hz (period 3.33 s). This is set to 6.7 s -- the
+# period of a 0.15 Hz platform, i.e. half that frequency -- so the probe stays
+# honest if the platform is retuned slower without anyone remembering to come
+# back here.
+#
+# (Historical note, so the next person does not repeat it: these constants were
+# once sized against an assumed ~0.055 Hz / ~18 s period, which was simply wrong
+# by ~5x. Nothing in the code checks this number against reality -- analyse_log's
+# platform_motion_frequency plot does. Look at it.)
+PROBE_DESIGN_PERIOD_SEC = 6.7
+
+# FAR field (APPROACH_PROBE): long memory, to resolve the platform's swing.
+FAR_PROBE_WINDOW_SEC = 1.5 * PROBE_DESIGN_PERIOD_SEC      # percentile window
+FAR_PROBE_DECAY_TAU_SEC = 1.5 * PROBE_DESIGN_PERIOD_SEC   # peak leak
+FAR_PROBE_HIGHPASS_TAU_SEC = 4.0 * PROBE_DESIGN_PERIOD_SEC  # de-biasing EMA; must
+    # stay well ABOVE the period or the mean starts tracking -- and therefore
+    # cancelling -- the very oscillation being measured. But not absurdly above:
+    # it also has to track out the slow thrust bias of the D*>0 approach descent,
+    # and a tau far longer than the approach lasts cannot.
+
+# NEAR field (FINAL_PROBE hold, after retune): short window = high fidelity on the
+# well-synchronized near-field measurement.
+#
+# NEAR_PROBE_DECAY_TAU_SEC IS THE HANDOFF KNOB: the half-life of trust in the
+# carried-over far-field estimate. Fresh near-field samples raise the peak
+# immediately; the old value decays at this tau. Long (~ one period) keeps the far
+# value alive as a floor across the hold and lets the near field overwrite it only
+# where it actually measures more -- the conservative choice, since an
+# under-estimated peak is the unsafe direction.
+NEAR_PROBE_WINDOW_SEC = 0.6 * PROBE_DESIGN_PERIOD_SEC
+NEAR_PROBE_DECAY_TAU_SEC = 1.0 * PROBE_DESIGN_PERIOD_SEC
+NEAR_PROBE_HIGHPASS_TAU_SEC = 2.0 * PROBE_DESIGN_PERIOD_SEC
+
+# Total probing time the gate requires, across BOTH phases. The near-field hold
+# alone cannot supply this -- which is exactly what stops a fast FOV/area trigger
+# from gating the whole landing on a fraction of one platform cycle.
+PROBE_MIN_DURATION_SEC = 3.0 * PROBE_DESIGN_PERIOD_SEC
+
+# The near-field hold itself. ~2 periods: long enough to see a full excursion at
+# the design frequency, short enough that the vehicle is not loitering at close
+# range burning battery and drifting.
+FINAL_PROBE_DURATION_SEC = 2.0 * PROBE_DESIGN_PERIOD_SEC
+
+# NOTE these are SIM seconds -- at EXPECTED_SIM_RTF they take proportionally
+# longer in wall time (the startup log prints the estimate; see
+# _log_mission_timer_wall_estimates).
+
+# --- Descent gain target: ride the CEILING at leg height, not the FLOOR -------
+# de Croon's safety-scaled stability ceiling is k_ceiling(h) = 2*s*h/dt, which
+# SHRINKS with height; Herisse's floor is k_min = peak_accel/D*. Feasibility
+# (h_crit <= LEG_CLEARANCE_M) is exactly the statement that a non-empty window
+# [k_min, k_ceiling(leg)] still exists at touchdown.
+#
+# The descent schedule used to decay k from k_explore toward k_min -- the FLOOR
+# of that window. With the constants actually flown that put the entire descent
+# at a roughly CONSTANT ~6.5% of the ceiling (the ratio is height-independent,
+# since k(t) and the ceiling both scale with h). Per the Bode analysis, higher
+# gain buys bandwidth, and bandwidth is what lets the vertical loop synchronize
+# with the platform at touchdown -- so the schedule now decays toward
+#   k_floor = max(k_min, DESCENT_CEILING_MARGIN * k_ceiling(LEG_CLEARANCE_M))
+# instead. k_min survives as a hard floor UNDER that target so a marginally-
+# feasible mission cannot end up below the disturbance-rejection floor.
+#
+# TWO MULTIPLICATIVE MARGINS, do not conflate them:
+#   CEILING_SAFETY_FACTOR (s)      derates the THEORETICAL instability limit.
+#   DESCENT_CEILING_MARGIN         how close to that ALREADY-derated ceiling we
+#                                  ride. 0.8 is NOT "80% of the stability limit";
+#                                  it is 80% of s (=50%) of it.
+# CEILING_SAFETY_FACTOR was previously left to mission_routine's own default and
+# never passed from here -- exactly the dead-default trap the WARNING above
+# describes. It is now explicit.
+CEILING_SAFETY_FACTOR = 0.5
+DESCENT_CEILING_MARGIN = 0.8
+
+# --- The gain schedule's ANCHOR ----------------------------------------------
+# Approximate height at which the near-field trigger (FOV_NEAR_AREA_FRACTION /
+# fov_saturated) actually fires, i.e. the height FINAL_PROBE happens at.
+#
+# WHY THIS EXISTS. INITIAL_THRUST_GAIN (k_explore) is a FAR-FIELD gain. The de
+# Croon ceiling shrinks with height -- k_ceiling(h) = 2*s*h/STABILITY_DT_SEC --
+# so k_explore is only admissible above h = k_explore*dt/(2*s), which at the
+# flown constants is ~0.46 m. FINAL_PROBE fires on FOV saturation, WELL BELOW
+# that. Holding k_explore into the near field therefore probes ABOVE the
+# stability ceiling; and because PlatformProbe measures the THRUST-COMMAND
+# RESIDUAL, any resulting self-induced oscillation is counted as platform
+# acceleration. That does not just risk instability -- it corrupts the single
+# number the feasibility gate rests on.
+#
+# So the gain is walked DOWN during APPROACH_PROBE to
+#   k_probe = min(k_explore, DESCENT_CEILING_MARGIN * k_ceiling(NEAR_FIELD_HEIGHT_M))
+# held FLAT through FINAL_PROBE (a moving gain during a probe moves the
+# closed-loop transfer function and contaminates the residual), and the descent
+# then continues DOWN from k_probe -- it never steps back up to k_explore.
+#
+# CALIBRATE THIS FROM A LOG. Unlike h0, this is not a dead-reckoned quantity: it
+# is where FOV saturation geometrically occurs (target diameter vs camera FOV).
+# analyse_log's mission summary now prints "height at FINAL_PROBE entry" from
+# relative_z_m -- run once, read that number, put it here. Erring LOW is the
+# conservative direction (a lower anchor -> lower k_probe -> further below the
+# ceiling).
+NEAR_FIELD_HEIGHT_M = 0.40
 
 # dt fed into the de Croon feasibility gate -- see mission_routine.py's
 # stability_dt_sec constructor docstring for the base reasoning (why this must
@@ -222,8 +367,8 @@ PROBE_MIN_DURATION_SEC = 10.0
 #    underestimate here silently reopens the exact gap this whole correction
 #    exists to close. Re-measure and update whenever the optical-flow
 #    pipeline's cost changes.
-CAMERA_FRAME_PERIOD_SEC = 1.0 / 30.0
-VISION_PROCESSING_LATENCY_BUDGET_SEC = 0.01  # conservative p95-ish reading of
+CAMERA_FRAME_PERIOD_SEC = 1.0 / 60.0
+VISION_PROCESSING_LATENCY_BUDGET_SEC = 0.02  # conservative p95-ish reading of
                                               # timing_camera_cb_duration_ms;
                                               # re-measure after pipeline changes.
 STABILITY_DT_SEC = (
@@ -371,7 +516,7 @@ VEHICLE_STATUS_TOPICS = (
 # Real pose telemetry is noisy/jittery sample-to-sample; smooth the finite-
 # differenced velocity the same way OpticalFlowEstimator smooths divergence
 # (see optical_flow.py's module docstring for the same underlying argument).
-PLATFORM_VELOCITY_SMOOTHING = 0.5
+PLATFORM_VELOCITY_SMOOTHING = 0.7
 
 # Touchdown bridge. The Gazebo side is published by TouchPlugin in
 # bee_platform.sdf. Bridge it with:
@@ -455,8 +600,21 @@ class BeeLandNode(Node):
 			hover_thrust=self.control_law.hover_thrust,
 			control_period_sec=CONTROL_PERIOD_SEC,
 			descent_divergence_setpoint=DESCENT_DIVERGENCE_SETPOINT,
+			approach_divergence_setpoint=APPROACH_DIVERGENCE_SETPOINT,
+			final_probe_duration_sec=FINAL_PROBE_DURATION_SEC,
+			final_probe_entry_ramp_sec=FINAL_PROBE_ENTRY_RAMP_SEC,
+			fov_near_area_fraction=FOV_NEAR_AREA_FRACTION,
 			probe_min_duration_sec=PROBE_MIN_DURATION_SEC,
+			far_probe_window_sec=FAR_PROBE_WINDOW_SEC,
+			far_probe_decay_tau_sec=FAR_PROBE_DECAY_TAU_SEC,
+			far_probe_highpass_tau_sec=FAR_PROBE_HIGHPASS_TAU_SEC,
+			near_probe_window_sec=NEAR_PROBE_WINDOW_SEC,
+			near_probe_decay_tau_sec=NEAR_PROBE_DECAY_TAU_SEC,
+			near_probe_highpass_tau_sec=NEAR_PROBE_HIGHPASS_TAU_SEC,
 			leg_clearance_m=LEG_CLEARANCE_M,
+			ceiling_safety_factor=CEILING_SAFETY_FACTOR,
+			ceiling_margin=DESCENT_CEILING_MARGIN,
+			near_field_height_m=NEAR_FIELD_HEIGHT_M,
 			probe_only=HOVER_PROBE_ONLY,
 			initial_thrust_gain=INITIAL_THRUST_GAIN,
 			d_star_ramp_in_sec=D_STAR_RAMP_IN_SEC,
@@ -532,10 +690,18 @@ class BeeLandNode(Node):
 		# own perf_counter timings of the two calls (durations, comparable across
 		# processes). frame_to_available/frame_to_command/result_period are the
 		# real cross-boundary latencies the v1.0-era stage timers never captured,
-		# all measured in THIS process's wall clock (see _drain_vision_results /
+		# all measured in THIS process's wall clock (see _publish_vision_result /
 		# on_control_timer).
 		self._latest_worker_target_acquisition_ms = None
 		self._latest_worker_optical_flow_ms = None
+		# IPC-leg decomposition (A-instrumentation). ipc_in = send + inbound
+		# queue-wait + unpickle (measured in the worker); ipc_out = out_q transit
+		# + wait-until-drained + unpickle (measured here in the drain thread).
+		# Together with the two worker compute times these sum to
+		# frame_to_available, so the ~9-18ms that used to be "unexplained gap"
+		# between compute and round-trip is now split into named legs.
+		self._latest_ipc_in_ms = None
+		self._latest_ipc_out_ms = None
 		self._latest_frame_to_available_ms = None
 		self._latest_frame_to_command_ms = None
 		self._latest_vision_result_period_ms = None
@@ -634,6 +800,12 @@ class BeeLandNode(Node):
 		# vision_worker.py for the loop itself.
 		self._vision_dropped_frames = 0
 		self._vision_worker_dead_logged = False
+		# B: results are drained by a dedicated event-driven thread (blocks on
+		# out_q, wakes the instant a result lands) instead of being polled by the
+		# 100 Hz control timer -- see _vision_drain_loop. This stop event lets
+		# shutdown unblock and join it cleanly.
+		self._vision_drain_stop = threading.Event()
+		self._vision_drain_thread = None
 		self._start_vision_worker()
 
 		self.diagnostics = DiagnosticsWriter(output_dir="logs", filename=None, flush_every_row=True)
@@ -770,6 +942,10 @@ class BeeLandNode(Node):
 		# Output queue is emptied every control tick (100 Hz) while the worker
 		# produces at <=30 Hz, so it never backs up; left unbounded so the
 		# worker never blocks on put().
+		# Drained by the dedicated _vision_drain_loop thread the instant a result
+		# lands (B). Left unbounded so the worker never blocks on put(); in
+		# steady state it holds 0-1 items because the drain thread is always
+		# parked in get() waiting for the next one.
 		self._vision_out_q = ctx.Queue()
 		self._vision_worker = ctx.Process(
 			target=run_vision_worker,
@@ -778,11 +954,24 @@ class BeeLandNode(Node):
 			daemon=True,
 		)
 		self._vision_worker.start()
+
+		# Event-driven drain thread (B). Publishes results into _latest_* the
+		# instant the worker returns them, rather than waiting for the next
+		# 100 Hz control tick to poll. daemon=True so it can never keep the
+		# process alive; shutdown still joins it explicitly via the stop event.
+		self._vision_drain_stop.clear()
+		self._vision_drain_thread = threading.Thread(
+			target=self._vision_drain_loop,
+			name="bee_vision_drain",
+			daemon=True,
+		)
+		self._vision_drain_thread.start()
+
 		self.get_logger().info(
 			f"Vision worker started (pid={self._vision_worker.pid}, "
-			"start_method=spawn). target_acquisition + optical_flow now run "
-			"out-of-process; on_camera no longer blocks the control/setpoint "
-			"timers on vision."
+			"start_method=spawn) with event-driven drain thread. "
+			"target_acquisition + optical_flow run out-of-process; on_camera no "
+			"longer blocks the control/setpoint timers on vision."
 		)
 
 	def _ship_frame_to_vision(self, frame, timestamp, body_rates, frame_wall):
@@ -796,11 +985,14 @@ class BeeLandNode(Node):
 		widens the baseline for the next one.
 
 		frame_wall is this process's wall clock at frame arrival; it rides along
-		and is echoed back in the VisionResult so _drain_vision_results can
-		measure the true frame->available round trip without any cross-process
-		clock comparison.
+		and is echoed back in the VisionResult so the drain thread can measure
+		the true frame->available round trip. ship_perf is a perf_counter taken
+		right before the put, used by the worker to measure the inbound IPC leg
+		(A-instrumentation) -- perf_counter is a shared monotonic clock across
+		processes on Linux, so worker_recv - ship_perf is a valid duration.
 		"""
-		payload = (frame, timestamp, body_rates, frame_wall)
+		ship_perf = time.perf_counter()
+		payload = (frame, timestamp, body_rates, frame_wall, ship_perf)
 		try:
 			self._vision_in_q.put_nowait(payload)
 		except queue.Full:
@@ -815,63 +1007,95 @@ class BeeLandNode(Node):
 				# Worker refilled it between our get and put -- skip this frame.
 				self._vision_dropped_frames += 1
 
-	def _drain_vision_results(self):
-		"""Pull the freshest (target, flow) the worker has produced and publish
-		it into _latest_target/_latest_flow for the controller.
+	def _vision_drain_loop(self):
+		"""Event-driven drain thread (B). Blocks on the worker's out_q and
+		publishes each result into _latest_* the instant it arrives, so
+		_latest_flow is always as fresh as the pipeline can make it instead of
+		waiting up to one control period to be polled.
 
-		Called at the top of on_control_timer (100 Hz), far faster than the
-		<=30 Hz the worker can produce, so the output queue is emptied every
-		tick and the controller always acts on the newest result.
+		Threading model: this is the ONLY writer of _latest_target/_latest_flow
+		and the vision measurement fields; the executor thread only reads them.
+		Reference/float assignments are individually atomic under the GIL, and
+		_publish_vision_result sets target before flow (same order the old poll
+		drain used) so the 'flow is None' gate never sees flow-without-target.
+		The one residual race -- the executor reading _latest_target and
+		_latest_flow on either side of a publish and getting a one-frame-skewed
+		pair -- is bounded to a single ~16-33ms frame and is no worse than the
+		sensor jitter already present; it is called out here so it is a known,
+		accepted property, not a surprise.
 
-		INSTRUMENTATION (v2.0): this is where the real cross-boundary numbers are
-		measured. frame_to_available_ms is the full round trip -- frame arrival
-		in on_camera, IPC send, queue wait, worker compute, IPC return, until
-		drained here -- computed purely in THIS process's wall clock via the
-		echoed frame_wall (no cross-process clock comparison). The worker's own
-		per-call timings land in worker_* fields, NOT in on_camera's stage
-		fields; on_camera no longer runs those two stages, so folding worker
-		numbers back through its stage schema is exactly the arithmetic-
-		impossibility bug the first v2.0 test surfaced.
+		The get() uses a timeout purely so the thread can notice the stop event
+		on shutdown; when a result is waiting it returns immediately (this is
+		event-driven in steady state, not a poll).
 		"""
-		newest = None
-		while True:
+		while not self._vision_drain_stop.is_set():
 			try:
-				newest = self._vision_out_q.get_nowait()
+				result = self._vision_out_q.get(timeout=0.2)
 			except queue.Empty:
+				continue
+			except (OSError, ValueError):
+				# Queue closed during shutdown -- nothing left to drain.
 				break
+			drain_perf = time.perf_counter()
+			self._publish_vision_result(result, drain_perf)
 
-		if newest is not None:
-			drain_wall = self.time.wall_sec()
-			self._latest_target = newest.target
-			self._latest_flow = newest.flow
+	def _publish_vision_result(self, result, drain_perf):
+		"""Publish one worker result into _latest_* and compute the cross-boundary
+		latency legs. Runs on the drain thread only.
 
-			# Worker-side compute cost (honest, separate from on_camera stages).
-			self._latest_worker_target_acquisition_ms = newest.target_acquisition_ms
-			self._latest_worker_optical_flow_ms = newest.optical_flow_ms
+		Latency decomposition (all durations, so cross-process/thread clock
+		epochs don't matter):
+		  ipc_in   : send + inbound queue-wait + unpickle  (measured in worker)
+		  compute  : target_acquisition_ms + optical_flow_ms (measured in worker)
+		  ipc_out  : out_q transit + wait-until-drained + unpickle
+		             = drain_perf - result.done_perf  (both perf_counter)
+		  frame_to_available = ipc_in + compute + ipc_out
+		This replaces the old wall-clock (drain - frame_wall) round trip with a
+		sum of named legs, which is why the previously 'unexplained' gap between
+		compute and round trip is now attributable.
+		"""
+		ipc_out_ms = 1000.0 * (drain_perf - result.done_perf)
+		frame_to_available_ms = (
+			result.ipc_in_ms
+			+ result.target_acquisition_ms
+			+ result.optical_flow_ms
+			+ ipc_out_ms
+		)
 
-			# True frame->available round trip (parent wall clock throughout).
-			if newest.frame_wall is not None:
-				self._latest_frame_to_available_ms = 1000.0 * (drain_wall - newest.frame_wall)
-			# Effective processed-frame period: gap between the arrival times of
-			# consecutive results the worker actually returned. If this grows
-			# well past the camera period, the worker is not keeping up (frames
-			# dropped at the shallow input queue) and _latest_flow is going
-			# stale -- the second thing the first test could not see.
-			if (
-				self._prev_vision_result_frame_wall is not None
-				and newest.frame_wall is not None
-			):
-				self._latest_vision_result_period_ms = 1000.0 * (
-					newest.frame_wall - self._prev_vision_result_frame_wall
-				)
-			self._prev_vision_result_frame_wall = newest.frame_wall
-			# Held so on_control_timer can close the frame->command measurement
-			# when THIS sample actually drives a new command.
-			self._latest_flow_frame_wall = newest.frame_wall
+		# Effective processed-frame period: gap between the arrival wall-times of
+		# consecutive results the worker actually returned. If this grows well
+		# past the camera period, the worker is not keeping up and _latest_flow
+		# is going stale.
+		if (
+			self._prev_vision_result_frame_wall is not None
+			and result.frame_wall is not None
+		):
+			self._latest_vision_result_period_ms = 1000.0 * (
+				result.frame_wall - self._prev_vision_result_frame_wall
+			)
+		self._prev_vision_result_frame_wall = result.frame_wall
 
-		# Liveness: if the worker process has died, results silently stop and the
-		# controller would coast on a stale sample until LOST_TARGET_TIMEOUT_SEC
-		# aborts to a neutral hover. Surface it loudly, exactly once.
+		# Diagnostics fields (thread-written, executor-read; diagnostics only).
+		self._latest_worker_target_acquisition_ms = result.target_acquisition_ms
+		self._latest_worker_optical_flow_ms = result.optical_flow_ms
+		self._latest_ipc_in_ms = result.ipc_in_ms
+		self._latest_ipc_out_ms = ipc_out_ms
+		self._latest_frame_to_available_ms = frame_to_available_ms
+		# Frame-arrival wall time of the sample now in _latest_flow, so
+		# on_control_timer can close frame->command when it drives a command.
+		self._latest_flow_frame_wall = result.frame_wall
+
+		# Control state LAST, target before flow (see _vision_drain_loop docstring).
+		self._latest_target = result.target
+		self._latest_flow = result.flow
+
+	def _check_vision_worker_alive(self):
+		"""Liveness check, called from on_control_timer (executor thread). If the
+		worker died, results silently stop and the controller would coast on a
+		stale sample until LOST_TARGET_TIMEOUT_SEC aborts to a neutral hover.
+		Surface it loudly, exactly once. Kept on the executor thread (not the
+		drain thread) because the drain thread would just sit blocked in get()
+		and never notice."""
 		if (
 			not self._vision_worker_dead_logged
 			and self._vision_worker is not None
@@ -892,6 +1116,19 @@ class BeeLandNode(Node):
 		with a timeout, and terminates only as a last resort. Called from main()'s
 		finally clause alongside the other subsystem teardown.
 		"""
+		# Stop the event-driven drain thread first so it isn't blocked in get()
+		# on a queue we're about to tear down. It wakes within its get() timeout,
+		# sees the stop event, and exits.
+		drain_thread = getattr(self, "_vision_drain_thread", None)
+		if drain_thread is not None:
+			try:
+				self._vision_drain_stop.set()
+				drain_thread.join(timeout=1.0)
+			except Exception:
+				pass
+			finally:
+				self._vision_drain_thread = None
+
 		worker = getattr(self, "_vision_worker", None)
 		if worker is None:
 			return
@@ -968,7 +1205,7 @@ class BeeLandNode(Node):
 		# longer held for the 40-200 ms the two vision stages take -- that work
 		# now happens in vision_worker, in parallel. The (target, flow) result
 		# lands back in _latest_target/_latest_flow when on_control_timer calls
-		# _drain_vision_results. _latest_frame is set here (not from the result)
+		# the vision drain thread. _latest_frame is set here (not from the result)
 		# so the "have we ever received a frame" gates (_ready_to_start and the
 		# top of on_control_timer) fire as soon as the first frame arrives, just
 		# as before.
@@ -985,7 +1222,7 @@ class BeeLandNode(Node):
 		# still happen HERE and are timed here; the target_acquisition and
 		# optical_flow stages now run in the worker and are filled into
 		# _latest_stage_target_acquisition_ms / _latest_stage_optical_flow_ms
-		# from the worker's own measurements when _drain_vision_results runs. So
+		# from the worker's own measurements when _publish_vision_result runs. So
 		# these on_camera stages NO LONGER sum to camera_cb_duration_ms (which is
 		# now just the light ship-the-frame path, and should be small) -- that is
 		# the whole point of the v2.0 split.
@@ -1188,8 +1425,10 @@ class BeeLandNode(Node):
 		self.get_logger().info(
 			f"Mission sim-time timers at EXPECTED_SIM_RTF={rtf:.2f} (update this "
 			"constant if your measured RTF differs -- see analyse_log.py's "
-			f"estimate_rtf()): probe_min_duration={PROBE_MIN_DURATION_SEC:.1f}s "
+			f"estimate_rtf()): approach_probe_min={PROBE_MIN_DURATION_SEC:.1f}s "
 			f"sim (~{PROBE_MIN_DURATION_SEC/rtf:.0f}s wall), "
+			f"final_probe_duration={FINAL_PROBE_DURATION_SEC:.1f}s sim "
+			f"(~{FINAL_PROBE_DURATION_SEC/rtf:.0f}s wall), "
 			f"d_star_ramp_in={D_STAR_RAMP_IN_SEC:.1f}s sim "
 			f"(~{D_STAR_RAMP_IN_SEC/rtf:.0f}s wall)."
 		)
@@ -1410,13 +1649,12 @@ class BeeLandNode(Node):
 	def on_control_timer(self):
 		now = self.time.wall_sec()
 
-		# v2.0: pick up whatever the vision worker has produced since the last
-		# tick before doing anything else -- this is what advances
-		# _latest_target/_latest_flow now that on_camera only ships frames.
-		# Drained unconditionally (every phase) so the output queue never backs
-		# up, and BEFORE the have-a-frame gate below so _latest_flow can leave
-		# None once the first result arrives.
-		self._drain_vision_results()
+		# v2.0 (B): results are now drained into _latest_target/_latest_flow by
+		# the event-driven _vision_drain_loop thread the instant they arrive, so
+		# there is nothing to poll here -- we just read the freshest values. We
+		# still check worker liveness on this (executor) thread, since the drain
+		# thread would sit blocked in get() and never notice a dead worker.
+		self._check_vision_worker_alive()
 
 		if self._latest_flow is None or self._latest_frame is None:
 			return
@@ -1528,6 +1766,8 @@ class BeeLandNode(Node):
 			offset_x=float(getattr(tgt, "offset_x", 0.0)),
 			offset_y=float(getattr(tgt, "offset_y", 0.0)),
 			target_found=bool(getattr(tgt, "found", False)),
+			area_fraction=float(getattr(tgt, "area_fraction", 0.0)),
+			fov_saturated=bool(getattr(tgt, "fov_saturated", False)),
 		)
 		self._latest_mission_control = mc
 
@@ -1545,7 +1785,15 @@ class BeeLandNode(Node):
 			# instead of continuing smoothly from wherever centering left off.
 			self.control_law.reset_divergence_integral()
 			self.get_logger().info(
-				"CENTER done -> cleared divergence integral before probe (filter state kept continuous)."
+				"CENTER done -> cleared divergence integral before approach probe (filter state kept continuous)."
+			)
+		if mc.info.get("event") == "final_probe_start":
+			# The approach leg deliberately descends with D*>0. Clear any accumulated
+			# divergence bias before the near-field D*=0 probe so the thrust residual
+			# measured there reflects the platform, not the approach history.
+			self.control_law.reset_divergence_integral()
+			self.get_logger().info(
+				"Visual near-field reached -> cleared divergence integral before final probe."
 			)
 		if now - self._last_mission_log_time >= 2.0:
 			self._last_mission_log_time = now
@@ -1744,6 +1992,12 @@ class BeeLandNode(Node):
 			# shed at the shallow input queue under load.
 			"worker_target_acquisition_ms": self._latest_worker_target_acquisition_ms,
 			"worker_optical_flow_ms": self._latest_worker_optical_flow_ms,
+			# A: IPC legs. ipc_in + worker compute + ipc_out == frame_to_available.
+			# ipc_out is now near-pure IPC (no poll wait) because the drain thread
+			# picks results up on arrival, so any residual in
+			# frame_to_command - frame_to_available is the control-tick grid wait.
+			"ipc_in_ms": self._latest_ipc_in_ms,
+			"ipc_out_ms": self._latest_ipc_out_ms,
 			"frame_to_available_wall_ms": self._latest_frame_to_available_ms,
 			"frame_to_command_wall_ms": self._latest_frame_to_command_ms,
 			"vision_result_period_wall_ms": self._latest_vision_result_period_ms,
@@ -1772,19 +2026,64 @@ class BeeLandNode(Node):
 			return None
 		info = getattr(mc, "info", {}) or {}
 		gate = self.mission.gate
+
+		# SUBSTATE COMES FROM THE LIVE ROUTINE, not from mc.substate.
+		#
+		# mc is a CACHED MissionControl, refreshed only inside mission.update().
+		# Once PHASE_LANDED latches, on_control_timer returns early and never calls
+		# mission.update() again -- so mc stays frozen on the last DESCEND command
+		# for the rest of the log. mark_landed() does correctly flip the routine's
+		# own substate to LANDED, but reading it off the stale cache meant the CSV
+		# never showed a single "landed" row (confirmed: 661 zero-thrust rows, all
+		# still labelled "descend"). The routine is the single source of truth for
+		# WHICH PHASE WE ARE IN; mc only carries the last COMMAND we formed.
+		substate = self.mission.substate
+		landed = substate == MISSION_LANDED
+
+		# Once landed, the cached command is a fiction: bee_node is publishing its
+		# own zero-thrust setpoint and the mission routine has stopped forming
+		# commands. Blank the per-step control fields rather than let the final
+		# DESCEND values persist as a flat line that looks like a live command.
+		# The GATE fields (k_min/k_floor/peak_accel/...) are NOT blanked -- they are
+		# the mission's verdict and stay meaningful after touchdown.
 		return {
-			"substate": mc.substate,
-			"divergence_setpoint": mc.divergence_setpoint,
-			"thrust_gain_k": mc.thrust_gain_override,
-			"lateral_p_scale": mc.lateral_p_scale,
-			"lateral_d_scale": mc.lateral_d_scale,
+			"substate": substate,
+			"divergence_setpoint": None if landed else mc.divergence_setpoint,
+			"thrust_gain_k": None if landed else mc.thrust_gain_override,
+			"lateral_p_scale": None if landed else mc.lateral_p_scale,
+			"lateral_d_scale": None if landed else mc.lateral_d_scale,
 			"k_min": gate.k_min,
 			"k_explore": gate.k_explore,
 			"h_crit": gate.h_crit,
-			# h_pred only exists during descent; blank otherwise.
-			"h_pred": info.get("h_pred"),
+			# The descent gain window (see mission_routine): k(t) now decays toward
+			# k_floor = max(k_min, ceiling_margin * k_ceiling_leg), NOT toward k_min.
+			# k_over_ceiling_leg is the headline diagnostic for this change -- it used
+			# to sit near 0.065 for the whole descent; it should now approach
+			# ceiling_margin.
+			"k_ceiling_leg": gate.k_ceiling_leg,
+			"k_target": gate.k_target,
+			"k_floor": gate.k_floor,
+			"k_descend_start": gate.k_descend_start,
+			"ceiling_margin": gate.ceiling_margin,
+			"k_over_ceiling_leg": None if landed else info.get("k_over_ceiling_leg"),
+			# h_pred only exists during descent; blank otherwise. DIAGNOSTIC ONLY --
+			# no control path reads it (see mission_routine's scheduled_gain_at_time).
+			"h_pred": None if landed else info.get("h_pred"),
+			# ONE continuous probe: peak_accel is the live estimate, and
+			# peak_accel_at_handoff freezes what it was at the far->near switch.
+			# Logging both shows how much the (more trustworthy) near-field samples
+			# actually revised the far-field number, and in which direction -- if
+			# they never revise it, NEAR_PROBE_DECAY_TAU_SEC is too long or the hold
+			# is too short to see an excursion.
 			"peak_accel": self.mission.probe_result.peak_accel,
+			"peak_accel_at_handoff": self.mission.peak_accel_at_handoff,
+			"probe_total_duration_sec": self.mission.probe_result.total_duration_sec,
 			"feasible": gate.feasible,
+			# Per-step probe internals (accel / mean / residual / percentile / peak).
+			# peak_accel is a slow envelope; these are what it is built from, and are
+			# what the probe-acceleration plot needs to show whether the envelope is
+			# tracking real excursions or coasting on a stale peak.
+			**self.mission.probe_telemetry(),
 		}
 
 	def _ready_to_start(self) -> bool:
@@ -1826,6 +2125,20 @@ class BeeLandNode(Node):
 	def _enter_landed_phase(self, reason: str):
 		if self._mission_phase == PHASE_LANDED:
 			return
+
+		# Latch the terminal substate on the mission routine as well, so the LOG
+		# says "landed" instead of continuing to say "descend" for the whole
+		# post-touchdown zero-thrust hold. In the previous run 1437 of 2065
+		# "descend" rows were actually the vehicle already sitting on the platform,
+		# which corrupted every per-phase statistic computed from the CSV (the
+		# descent's achieved divergence read 0.012 instead of its true 0.238).
+		#
+		# Stamped on the VISION clock -- the same clock mission.update() runs on --
+		# so t_landed is comparable with the other mission timestamps. Falls back to
+		# the last known vision time if none has arrived yet.
+		self.mission.mark_landed(
+			float(getattr(self._latest_flow, "timestamp", 0.0) or 0.0)
+		)
 
 		self.get_logger().warning(f"LANDING COMPLETE: {reason}. Entering landed phase.")
 		self._latest_setpoint = self._landed_zero_thrust_setpoint()

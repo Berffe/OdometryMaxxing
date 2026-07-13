@@ -35,8 +35,12 @@ modules and their dependencies so a spawned child stays light and DDS-free.
 PICKLING
 --------
 multiprocessing.Queue pickles everything crossing the boundary:
-  in : (frame: np.ndarray, timestamp: float, body_rates: tuple|np.ndarray|None)
+  in : (frame: np.ndarray, timestamp: float, body_rates: tuple|np.ndarray|None,
+        frame_wall: float, ship_perf: float)
   out: VisionResult(timestamp, target: TargetEstimate, flow: FlowResult, ...)
+frame_wall is the parent's wall clock at frame arrival (echoed back untouched);
+ship_perf is the parent's perf_counter just before put() (used only to measure
+the inbound IPC leg -- see VisionResult below).
 frame is a small BGR uint8 array (~28 KB at 120x80) so per-frame IPC cost is
 negligible at 30 Hz. TargetEstimate and FlowResult must stay picklable (plain
 dataclasses / namedtuples of scalars + small arrays -- no open cv2 handles,
@@ -69,6 +73,18 @@ from .target_acquisition import TargetAcquisition
 # optical_flow_ms are the worker's own perf_counter measurement of each call
 # (durations, so comparable across processes); they are the HONEST replacement
 # for the on_camera stage timers, which no longer run these two stages.
+# ipc_in_ms / done_perf added in the A-instrumentation pass to split the
+# frame->available round trip into its real legs instead of guessing where the
+# ~9-18ms beyond compute goes:
+#   ipc_in_ms : send + inbound-queue-wait + unpickle, measured as
+#               (worker perf_counter right after in_q.get()) - ship_perf, where
+#               ship_perf is the parent's perf_counter taken just before put().
+#   done_perf : the worker's perf_counter the instant compute finished, so the
+#               parent's drain thread can measure the OUTBOUND leg (out_q
+#               transit + wait-until-drained + unpickle) as drain_perf - done_perf.
+# Both rely on perf_counter being the same monotonic clock across processes,
+# which holds on Linux (CLOCK_MONOTONIC is system-wide); the two legs are
+# durations either way, so no absolute-epoch comparison is assumed beyond that.
 VisionResult = namedtuple(
 	"VisionResult",
 	[
@@ -78,6 +94,8 @@ VisionResult = namedtuple(
 		"target_acquisition_ms",
 		"optical_flow_ms",
 		"frame_wall",
+		"ipc_in_ms",
+		"done_perf",
 	],
 )
 
@@ -116,11 +134,15 @@ def run_vision_worker(in_q, out_q):
 
 	while True:
 		item = in_q.get()  # blocks; costs nothing while idle
+		# perf_counter the instant get() returns -- captures inbound-queue-wait
+		# AND unpickle (unpickle happens inside get()), before any other work.
+		recv_perf = time.perf_counter()
 		if item is STOP:
 			break
 
 		try:
-			frame, timestamp, body_rates, frame_wall = item
+			frame, timestamp, body_rates, frame_wall, ship_perf = item
+			ipc_in_ms = 1000.0 * (recv_perf - ship_perf)
 
 			t0 = time.perf_counter()
 			target = target_acquisition.update(frame, timestamp=timestamp)
@@ -137,6 +159,8 @@ def run_vision_worker(in_q, out_q):
 				target_acquisition_ms=1000.0 * (t1 - t0),
 				optical_flow_ms=1000.0 * (t2 - t1),
 				frame_wall=frame_wall,
+				ipc_in_ms=ipc_in_ms,
+				done_perf=t2,
 			))
 		except Exception as exc:
 			# A single malformed frame must not kill the pipeline. Skip it and
