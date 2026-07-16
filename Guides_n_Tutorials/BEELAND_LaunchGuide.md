@@ -25,6 +25,8 @@ cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Gazebo_defs/worlds/*
 
 cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Gazebo_defs/models/* ~/PX4-Autopilot/BEE_LAND/models/
 
+cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Gazebo_defs/plugins/* ~/PX4-Autopilot/BEE_LAND/plugins/
+
 cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Controller_logic/*.py ~/PX4-Autopilot/BEE_LAND/controller/
 
 cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/OpenLoop_Test/*.py ~/PX4-Autopilot/BEE_LAND/openloop/
@@ -101,10 +103,8 @@ Your ROS 2 nodes can subscribe to these topics through `px4_msgs`.
 ## Terminal 3 — Start all Gazebo → ROS 2 bridges
 
 ```bash
-ros2 run ros_gz_bridge parameter_bridge \
-  /bee_x500/camera/image@sensor_msgs/msg/Image[gz.msgs.Image \
-  /platform/pose@geometry_msgs/msg/Pose[gz.msgs.Pose \
-  /bee_platform/touched@std_msgs/msg/Bool[gz.msgs.Boolean
+cd ~/PX4-Autopilot/BEE_LAND
+./bridge.sh
 ```
 
 This single persistent process bridges the three Gazebo topics needed by the controller:
