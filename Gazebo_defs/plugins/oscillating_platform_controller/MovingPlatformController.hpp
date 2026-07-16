@@ -20,6 +20,7 @@
 
 #include <sdf/Element.hh>
 
+#include <optional>
 #include <string>
 
 namespace custom
@@ -55,6 +56,9 @@ private:
 	gz::math::Vector3d sinusoidalVelocity(double time_sec) const;
 	gz::math::Vector3d clampVectorNorm(const gz::math::Vector3d &value, double max_norm) const;
 
+	// Deck mass for the velocity-tracking force (F = m*gain*dv); cached, constant.
+	std::optional<double> linkMass(const gz::sim::EntityComponentManager &ecm) const;
+
 	// Publishes the ACTUAL simulated link pose, not only the commanded target.
 	// This topic is intentionally single-entity: every message on _pose_topic is
 	// the platform pose, so the ROS side can bridge it as gz.msgs.Pose ->
@@ -83,6 +87,31 @@ private:
 	// commanded_velocity = feedforward_sinusoid_velocity + position_gain * error.
 	double _position_gain{8.0};
 	double _max_linear_velocity{5.0};
+
+	// Velocity-tracking-force parameters (see PreUpdate). The deck is now a DYNAMIC
+	// body held on its sinusoid by a stiff velocity servo instead of a kinematic
+	// SetLinearVelocity, so contact with the landing gear produces a real normal
+	// force and the drone stops at the surface instead of sinking through it. The
+	// coupling stays one-way in practice: at mass 1000 kg a drone leg load
+	// perturbs the deck by only a few millimetres, restored within ~1/position_gain
+	// seconds. _velocity_tracking_gain [1/s] sets servo stiffness; too low and the
+	// deck lags its sinusoid, too high and it re-approaches the old treadmill
+	// (ignoring contact). _fallback_mass_kg is used only if the inertial component
+	// cannot be read.
+	//
+	// _gravity_magnitude is READ but currently UNUSED in PreUpdate:
+	// bee_platform.sdf's platform_link already carries <gravity>false</gravity>,
+	// so Gazebo never applies gravity to this link, and a compensating force here
+	// would cancel something that isn't there -- exactly the bug that was here
+	// before (a spurious constant ~m*g force that, combined with the velocity
+	// clamp, drove the deck into a large, irregular limit cycle far outside its
+	// commanded amplitude/period). Kept as SDF-configurable infrastructure only
+	// for the day <gravity> is re-enabled on the link, at which point PreUpdate's
+	// AddWorldForce must add this back -- the two must change together.
+	double _velocity_tracking_gain{50.0};
+	double _fallback_mass_kg{1000.0};
+	double _gravity_magnitude{9.8};
+	mutable std::optional<double> _cached_mass{};
 
 	std::string _pose_topic{"/platform/pose"};
 	gz::transport::Node _transport_node;

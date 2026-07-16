@@ -108,6 +108,27 @@ PLATFORM_NED_SIGN = 1.0
 # source, not a separate correction bolted onto the combined NED result.
 PLATFORM_TOP_SURFACE_OFFSET_M = 0.2 / 2.0  # bee_platform.sdf <length>0.2</length>, halved
 
+# The DRONE side of the same story. relative_z_m is only "coherent" -- reads the
+# gap the pilot cares about -- if it measures the drone's LOWEST point (its feet /
+# belly) to the platform's TOP surface. The platform offset above lifts the
+# reference from disc-centre to disc-top; this one lowers it from base_link to the
+# skids, so together they make relative_z = 0 mean "feet exactly on the surface"
+# (and relative_z > 0 mean the feet have gone THROUGH it, i.e. penetration).
+#
+# Value from bee_x500/x500_base (model_base.sdf): base_link_collision_3/_4 are the
+# landing-skid cross-bars, 0.25x0.015x0.015 boxes centred at z=-0.2195 relative to
+# base_link, so their underside -- the true first-contact point -- sits
+#   0.2195 + 0.015/2 = 0.227 m
+# below base_link. This is the same 0.227 m the module docstring already cites as
+# the skid-bottom clearance; it was just never subtracted from relative_z.
+#
+# NOT to be confused with LEG_CLEARANCE_M in bee_node (0.182 m): that is a
+# CAMERA-referenced height (camera above feet = 0.227 - 0.045), used by the
+# feasibility gate because the control's height sense is the camera's divergence.
+# This constant is base_link -> feet, used to place the diagnostic relative_z at
+# the belly. Different references, different jobs; keep them distinct.
+DRONE_BELLY_OFFSET_M = 0.227  # base_link -> skid underside, model_base.sdf
+
 # Untested (x_amplitude/y_amplitude are 0 in every run so far): NED's x=North
 # corresponds to ENU's y, and NED's y=East corresponds to ENU's x. Set True
 # once a lateral oscillation test shows relative_x/y tracking the WRONG
@@ -198,7 +219,24 @@ def relative_motion(
 	rel_vx = vehicle.vx - platform_vx
 	rel_vy = vehicle.vy - platform_vy
 
-	rel_z = vehicle.z + PLATFORM_NED_SIGN * (platform.z + PLATFORM_TOP_SURFACE_OFFSET_M)
+	# rel_z measures the drone's FEET to the platform's TOP surface, in the same
+	# NED closing-convention as rel_vz (negative while the feet are still above the
+	# surface, 0 at feet-on-surface, positive = penetration).
+	#
+	# Two geometric shifts, in the frame each belongs to:
+	#   + PLATFORM_TOP_SURFACE_OFFSET_M : platform.z is the disc CENTRE (ENU,
+	#       up-positive); its top surface is half a thickness higher. Added inside
+	#       the platform term, before the NED sign, exactly as before.
+	#   + DRONE_BELLY_OFFSET_M          : vehicle.z is base_link (NED, down-positive);
+	#       the feet are 0.227 m BELOW it, i.e. 0.227 m closer to the surface. In the
+	#       down-positive NED frame "lower" is "more positive", so the feet's z is
+	#       vehicle.z + DRONE_BELLY_OFFSET_M. This shrinks the clearance magnitude,
+	#       which is correct -- the skids reach the deck before base_link would.
+	# Both are constants, so rel_vz (the derivative) is unchanged.
+	rel_z = (
+		(vehicle.z + DRONE_BELLY_OFFSET_M)
+		+ PLATFORM_NED_SIGN * (platform.z + PLATFORM_TOP_SURFACE_OFFSET_M)
+	)
 	rel_vz = vehicle.vz + PLATFORM_NED_SIGN * platform.vz
 
 	return rel_x, rel_y, rel_z, rel_vx, rel_vy, rel_vz

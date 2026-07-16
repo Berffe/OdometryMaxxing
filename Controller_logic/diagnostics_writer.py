@@ -1,21 +1,15 @@
-"""CSV diagnostics writer for BEE_LAND runs.
+"""CSV diagnostics writer for BEE_LAND runs (schema 3.0).
 
-Important timestamp convention
-------------------------------
-``wall_timestamp`` is the only wall-clock reference used to build the relative
-``t_sec`` column. All other ``*_timestamp_sec`` fields are written as raw values
-from their own sources:
+Every timestamp name states both WHAT event it describes and WHICH clock owns
+it. Raw source timestamps and callback receipt timestamps are logged separately;
+no field silently converts SIM/PX4 time into WALL time.
 
-- target / flow / command timestamps: vision timestamp used by bee_node.py,
-  normally Gazebo image simulation time.
-- vehicle_timestamp_sec / vehicle_px4_timestamp_sec: whatever VehicleState
-  carries, normally wall receipt time plus PX4's own timestamp depending on the
-  active state.py convention.
-- platform timestamp is not written because /platform/pose is an unstamped Pose.
-
-The writer deliberately does not subtract wall-clock origin from target/flow/PX4
-fields. Mixing those epochs caused the huge negative timestamp columns seen in
-recent logs.
+Clock families:
+- ``*_wall_timestamp_sec``: Unix epoch / SYSTEM_TIME.
+- ``*_monotonic_timestamp_sec``: local steady clock, for durations only.
+- ``*_source_timestamp_sec`` + ``*_source_clock``: native sensor/estimator time.
+- ``*_estimated_sim_timestamp_sec``: explicit diagnostic affine estimate, never
+  presented as a native source stamp and never used by control.
 """
 
 from __future__ import annotations
@@ -28,8 +22,10 @@ from typing import Any, Optional
 
 try:
 	from .state import AttitudeSetpoint, FlowResult, PlatformState, TargetEstimate, VehicleState
+	from .platform_motion import relative_motion
 except ImportError:  # Allows standalone import/tests from the controller folder.
 	from state import AttitudeSetpoint, FlowResult, PlatformState, TargetEstimate, VehicleState
+	from platform_motion import relative_motion
 
 
 class DiagnosticsWriter:
@@ -48,6 +44,7 @@ class DiagnosticsWriter:
 		self.filepath = str(self.output_dir / filename)
 		self._flush_every_row = bool(flush_every_row)
 		self._start_wall_timestamp: Optional[float] = None
+		self._start_monotonic_timestamp: Optional[float] = None
 
 		self._file = open(self.filepath, "w", newline="", encoding="utf-8")
 		self._writer = csv.DictWriter(self._file, fieldnames=self._fieldnames())
@@ -57,15 +54,16 @@ class DiagnosticsWriter:
 
 	def write(
 		self,
-		wall_timestamp: float,
+		log_wall_timestamp_sec: float,
+		log_monotonic_timestamp_sec: float,
 		target: Optional[TargetEstimate],
 		flow: Optional[FlowResult],
 		setpoint: Optional[AttitudeSetpoint],
 		vehicle_state: Optional[VehicleState],
 		platform_state: Optional[PlatformState] = None,
 		calibration_axis: str = "",
-		px4_wall_offset_sec: Optional[float] = None,
-		sim_wall_offset_sec: Optional[float] = None,
+		timestamps: Optional[dict] = None,
+		clock: Optional[dict] = None,
 		mission: Optional[dict] = None,
 		px4_nav_state: Optional[int] = None,
 		px4_arming_state: Optional[int] = None,
@@ -74,17 +72,23 @@ class DiagnosticsWriter:
 		timing: Optional[dict] = None,
 		**_: Any,
 	):
-		wall_timestamp = float(wall_timestamp)
+		log_wall_timestamp_sec = float(log_wall_timestamp_sec)
+		log_monotonic_timestamp_sec = float(log_monotonic_timestamp_sec)
 		if self._start_wall_timestamp is None:
-			self._start_wall_timestamp = wall_timestamp
+			self._start_wall_timestamp = log_wall_timestamp_sec
+		if self._start_monotonic_timestamp is None:
+			self._start_monotonic_timestamp = log_monotonic_timestamp_sec
 
 		row = {name: "" for name in self._fieldnames()}
-		row["t_sec"] = wall_timestamp - self._start_wall_timestamp
-		row["wall_timestamp"] = wall_timestamp
+		row["diagnostics_schema_version"] = "3.0"
+		row["log_elapsed_wall_sec"] = log_wall_timestamp_sec - self._start_wall_timestamp
+		row["log_elapsed_monotonic_sec"] = log_monotonic_timestamp_sec - self._start_monotonic_timestamp
+		row["log_write_wall_timestamp_sec"] = log_wall_timestamp_sec
+		row["log_write_monotonic_timestamp_sec"] = log_monotonic_timestamp_sec
 
 		if target is not None:
 			row.update({
-				"target_timestamp_sec": self._raw_ts(getattr(target, "timestamp", 0.0)),
+				"target_source_timestamp_sec": self._raw_ts(getattr(target, "timestamp", 0.0)),
 				"target_found": self._bool_int(getattr(target, "found", False)),
 				"target_confidence": self._num(getattr(target, "confidence", 0.0)),
 				"target_offset_x": self._num(getattr(target, "offset_x", 0.0)),
@@ -97,7 +101,7 @@ class DiagnosticsWriter:
 
 		if flow is not None:
 			row.update({
-				"flow_timestamp_sec": self._raw_ts(getattr(flow, "timestamp", 0.0)),
+				"flow_source_timestamp_sec": self._raw_ts(getattr(flow, "timestamp", 0.0)),
 				"flow_valid": self._bool_int(getattr(flow, "valid", False)),
 				"flow_mean_x_px_s": self._num(getattr(flow, "mean_flow_x", 0.0)),
 				"flow_mean_y_px_s": self._num(getattr(flow, "mean_flow_y", 0.0)),
@@ -118,7 +122,7 @@ class DiagnosticsWriter:
 
 		if setpoint is not None:
 			row.update({
-				"command_timestamp_sec": self._raw_ts(getattr(setpoint, "timestamp", 0.0)),
+				"command_source_flow_timestamp_sec": self._raw_ts(getattr(setpoint, "timestamp", 0.0)),
 				"command_roll_rad": self._num(getattr(setpoint, "roll", 0.0)),
 				"command_pitch_rad": self._num(getattr(setpoint, "pitch", 0.0)),
 				"command_yaw_rad": self._num(getattr(setpoint, "yaw", 0.0)),
@@ -134,8 +138,10 @@ class DiagnosticsWriter:
 
 		if vehicle_state is not None:
 			row.update({
-				"vehicle_timestamp_sec": self._raw_ts(getattr(vehicle_state, "timestamp", 0.0)),
-				"vehicle_px4_timestamp_sec": self._raw_ts(getattr(vehicle_state, "px4_timestamp_sec", 0.0)),
+				"vehicle_state_source": "px4_vehicle_local_position",
+				"vehicle_state_frame": "px4_local_ned",
+				"vehicle_local_position_receipt_wall_timestamp_sec": self._raw_ts(getattr(vehicle_state, "timestamp", 0.0)),
+				"vehicle_local_position_publication_px4_timestamp_sec": self._raw_ts(getattr(vehicle_state, "px4_timestamp_sec", 0.0)),
 				"vehicle_x_m": self._num(getattr(vehicle_state, "x", 0.0)),
 				"vehicle_y_m": self._num(getattr(vehicle_state, "y", 0.0)),
 				"vehicle_z_m": self._num(getattr(vehicle_state, "z", 0.0)),
@@ -143,7 +149,7 @@ class DiagnosticsWriter:
 				"vehicle_vy_m_s": self._num(getattr(vehicle_state, "vy", 0.0)),
 				"vehicle_vz_m_s": self._num(getattr(vehicle_state, "vz", 0.0)),
 				"vehicle_yaw_rad": self._num(getattr(vehicle_state, "yaw", 0.0)),
-				"vehicle_attitude_timestamp_sec": self._raw_ts(getattr(vehicle_state, "attitude_timestamp", 0.0)),
+				"vehicle_attitude_publication_px4_timestamp_sec": self._raw_ts(getattr(vehicle_state, "attitude_timestamp", 0.0)),
 				"vehicle_roll_rad": self._num(getattr(vehicle_state, "roll", 0.0)),
 				"vehicle_pitch_rad": self._num(getattr(vehicle_state, "pitch", 0.0)),
 				"vehicle_attitude_yaw_rad": self._num(getattr(vehicle_state, "attitude_yaw", 0.0)),
@@ -152,26 +158,107 @@ class DiagnosticsWriter:
 
 		if platform_state is not None:
 			row.update({
+				"platform_pose_source": "gazebo_platform_pose_topic",
+				"platform_pose_frame": "gazebo_world_enu",
 				"platform_x_m": self._num(getattr(platform_state, "x", 0.0)),
 				"platform_y_m": self._num(getattr(platform_state, "y", 0.0)),
 				"platform_z_m": self._num(getattr(platform_state, "z", 0.0)),
-				"platform_vx_m_s": self._num(getattr(platform_state, "vx", 0.0)),
-				"platform_vy_m_s": self._num(getattr(platform_state, "vy", 0.0)),
-				"platform_vz_m_s": self._num(getattr(platform_state, "vz", 0.0)),
+				"platform_vx_derived_from_pose_m_s": self._num(getattr(platform_state, "vx", 0.0)),
+				"platform_vy_derived_from_pose_m_s": self._num(getattr(platform_state, "vy", 0.0)),
+				"platform_vz_derived_from_pose_m_s": self._num(getattr(platform_state, "vz", 0.0)),
 			})
 
 			if vehicle_state is not None:
-				# VehicleState is PX4 local NED: z grows negative upward. PlatformState is
-				# Gazebo world ENU. Therefore relative height in the existing logs is
-				# vehicle_z_NED + platform_z_ENU, and similarly for vz.
+				# Relative motion now goes through platform_motion.relative_motion()
+				# rather than a raw vehicle.z + platform.z sum. The raw sum measured
+				# distance to the platform's disc CENTRE from base_link, applying
+				# NEITHER the platform's centre->top-surface offset (which
+				# relative_motion already owned, so the log and that helper had
+				# silently diverged) NOR the drone's base_link->feet offset. The
+				# helper applies both, so relative_z_m is now the drone's FEET to the
+				# platform's TOP SURFACE: 0 at a clean touchdown, positive = the skids
+				# have gone through the deck (penetration). relative_vz_composed_m_s is
+				# unchanged (both offsets are constants, so they drop out of the rate).
+				rel = relative_motion(vehicle_state, platform_state)
+				rel_x, rel_y, rel_z, rel_vx, rel_vy, rel_vz = rel
 				row.update({
-					"relative_x_m": self._num(getattr(vehicle_state, "x", 0.0) - getattr(platform_state, "x", 0.0)),
-					"relative_y_m": self._num(getattr(vehicle_state, "y", 0.0) - getattr(platform_state, "y", 0.0)),
-					"relative_z_m": self._num(getattr(vehicle_state, "z", 0.0) + getattr(platform_state, "z", 0.0)),
-					"relative_vx_m_s": self._num(getattr(vehicle_state, "vx", 0.0) - getattr(platform_state, "vx", 0.0)),
-					"relative_vy_m_s": self._num(getattr(vehicle_state, "vy", 0.0) - getattr(platform_state, "vy", 0.0)),
-					"relative_vz_m_s": self._num(getattr(vehicle_state, "vz", 0.0) + getattr(platform_state, "vz", 0.0)),
+					"relative_motion_source": "platform_motion.relative_motion",
+					"relative_velocity_source": "px4_vehicle_velocity_plus_platform_pose_derived_velocity",
+					"relative_x_m": self._num(rel_x),
+					"relative_y_m": self._num(rel_y),
+					"relative_z_m": self._num(rel_z),
+					"relative_vx_composed_m_s": self._num(rel_vx),
+					"relative_vy_composed_m_s": self._num(rel_vy),
+					"relative_vz_composed_m_s": self._num(rel_vz),
 				})
+
+
+		# Explicit raw source/receipt timestamps supplied by bee_node. These
+		# override duplicated values inferred from dataclasses above when present.
+		if timestamps is not None:
+			for key, column in {
+				"camera_message_count": "camera_message_count",
+				"camera_nonincreasing_stamp_drop_count": "camera_nonincreasing_stamp_drop_count",
+				"camera_source_timestamp_sec": "camera_source_timestamp_sec",
+				"camera_source_clock": "camera_source_clock",
+				"camera_receipt_wall_sec": "camera_receipt_wall_timestamp_sec",
+				"camera_receipt_monotonic_sec": "camera_receipt_monotonic_timestamp_sec",
+				"vision_frame_receipt_wall_sec": "vision_frame_receipt_wall_timestamp_sec",
+				"vision_frame_receipt_monotonic_sec": "vision_frame_receipt_monotonic_timestamp_sec",
+				"vision_result_available_monotonic_sec": "vision_result_available_monotonic_timestamp_sec",
+				"vision_result_available_wall_sec": "vision_result_available_wall_timestamp_sec",
+				"vision_result_count": "vision_result_count",
+				"vision_source_clock": "vision_source_clock",
+				"command_source_flow_timestamp_sec": "command_source_flow_timestamp_sec",
+				"command_source_kind": "command_source_kind",
+				"command_source_clock": "command_source_clock",
+				"command_source_frame_receipt_wall_sec": "command_source_frame_receipt_wall_timestamp_sec",
+				"command_source_frame_receipt_monotonic_sec": "command_source_frame_receipt_monotonic_timestamp_sec",
+				"command_compute_wall_sec": "command_compute_wall_timestamp_sec",
+				"command_compute_monotonic_sec": "command_compute_monotonic_timestamp_sec",
+				"vehicle_local_position_publication_px4_sec": "vehicle_local_position_publication_px4_timestamp_sec",
+				"vehicle_local_position_sample_px4_sec": "vehicle_local_position_sample_px4_timestamp_sec",
+				"vehicle_local_position_message_count": "vehicle_local_position_message_count",
+				"vehicle_local_position_receipt_wall_sec": "vehicle_local_position_receipt_wall_timestamp_sec",
+				"vehicle_local_position_receipt_monotonic_sec": "vehicle_local_position_receipt_monotonic_timestamp_sec",
+				"vehicle_attitude_publication_px4_sec": "vehicle_attitude_publication_px4_timestamp_sec",
+				"vehicle_attitude_sample_px4_sec": "vehicle_attitude_sample_px4_timestamp_sec",
+				"vehicle_attitude_message_count": "vehicle_attitude_message_count",
+				"vehicle_attitude_receipt_wall_sec": "vehicle_attitude_receipt_wall_timestamp_sec",
+				"vehicle_attitude_receipt_monotonic_sec": "vehicle_attitude_receipt_monotonic_timestamp_sec",
+				"vehicle_angular_velocity_publication_px4_sec": "vehicle_angular_velocity_publication_px4_timestamp_sec",
+				"vehicle_angular_velocity_sample_px4_sec": "vehicle_angular_velocity_sample_px4_timestamp_sec",
+				"vehicle_angular_velocity_message_count": "vehicle_angular_velocity_message_count",
+				"vehicle_angular_velocity_receipt_wall_sec": "vehicle_angular_velocity_receipt_wall_timestamp_sec",
+				"vehicle_angular_velocity_receipt_monotonic_sec": "vehicle_angular_velocity_receipt_monotonic_timestamp_sec",
+				"vehicle_status_publication_px4_sec": "vehicle_status_publication_px4_timestamp_sec",
+				"vehicle_status_message_count": "vehicle_status_message_count",
+				"vehicle_status_receipt_wall_sec": "vehicle_status_receipt_wall_timestamp_sec",
+				"vehicle_status_receipt_monotonic_sec": "vehicle_status_receipt_monotonic_timestamp_sec",
+				"platform_pose_receipt_wall_sec": "platform_pose_receipt_wall_timestamp_sec",
+				"platform_pose_message_count": "platform_pose_message_count",
+				"platform_pose_receipt_monotonic_sec": "platform_pose_receipt_monotonic_timestamp_sec",
+				"platform_pose_estimated_sim_sec": "platform_pose_estimated_sim_timestamp_sec",
+				"platform_velocity_dt_estimated_sim_sec": "platform_velocity_dt_estimated_sim_sec",
+				"platform_velocity_source": "platform_velocity_source",
+				"platform_velocity_smoothing_tau_sim_sec": "platform_velocity_smoothing_tau_sim_sec",
+				"px4_publish_wall_sec": "px4_publish_wall_timestamp_sec",
+				"px4_publish_timestamp_us": "px4_publish_timestamp_us",
+				"px4_publish_monotonic_sec": "px4_publish_monotonic_timestamp_sec",
+				"touchdown_detected": "touchdown_detected",
+				"touchdown_receipt_wall_sec": "touchdown_receipt_wall_timestamp_sec",
+				"touchdown_receipt_monotonic_sec": "touchdown_receipt_monotonic_timestamp_sec",
+				"touchdown_source": "touchdown_source",
+			}.items():
+				value = timestamps.get(key)
+				if column.endswith("_clock") or column.endswith("_source") or column.endswith("_kind"):
+					row[column] = value or ""
+				elif column.endswith("_count"):
+					row[column] = self._int_or_blank(value)
+				elif column == "touchdown_detected":
+					row[column] = self._bool_int(value) if value is not None else ""
+				else:
+					row[column] = self._num(value)
 
 		row["calibration_axis"] = calibration_axis or ""
 
@@ -251,9 +338,9 @@ class DiagnosticsWriter:
 		# cadence, and (3) what real-time factor did the simulator/PX4 clock run at.
 		if timing is not None:
 			row.update({
-				"timing_camera_cb_start_wall_sec": self._num(timing.get("camera_cb_start_wall_sec")),
-				"timing_camera_cb_end_wall_sec": self._num(timing.get("camera_cb_end_wall_sec")),
-				"timing_camera_cb_duration_ms": self._num(timing.get("camera_cb_duration_ms")),
+				"timing_camera_callback_start_monotonic_sec": self._num(timing.get("camera_callback_start_monotonic_sec")),
+				"timing_camera_callback_end_monotonic_sec": self._num(timing.get("camera_callback_end_monotonic_sec")),
+				"timing_camera_callback_duration_ms": self._num(timing.get("camera_callback_duration_ms")),
 				"timing_stage_bridge_ms": self._num(timing.get("stage_bridge_ms")),
 				"timing_stage_rotate_ms": self._num(timing.get("stage_rotate_ms")),
 				"timing_stage_show_camera_ms": self._num(timing.get("stage_show_camera_ms")),
@@ -271,23 +358,33 @@ class DiagnosticsWriter:
 				"timing_worker_optical_flow_ms": self._num(timing.get("worker_optical_flow_ms")),
 				"timing_ipc_in_ms": self._num(timing.get("ipc_in_ms")),
 				"timing_ipc_out_ms": self._num(timing.get("ipc_out_ms")),
-				"timing_frame_to_available_wall_ms": self._num(timing.get("frame_to_available_wall_ms")),
-				"timing_frame_to_command_wall_ms": self._num(timing.get("frame_to_command_wall_ms")),
-				"timing_vision_result_period_wall_ms": self._num(timing.get("vision_result_period_wall_ms")),
+				"timing_frame_to_available_ms": self._num(timing.get("frame_to_available_ms")),
+				"timing_frame_to_command_ms": self._num(timing.get("frame_to_command_ms")),
+				"timing_vision_result_period_ms": self._num(timing.get("vision_result_period_ms")),
 				"timing_vision_dropped_frames": self._int_or_blank(timing.get("vision_dropped_frames", -1)),
-				"timing_control_compute_start_wall_sec": self._num(timing.get("control_compute_start_wall_sec")),
-				"timing_control_compute_end_wall_sec": self._num(timing.get("control_compute_end_wall_sec")),
+				"timing_control_compute_start_monotonic_sec": self._num(timing.get("control_compute_start_monotonic_sec")),
+				"timing_control_compute_end_monotonic_sec": self._num(timing.get("control_compute_end_monotonic_sec")),
 				"timing_control_compute_duration_ms": self._num(timing.get("control_compute_duration_ms")),
-				"timing_control_period_wall_sec": self._num(timing.get("control_period_wall_sec")),
-				"timing_control_dt_vision_sec": self._num(timing.get("control_dt_vision_sec")),
-				"timing_flow_age_at_control_wall_ms": self._num(timing.get("flow_age_at_control_wall_ms")),
-				"timing_px4_publish_wall_sec": self._num(timing.get("px4_publish_wall_sec")),
-				"timing_px4_publish_period_wall_sec": self._num(timing.get("px4_publish_period_wall_sec")),
+				"timing_control_period_monotonic_sec": self._num(timing.get("control_period_monotonic_sec")),
+				"timing_control_dt_source_sec": self._num(timing.get("control_dt_source_sec")),
+				"timing_flow_age_at_control_ms": self._num(timing.get("flow_age_at_control_ms")),
+				"timing_px4_publish_period_monotonic_sec": self._num(timing.get("px4_publish_period_monotonic_sec")),
 				"timing_command_age_at_px4_publish_ms": self._num(timing.get("command_age_at_px4_publish_ms")),
-				"timing_flow_age_at_px4_publish_wall_ms": self._num(timing.get("flow_age_at_px4_publish_wall_ms")),
+				"timing_flow_age_at_px4_publish_ms": self._num(timing.get("flow_age_at_px4_publish_ms")),
 				"timing_px4_publish_count": self._int_or_blank(timing.get("px4_publish_count", -1)),
-				"timing_sim_rtf_estimate": self._num(timing.get("sim_rtf_estimate")),
-				"timing_px4_rtf_estimate": self._num(timing.get("px4_rtf_estimate")),
+				"timing_mavsdk_start_requested_monotonic_sec": self._num(timing.get("mavsdk_start_requested_monotonic_sec")),
+				"timing_mavsdk_worker_loop_started_monotonic_sec": self._num(timing.get("mavsdk_worker_loop_started_monotonic_sec")),
+				"timing_mavsdk_connected_monotonic_sec": self._num(timing.get("mavsdk_connected_monotonic_sec")),
+				"timing_mavsdk_health_ready_monotonic_sec": self._num(timing.get("mavsdk_health_ready_monotonic_sec")),
+				"timing_mavsdk_takeoff_commanded_monotonic_sec": self._num(timing.get("mavsdk_takeoff_commanded_monotonic_sec")),
+				"timing_mavsdk_takeoff_done_monotonic_sec": self._num(timing.get("mavsdk_takeoff_done_monotonic_sec")),
+				"timing_mavsdk_motor_stop_requested_monotonic_sec": self._num(timing.get("mavsdk_motor_stop_requested_monotonic_sec")),
+				"timing_mavsdk_motor_stop_picked_up_monotonic_sec": self._num(timing.get("mavsdk_motor_stop_picked_up_monotonic_sec")),
+				"timing_mavsdk_pre_motor_stop_done_monotonic_sec": self._num(timing.get("mavsdk_pre_motor_stop_done_monotonic_sec")),
+				"timing_mavsdk_disarm_attempted_monotonic_sec": self._num(timing.get("mavsdk_disarm_attempted_monotonic_sec")),
+				"timing_mavsdk_disarm_result_monotonic_sec": self._num(timing.get("mavsdk_disarm_result_monotonic_sec")),
+				"timing_mavsdk_kill_attempted_monotonic_sec": self._num(timing.get("mavsdk_kill_attempted_monotonic_sec")),
+				"timing_mavsdk_kill_result_monotonic_sec": self._num(timing.get("mavsdk_kill_result_monotonic_sec")),
 			})
 
 		# PX4 mode/arming: the ground truth for whether offboard is actually
@@ -296,12 +393,20 @@ class DiagnosticsWriter:
 		row["px4_arming_state"] = px4_arming_state if px4_arming_state is not None else ""
 		row["px4_failsafe"] = self._bool_int(px4_failsafe) if px4_failsafe is not None else ""
 
-		# Clock-family offsets (WALL - PX4) and (WALL - SIM), in seconds. These
-		# are diagnostics-only desync monitors: in healthy SITL they sit near a
-		# constant; visible drift means the uXRCE-DDS timesync or the sim clock
-		# is wandering relative to the wall clock the PX4 stream is stamped on.
-		row["px4_wall_offset_sec"] = self._num(px4_wall_offset_sec) if px4_wall_offset_sec is not None else ""
-		row["sim_wall_offset_sec"] = self._num(sim_wall_offset_sec) if sim_wall_offset_sec is not None else ""
+		# Clock-fit diagnostics. Raw pairs above remain authoritative.
+		if clock is not None:
+			for family in ("sim", "px4"):
+				snap = clock.get(family, {}) or {}
+				prefix = f"clock_{family}_"
+				row[prefix + "fit_sample_count"] = self._int_or_blank(snap.get("sample_count", -1))
+				row[prefix + "local_rate_per_wall"] = self._num(snap.get("local_rate"))
+				row[prefix + "run_rate_per_wall"] = self._num(snap.get("run_rate"))
+				row[prefix + "fit_wall_reference_sec"] = self._num(snap.get("fit_wall_reference_sec"))
+				row[prefix + "fit_source_reference_sec"] = self._num(snap.get("fit_source_reference_sec"))
+				row[prefix + "latest_fit_residual_source_sec"] = self._num(snap.get("latest_fit_residual_source_sec"))
+				row[prefix + "latest_source_timestamp_sec"] = self._num(snap.get("latest_source_sec"))
+				row[prefix + "latest_receipt_wall_timestamp_sec"] = self._num(snap.get("latest_receipt_wall_sec"))
+
 
 		self._writer.writerow(row)
 		if self._flush_every_row:
@@ -315,9 +420,24 @@ class DiagnosticsWriter:
 	@staticmethod
 	def _fieldnames():
 		return [
-			"t_sec",
-			"wall_timestamp",
-			"target_timestamp_sec",
+			"diagnostics_schema_version",
+			"log_elapsed_wall_sec",
+			"log_elapsed_monotonic_sec",
+			"log_write_wall_timestamp_sec",
+			"log_write_monotonic_timestamp_sec",
+			"camera_source_timestamp_sec",
+			"camera_message_count",
+			"camera_nonincreasing_stamp_drop_count",
+			"camera_source_clock",
+			"camera_receipt_wall_timestamp_sec",
+			"camera_receipt_monotonic_timestamp_sec",
+			"vision_frame_receipt_wall_timestamp_sec",
+			"vision_frame_receipt_monotonic_timestamp_sec",
+			"vision_result_available_monotonic_timestamp_sec",
+			"vision_result_available_wall_timestamp_sec",
+			"vision_result_count",
+			"vision_source_clock",
+			"target_source_timestamp_sec",
 			"target_found",
 			"target_confidence",
 			"target_offset_x",
@@ -326,7 +446,7 @@ class DiagnosticsWriter:
 			"target_detection_height_px",
 			"target_area_fraction",
 			"target_fov_saturated",
-			"flow_timestamp_sec",
+			"flow_source_timestamp_sec",
 			"flow_valid",
 			"flow_mean_x_px_s",
 			"flow_mean_y_px_s",
@@ -343,14 +463,25 @@ class DiagnosticsWriter:
 			"flow_roi_y0",
 			"flow_roi_x1",
 			"flow_roi_y1",
-			"command_timestamp_sec",
+			"command_source_flow_timestamp_sec",
+			"command_source_kind",
+			"command_source_clock",
+			"command_source_frame_receipt_wall_timestamp_sec",
+			"command_source_frame_receipt_monotonic_timestamp_sec",
+			"command_compute_wall_timestamp_sec",
+			"command_compute_monotonic_timestamp_sec",
 			"command_roll_rad",
 			"command_pitch_rad",
 			"command_yaw_rad",
 			"command_thrust",
 			"command_thrust_integral",
-			"vehicle_timestamp_sec",
-			"vehicle_px4_timestamp_sec",
+			"vehicle_local_position_publication_px4_timestamp_sec",
+			"vehicle_state_source",
+			"vehicle_state_frame",
+			"vehicle_local_position_sample_px4_timestamp_sec",
+			"vehicle_local_position_message_count",
+			"vehicle_local_position_receipt_wall_timestamp_sec",
+			"vehicle_local_position_receipt_monotonic_timestamp_sec",
 			"vehicle_x_m",
 			"vehicle_y_m",
 			"vehicle_z_m",
@@ -358,23 +489,54 @@ class DiagnosticsWriter:
 			"vehicle_vy_m_s",
 			"vehicle_vz_m_s",
 			"vehicle_yaw_rad",
-			"vehicle_attitude_timestamp_sec",
+			"vehicle_attitude_publication_px4_timestamp_sec",
+			"vehicle_attitude_sample_px4_timestamp_sec",
+			"vehicle_attitude_message_count",
+			"vehicle_attitude_receipt_wall_timestamp_sec",
+			"vehicle_attitude_receipt_monotonic_timestamp_sec",
+			"vehicle_angular_velocity_publication_px4_timestamp_sec",
+			"vehicle_angular_velocity_sample_px4_timestamp_sec",
+			"vehicle_angular_velocity_message_count",
+			"vehicle_angular_velocity_receipt_wall_timestamp_sec",
+			"vehicle_angular_velocity_receipt_monotonic_timestamp_sec",
+			"vehicle_status_publication_px4_timestamp_sec",
+			"vehicle_status_message_count",
+			"vehicle_status_receipt_wall_timestamp_sec",
+			"vehicle_status_receipt_monotonic_timestamp_sec",
 			"vehicle_roll_rad",
 			"vehicle_pitch_rad",
 			"vehicle_attitude_yaw_rad",
 			"vehicle_attitude_source",
+			"platform_pose_receipt_wall_timestamp_sec",
+			"platform_pose_source",
+			"platform_pose_frame",
+			"platform_pose_message_count",
+			"platform_pose_receipt_monotonic_timestamp_sec",
+			"platform_pose_estimated_sim_timestamp_sec",
+			"platform_velocity_dt_estimated_sim_sec",
+			"platform_velocity_source",
+			"platform_velocity_smoothing_tau_sim_sec",
 			"platform_x_m",
 			"platform_y_m",
 			"platform_z_m",
-			"platform_vx_m_s",
-			"platform_vy_m_s",
-			"platform_vz_m_s",
+			"platform_vx_derived_from_pose_m_s",
+			"platform_vy_derived_from_pose_m_s",
+			"platform_vz_derived_from_pose_m_s",
 			"relative_x_m",
+			"relative_motion_source",
+			"relative_velocity_source",
 			"relative_y_m",
 			"relative_z_m",
-			"relative_vx_m_s",
-			"relative_vy_m_s",
-			"relative_vz_m_s",
+			"relative_vx_composed_m_s",
+			"relative_vy_composed_m_s",
+			"relative_vz_composed_m_s",
+			"px4_publish_wall_timestamp_sec",
+			"px4_publish_timestamp_us",
+			"px4_publish_monotonic_timestamp_sec",
+			"touchdown_detected",
+			"touchdown_receipt_wall_timestamp_sec",
+			"touchdown_receipt_monotonic_timestamp_sec",
+			"touchdown_source",
 			"calibration_axis",
 			"mission_substate",
 			"mission_divergence_setpoint_1_s",
@@ -405,9 +567,9 @@ class DiagnosticsWriter:
 			"mission_probe_peak_decay_tau_sec",
 			"mission_probe_elapsed_sec",
 			"mission_probe_total_elapsed_sec",
-			"timing_camera_cb_start_wall_sec",
-			"timing_camera_cb_end_wall_sec",
-			"timing_camera_cb_duration_ms",
+			"timing_camera_callback_start_monotonic_sec",
+			"timing_camera_callback_end_monotonic_sec",
+			"timing_camera_callback_duration_ms",
 			"timing_stage_bridge_ms",
 			"timing_stage_rotate_ms",
 			"timing_stage_show_camera_ms",
@@ -418,28 +580,52 @@ class DiagnosticsWriter:
 			"timing_worker_optical_flow_ms",
 			"timing_ipc_in_ms",
 			"timing_ipc_out_ms",
-			"timing_frame_to_available_wall_ms",
-			"timing_frame_to_command_wall_ms",
-			"timing_vision_result_period_wall_ms",
+			"timing_frame_to_available_ms",
+			"timing_frame_to_command_ms",
+			"timing_vision_result_period_ms",
 			"timing_vision_dropped_frames",
-			"timing_control_compute_start_wall_sec",
-			"timing_control_compute_end_wall_sec",
+			"timing_control_compute_start_monotonic_sec",
+			"timing_control_compute_end_monotonic_sec",
 			"timing_control_compute_duration_ms",
-			"timing_control_period_wall_sec",
-			"timing_control_dt_vision_sec",
-			"timing_flow_age_at_control_wall_ms",
-			"timing_px4_publish_wall_sec",
-			"timing_px4_publish_period_wall_sec",
+			"timing_control_period_monotonic_sec",
+			"timing_control_dt_source_sec",
+			"timing_flow_age_at_control_ms",
+			"timing_px4_publish_period_monotonic_sec",
 			"timing_command_age_at_px4_publish_ms",
-			"timing_flow_age_at_px4_publish_wall_ms",
+			"timing_flow_age_at_px4_publish_ms",
 			"timing_px4_publish_count",
-			"timing_sim_rtf_estimate",
-			"timing_px4_rtf_estimate",
+			"timing_mavsdk_start_requested_monotonic_sec",
+			"timing_mavsdk_worker_loop_started_monotonic_sec",
+			"timing_mavsdk_connected_monotonic_sec",
+			"timing_mavsdk_health_ready_monotonic_sec",
+			"timing_mavsdk_takeoff_commanded_monotonic_sec",
+			"timing_mavsdk_takeoff_done_monotonic_sec",
+			"timing_mavsdk_motor_stop_requested_monotonic_sec",
+			"timing_mavsdk_motor_stop_picked_up_monotonic_sec",
+			"timing_mavsdk_pre_motor_stop_done_monotonic_sec",
+			"timing_mavsdk_disarm_attempted_monotonic_sec",
+			"timing_mavsdk_disarm_result_monotonic_sec",
+			"timing_mavsdk_kill_attempted_monotonic_sec",
+			"timing_mavsdk_kill_result_monotonic_sec",
 			"px4_nav_state",
 			"px4_arming_state",
 			"px4_failsafe",
-			"px4_wall_offset_sec",
-			"sim_wall_offset_sec",
+			"clock_sim_fit_sample_count",
+			"clock_sim_local_rate_per_wall",
+			"clock_sim_run_rate_per_wall",
+			"clock_sim_fit_wall_reference_sec",
+			"clock_sim_fit_source_reference_sec",
+			"clock_sim_latest_fit_residual_source_sec",
+			"clock_sim_latest_source_timestamp_sec",
+			"clock_sim_latest_receipt_wall_timestamp_sec",
+			"clock_px4_fit_sample_count",
+			"clock_px4_local_rate_per_wall",
+			"clock_px4_run_rate_per_wall",
+			"clock_px4_fit_wall_reference_sec",
+			"clock_px4_fit_source_reference_sec",
+			"clock_px4_latest_fit_residual_source_sec",
+			"clock_px4_latest_source_timestamp_sec",
+			"clock_px4_latest_receipt_wall_timestamp_sec",
 		]
 
 	@staticmethod

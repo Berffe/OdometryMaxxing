@@ -80,6 +80,96 @@
 	</joint>
 	<!-- BELLY CAMERA SENSOR ADDITION -->
 
+	<!-- LANDING-GEAR CONTACT SENSOR, kept ENTIRELY in the bee model so the stock
+	     x500_base is never edited (upstream PX4/ArduPilot updates then cannot clobber
+	     it). A contact sensor must live inside a link, and merge-include does not let
+	     us re-open the base's base_link from here, so detection lives on its own
+	     massless link fixed to base_link. Its two collision pads sit at the skid
+	     undersides (base_link_collision_3/_4: y=+/-0.132, underside z=-0.227), so
+	     they register contact at the same instant the real skids do. The pads are
+	     thin and their inertia is negligible, so they do not change the landing
+	     dynamics: a sensing surface co-located with the gear, not a second leg. -->
+	<link name="bee_gear_contact_link">
+		<pose relative_to="base_link">0 0 0 0 0 0</pose>
+		<!-- Mass/inertia matched to the CAMERA link's proven-working scale
+		     (mass=0.02, inertia~1e-5), not the near-zero value tried first
+		     (mass=1e-4, inertia~1e-8). Near-zero mass is the prime suspect for the
+		     sensor never publishing at all (confirmed via `gz topic -e`: no data
+		     even with the drone stationary on the ground, where the pads are
+		     certainly overlapping it). A fixed-jointed child link with near-
+		     singular inertia can be dropped from the physics engine's active pose
+		     updates – frozen at spawn pose instead of tracking base_link – so its
+		     collisions never geometrically reach the ground or deck and no
+		     contact is possible, matching exactly what was observed. Still light
+		     enough (0.02 kg, ~0.8% of the ~2.5 kg airframe) to be dynamically
+		     negligible.-->
+		<inertial>
+			<mass>0.02</mass>
+			<inertia>
+				<ixx>1e-5</ixx><iyy>1e-5</iyy><izz>1e-5</izz>
+				<ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+			</inertia>
+		</inertial>
+		<collision name="bee_gear_pad_left">
+			<pose>0 -0.132 -0.2225 0 0 0</pose>
+			<geometry><box><size>0.25 0.015 0.010</size></box></geometry>
+			<surface>
+				<contact><ode><min_depth>0.001</min_depth><max_vel>0</max_vel></ode></contact>
+			</surface>
+		</collision>
+		<collision name="bee_gear_pad_right">
+			<pose>0 0.132 -0.2225 0 0 0</pose>
+			<geometry><box><size>0.25 0.015 0.010</size></box></geometry>
+			<surface>
+				<contact><ode><min_depth>0.001</min_depth><max_vel>0</max_vel></ode></contact>
+			</surface>
+		</collision>
+		<!-- TWO single-collision sensors, not one sensor watching both pads.
+		     gz-sim's contact-sensor system splits a <sensor> that lists more than
+		     one <collision> into separate per-collision sensors with distinct
+		     auto-generated names (observed: landing_gear_contact_sensor_left /
+		     _right). Splitting explicitly here keeps that naming under our
+		     control and keeps each pad's contacts unambiguous (left vs right),
+		     which matters for future diagnostics even though – see below –
+		     the SDF <topic> tag turned out not to route real data either way. -->
+		<!-- NO <topic> override here – REMOVED after live testing. Confirmed
+		     (via `gz topic -e` on both) that contact-type sensors in this gz-sim
+		     version do NOT publish real data on an SDF <topic> override, single-
+		     or multi-collision alike: the override merely advertises an extra,
+		     permanently-empty alias topic, which is worse than no override (it
+		     looks like a working topic and is not). Real data only ever appears
+		     on gz-sim's AUTO-GENERATED per-sensor topic, of the form
+		         /world/<world>/model/<model-instance>/link/<link>/sensor/<sensor>/contact
+		     which embeds the model INSTANCE name (bee_x500_0, _1, ... per
+		     PX4_INSTANCE / spawn count). Bridge THAT topic and remap it to a clean
+		     name on the ROS side instead – see bee_node.py's GEAR_CONTACTS_*_TOPIC
+		     comment for the exact bridge invocation. bee_node.py itself is
+		     unaffected: it still subscribes to /bee/gear_contacts/left|right; only
+		     where that name comes from changes (ROS-side remap, not gz-side
+		     <topic>). -->
+		<sensor name="landing_gear_contact_sensor_left" type="contact">
+			<gz_frame_id>base_link</gz_frame_id>
+			<always_on>1</always_on>
+			<update_rate>250</update_rate>
+			<contact>
+				<collision>bee_gear_pad_left</collision>
+			</contact>
+		</sensor>
+		<sensor name="landing_gear_contact_sensor_right" type="contact">
+			<gz_frame_id>base_link</gz_frame_id>
+			<always_on>1</always_on>
+			<update_rate>250</update_rate>
+			<contact>
+				<collision>bee_gear_pad_right</collision>
+			</contact>
+		</sensor>
+	</link>
+	<joint name="bee_gear_contact_joint" type="fixed">
+		<parent>base_link</parent>
+		<child>bee_gear_contact_link</child>
+	</joint>
+
+
 	<plugin filename="gz-sim-multicopter-motor-model-system"
 	name="gz::sim::systems::MulticopterMotorModel">
 	<jointName>rotor_0_joint</jointName>

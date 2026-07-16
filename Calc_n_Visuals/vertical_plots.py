@@ -691,17 +691,17 @@ if __name__ == "__main__":
 
 		# Use 0.0 for hover/probe interpretation.
 		# Use your descent D* value, e.g. 0.30, for descent frozen-point analysis.
-		divergence_op_1_s=0.0,
+		divergence_op_1_s=0,
 
 		# Compare your last two tested gains.
-		gain_values=(1.5, 6.5, 20),
+		gain_values=(1.5, 2.5, 6.5, 20),
 
 		# Effective discrete time/dead-time.
 		# This should represent the visual-control sample/effective correction time.
 		sample_time_s=0.05,
 
 		# Add delay samples here to see how quickly margins degrade.
-		delay_samples=0,
+		delay_samples=5,
 
 		# Last test: 0.4 Hz, 0.1 m platform.
 		platform_frequency_hz=0.4,

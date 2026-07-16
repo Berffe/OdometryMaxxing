@@ -134,6 +134,16 @@ class MavsdkWorker:
 		self.timing_kill_attempted = None
 		self.timing_kill_result = None
 
+		# Takeoff-side milestones on the same monotonic clock. These let the CSV
+		# separate MAVSDK connection/health/settling/climb time from the later ROS
+		# offboard handoff without mixing in PX4, SIM, or epoch-wall timestamps.
+		self.timing_start_requested = None
+		self.timing_worker_loop_started = None
+		self.timing_connected = None
+		self.timing_health_ready = None
+		self.timing_takeoff_commanded = None
+		self.timing_takeoff_done = None
+
 	# ---- node-facing controls ------------------------------------------------
 	def start(self) -> None:
 		"""Spawn the worker thread (idempotent). Sets takeoff_error instead of
@@ -144,6 +154,7 @@ class MavsdkWorker:
 			self.takeoff_error = "mavsdk is not installed in this Python environment"
 			return
 		self.takeoff_started = True
+		self.timing_start_requested = time.monotonic()
 		self._logger.info(f"Starting MAVSDK takeoff to {self._takeoff_altitude_m:.2f} m.")
 		self._thread = threading.Thread(
 			target=self._run_thread, name="mavsdk_takeoff", daemon=True
@@ -186,6 +197,7 @@ class MavsdkWorker:
 		# from the node's thread (see _wake()).
 		self._wake_event = asyncio.Event()
 		self._loop = asyncio.get_running_loop()
+		self.timing_worker_loop_started = time.monotonic()
 
 		self._free_port(self._port_to_free)
 		drone = System()
@@ -199,6 +211,7 @@ class MavsdkWorker:
 			"MAVSDK connection",
 		)
 		self._logger.info("MAVSDK: connected.")
+		self.timing_connected = time.monotonic()
 
 		self._logger.info("MAVSDK: waiting for global/home/local position estimates...")
 		await self._wait_for_condition(
@@ -208,6 +221,7 @@ class MavsdkWorker:
 			"global/home/local position health",
 		)
 		self._logger.info("MAVSDK: all position estimates OK.")
+		self.timing_health_ready = time.monotonic()
 
 		await asyncio.sleep(self._ekf2_settle)
 		home_position = await self._wait_for_condition(
@@ -227,6 +241,7 @@ class MavsdkWorker:
 		await drone.action.arm()
 		self._logger.info("MAVSDK: takeoff command.")
 		await drone.action.takeoff()
+		self.timing_takeoff_commanded = time.monotonic()
 
 		await self._wait_for_condition(
 			drone.telemetry.position(),
@@ -240,6 +255,7 @@ class MavsdkWorker:
 		)
 		self._logger.info("MAVSDK: reached takeoff altitude; hovering.")
 		self.takeoff_done = True
+		self.timing_takeoff_done = time.monotonic()
 
 		# MAVSDK is kept only for takeoff and terminal motor-stop actions.
 		# Closed-loop attitude/thrust setpoints are published directly to PX4 via

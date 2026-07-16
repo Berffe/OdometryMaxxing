@@ -154,12 +154,18 @@
 		</surface>
 	</collision>
 
-	<!-- Contact sensor used by Gazebo's TouchPlugin to detect a real touchdown.
-	     It is attached to the platform collision, so we don't need to know the
-	     landing-gear collision names inside the included bee_x500/x500_base model. -->
+	<!-- Contact sensor feeding the TouchPlugin below. Detection is keyed on the
+	     DRONE'S LANDING GEAR: TouchPlugin's target is the gear pads
+	     (bee_gear_pad_*, defined on the drone in model.sdf), so this fires only
+	     when the deck touches a skid pad – not a rotor, not the belly. The sensor
+	     lives here because gz-sim's TouchPlugin reads contact data from collisions
+	     in its OWN model, and a drone-side plugin did not reliably see the pads'
+	     contact data (it left touchdown never latching); platform-side is the
+	     configuration that provably publishes. The sensing SURFACE is still the
+	     drone's gear – only the plugin that watches it lives here. -->
 	<sensor name="deck_contact_sensor" type="contact">
 		<always_on>1</always_on>
-		<update_rate>100</update_rate>
+		<update_rate>250</update_rate>
 		<contact>
 			<collision>collision</collision>
 		</contact>
@@ -198,20 +204,38 @@
 		<y_frequency>0.0</y_frequency>
 		<y_phase>0.0</y_phase>
 
-		<z_amplitude>0.3</z_amplitude>
-		<z_frequency>0.3</z_frequency>
+		<z_amplitude>0.8</z_amplitude>
+		<z_frequency>0.1</z_frequency>
 		<z_phase>0.0</z_phase>
+
+		<!-- Deck is a dynamic body held on its sinusoid by a velocity-tracking
+		     force (see MovingPlatformController.cpp PreUpdate), so landing-gear
+		     contact produces a real normal force and the drone stops at the
+		     surface. These gains are optional overrides of the plugin defaults;
+		     velocity_tracking_gain trades servo stiffness (hold the sinusoid)
+		     against contact compliance (let the deck deflect a few mm rather than
+		     ignore the drone). -->
+		<velocity_tracking_gain>50.0</velocity_tracking_gain>
+		<fallback_mass_kg>1000.0</fallback_mass_kg>
+		<gravity_magnitude>9.8</gravity_magnitude>
 	</plugin>
 
-	<!-- Publishes /bee_platform/touched as gz.msgs.Boolean once the platform
-	     contact sensor has touched the bee_x500 model continuously for 0.15 s.
-	     The target string is intentionally broad: it should match bee_x500,
-	     bee_x500_0, and scoped collision names containing the model name. -->
+	<!-- LEGACY / FALLBACK touchdown path. The PRIMARY detection is now bee_node
+	     reading the drone's raw gear-pad contact stream directly
+	     (model.sdf landing_gear_contact_sensor -> /bee/gear_contacts ->
+	     ros_gz_bridge Contacts -> bee_node.on_gear_contacts, filtered to
+	     collisions named *bee_platform*). That path was adopted after TouchPlugin
+	     failed to publish from the drone side; the raw stream is verified working
+	     and carries the contacted collision's name, so the node does its own
+	     platform filtering. This plugin is kept only as a redundant Bool fallback
+	     on the same /bee_platform/touched topic bee_node already subscribes to;
+	     if it also fires, the touchdown latch is idempotent and the first wins.
+	     <target>bee_gear_pad</target> scopes it to the drone's skid pads. -->
 	<plugin filename="gz-sim-touchplugin-system"
 		name="gz::sim::systems::TouchPlugin">
-		<target>bee_x500</target>
+		<target>bee_gear_pad</target>
 		<namespace>bee_platform</namespace>
-		<time>0.01</time>
+		<time>0.0</time>
 		<enabled>true</enabled>
 	</plugin>
 	</model>

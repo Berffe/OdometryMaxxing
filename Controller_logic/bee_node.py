@@ -1,4 +1,5 @@
 import contextlib
+from collections import OrderedDict
 import math
 import multiprocessing as mp
 import os
@@ -24,6 +25,11 @@ except ImportError:
 from sensor_msgs.msg import Image
 from geometry_msgs.msg import Pose
 from std_msgs.msg import Bool
+
+try:
+	from ros_gz_interfaces.msg import Contacts as GzContacts
+except ImportError:  # bridge package absent: legacy Bool touchdown path still works
+	GzContacts = None
 from px4_msgs.msg import (
 	VehicleLocalPosition,
 	VehicleAttitude,
@@ -337,9 +343,9 @@ NEAR_FIELD_HEIGHT_M = 0.40
 # 2. PX4_SETPOINT_PERIOD_SEC (defined above): the ROS WALL-clock timer that
 #    actually publishes to PX4. This is a genuine hardware period (a fixed
 #    ROS timer, not gated to the vision/sim clock -- confirmed against logs:
-#    timing_px4_publish_period_wall_sec tracks 0.05s regardless of
-#    timing_sim_rtf_estimate), so no RTF correction is needed for it, unlike
-#    timing_control_period_wall_sec (which IS inflated by RTF and must never
+#    timing_px4_publish_period_monotonic_sec tracks the configured cadence
+#    regardless of clock_sim_local_rate_per_wall, so no RTF correction is
+#    needed for it, unlike a SIM-time interval (which IS inflated by RTF and must never
 #    feed this estimate). It matters because a fresh vision-driven correction
 #    can only reach the actuator at the rate of WHICHEVER TIMER IS SLOWER: if
 #    the camera produces a new estimate faster than PX4_SETPOINT_PERIOD_SEC,
@@ -397,15 +403,25 @@ CAMERA_HEIGHT_PX = 80
 # log can print an honest wall-time estimate instead of leaving the operator
 # to discover it empirically (as "15 seconds" quietly becoming ~75). Measure
 # your own RTF with analyse_log.py's estimate_rtf() on a recent log, or from
-# the sim_wall_offset_sec drift, and update this if your machine/scene load
+# clock_sim_run_rate_per_wall, and update this if your machine/scene load
 # changes meaningfully -- a stale value only misleads the printed estimate,
 # it cannot affect flight behavior.
 EXPECTED_SIM_RTF = 0.2
 
-# Vehicle's own ground/landing-gear clearance, in meters -- the feasibility
-# gate's threshold for h_crit. PLACEHOLDER: set this from the actual airframe
-# geometry before flying for real; 0.20 m is not derived from anything here.
-LEG_CLEARANCE_M = 0.20
+# The feasibility gate's threshold for h_crit: the CAMERA's height above the deck
+# surface at the instant the landing skids touch it. Camera-referenced on purpose
+# -- h_crit comes out of the divergence dynamics, and divergence D = -v_cam/h_cam
+# is a property of the CAMERA, so the height the gate reasons about is the
+# camera's, not base_link's or the feet's. At skid contact the camera sits
+# camera-above-feet above the surface:
+#   0.227 (base_link -> feet, model_base.sdf base_link_collision_3/_4)
+# - 0.045 (base_link -> camera, model.sdf bee_camera_link pose)
+# = 0.182 m
+# (Contrast platform_motion.DRONE_BELLY_OFFSET_M = 0.227, which is base->feet and
+# is used to place the DIAGNOSTIC relative_z at the belly -- a different reference
+# for a different job. Do not unify them.)
+# Was 0.20 m, an explicit "not derived from anything" placeholder.
+LEG_CLEARANCE_M = 0.182
 
 # FIRST-BRINGUP KNOB. True -> the mission runs the D*=0 probe, computes and logs
 # k_min / h_crit / feasibility, then HOLDS hover indefinitely without ever
@@ -513,16 +529,63 @@ VEHICLE_STATUS_TOPICS = (
 	"/fmu/out/vehicle_status",
 )
 
-# Real pose telemetry is noisy/jittery sample-to-sample; smooth the finite-
-# differenced velocity the same way OpticalFlowEstimator smooths divergence
-# (see optical_flow.py's module docstring for the same underlying argument).
-PLATFORM_VELOCITY_SMOOTHING = 0.7
+# Diagnostics-only platform velocity is obtained by differentiating the
+# unstamped pose on its estimated SIM axis. Smooth that derivative with a
+# time-constant, not a per-sample alpha, so irregular callback spacing does not
+# silently change the filter dynamics.
+PLATFORM_VELOCITY_SMOOTHING_TAU_SIM_SEC = 0.06
 
 # Touchdown bridge. The Gazebo side is published by TouchPlugin in
 # bee_platform.sdf. Bridge it with:
 #   ros2 run ros_gz_bridge parameter_bridge \
 #       /bee_platform/touched@std_msgs/msg/Bool@gz.msgs.Boolean
 TOUCHDOWN_TOPIC = "/bee_platform/touched"
+
+# PRIMARY touchdown source: the drone's own landing-gear contact sensors, bridged
+# raw. TWO sensors, one per pad (model.sdf: bee_gear_contact_link).
+#
+# IMPORTANT, found by live testing (not documented anywhere): gz-sim's
+# contact-type sensors do NOT publish real data on an SDF <topic> override in
+# this gz-sim version -- confirmed via `gz topic -e` on both the override and
+# the default: the override sat permanently empty while the AUTO-GENERATED
+# per-sensor topic carried real contact messages the whole time. So model.sdf
+# no longer sets <topic> on these sensors at all (a non-functional override that
+# LOOKS like a working topic in `gz topic -l` is worse than none). The real, live
+# topics are gz-sim's default per-sensor path:
+#   /world/<world>/model/<model-instance>/link/bee_gear_contact_link/sensor/landing_gear_contact_sensor_left/contact
+#   /world/<world>/model/<model-instance>/link/bee_gear_contact_link/sensor/landing_gear_contact_sensor_right/contact
+# which embeds the WORLD name (bee_platform) and the model INSTANCE name
+# (bee_x500_0, _1, ... -- one per PX4_INSTANCE / spawn count; stable for a
+# single-vehicle SITL launch, but re-check if you ever spawn more than one).
+#
+# Rather than have bee_node depend on that long, instance-suffixed path
+# directly, the clean short names below (GEAR_CONTACTS_LEFT_TOPIC / _RIGHT_TOPIC)
+# are applied as a ROS-SIDE REMAP in the bridge command, not as a gz-side
+# <topic>. All bridge lines (camera, platform pose, legacy touchdown Bool, and
+# both gear-contact remaps) now live in ONE place: bridge.sh at the repo root --
+# run that instead of hand-typing parameter_bridge invocations. It exists
+# because a hand-typed multi-line bridge command has twice silently lost a
+# line (once the gear topics, once platform/pose) with no error, just a topic
+# that quietly has zero publishers -- exactly the failure bee_node's own
+# startup warnings for /platform/pose and the touchdown topics are trying to
+# catch after the fact. One script removes the class of bug, not just this
+# instance of it.
+#
+# Reference (bridge.sh is authoritative; keep this comment in sync with it):
+#   GZ_TOPIC="/world/bee_platform/model/bee_x500_0/link/bee_gear_contact_link/sensor/landing_gear_contact_sensor_left/contact"
+#   ros2 run ros_gz_bridge parameter_bridge \
+#     "${GZ_TOPIC}@ros_gz_interfaces/msg/Contacts[gz.msgs.Contacts" \
+#     --ros-args -r "${GZ_TOPIC}:=/bee/gear_contacts/left"
+#   (note: single @ then [ for a GZ->ROS-only bridge -- NOT @twice, which is
+#   the bidirectional form and not what any topic here needs.)
+#
+# Each Contact names BOTH collisions, so bee_node itself decides what counts as
+# touchdown: a gear pad touching a collision whose scoped name contains
+# TOUCHDOWN_TARGET_SUBSTRING. Contact with anything else (ground plane at spawn,
+# in particular) is ignored by the name filter.
+GEAR_CONTACTS_LEFT_TOPIC = "/bee/gear_contacts/left"
+GEAR_CONTACTS_RIGHT_TOPIC = "/bee/gear_contacts/right"
+TOUCHDOWN_TARGET_SUBSTRING = "bee_platform"
 TOUCHDOWN_STATUS_TOPIC = "/bee_land/touchdown"
 ENABLE_TOUCHDOWN_MOTOR_STOP = True
 # SITL fallback: if PX4 refuses a normal disarm because its internal land
@@ -567,29 +630,49 @@ class BeeLandNode(Node):
 		# subsystem (px4_interface included) shares one definition of each
 		# clock family -- see clock.py.
 		self.time = TimeManager(self)
-		self._node_start_time = self.time.wall_sec()
+		self._node_start_steady = self.time.monotonic_sec()
 		self.bridge = CvBridge()
 		self._vehicle_state = VehicleState()
+		self._vehicle_local_position_receipt_wall_sec = None
+		self._vehicle_local_position_receipt_monotonic_sec = None
+		self._vehicle_local_position_sample_px4_sec = None
+		self._vehicle_attitude_receipt_wall_sec = None
+		self._vehicle_attitude_receipt_monotonic_sec = None
+		self._vehicle_attitude_sample_px4_sec = None
+		self._vehicle_angular_velocity_source_px4_sec = None
+		self._vehicle_angular_velocity_sample_px4_sec = None
+		self._vehicle_angular_velocity_receipt_wall_sec = None
+		self._vehicle_angular_velocity_receipt_monotonic_sec = None
 
 		# Platform pose (dedicated bridge -> on_platform_pose): exact
 		# world-frame position each message, finite-differenced into a
-		# smoothed velocity (see PLATFORM_VELOCITY_SMOOTHING). None until the
+		# smoothed velocity (see PLATFORM_VELOCITY_SMOOTHING_TAU_SIM_SEC). None until the
 		# first message arrives, or forever if PLATFORM_POSE_TOPIC is None --
 		# diagnostics rows just get empty platform_*/relative_* fields.
 		self._platform_state = None
-		self._prev_platform_pose_t = None
+		self._prev_platform_pose_sim_estimate_sec = None
 		self._prev_platform_pose_xyz = None
 		self._platform_velocity_filtered = (0.0, 0.0, 0.0)
 		self._has_filtered_platform_velocity = False
+		self._platform_pose_receipt_wall_sec = None
+		self._platform_pose_receipt_monotonic_sec = None
+		self._platform_pose_estimated_sim_sec = None
+		self._platform_velocity_dt_sim_estimated_sec = None
+		self._platform_velocity_source = "unavailable"
 		self._platform_pose_count = 0
 		self._platform_pose_stall_logged = False
 
 		self._latest_flow = None
+		self._latest_flow_source_clock = ""
+		self._vision_result_count = 0
+		self._latest_vision_bundle = None
+		self._diagnostics_vision_bundle = None
 		self._latest_frame = None
 		self._latest_target = TargetEstimate()
 
 		self.control_law = ControlLaw()
 		self._latest_setpoint = AttitudeSetpoint(thrust=self.control_law.hover_thrust)
+		self._latest_setpoint_source_kind = "initial_hover"
 
 		# Probe -> gate -> scheduled-gain descent for the moving-platform
 		# landing -- see mission_routine.py's module docstring. Parameterizes
@@ -630,15 +713,19 @@ class BeeLandNode(Node):
 		self._latest_mission_control = None
 
 		self._have_local_position = False
+		self._vehicle_local_position_count = 0
 		self._have_vehicle_attitude = False
 		self._vehicle_attitude_count = 0
+		self._vehicle_angular_velocity_count = 0
+		self._vehicle_status_count = 0
 		self._image_count = 0
+		self._camera_nonincreasing_stamp_drop_count = 0
 		self._last_image_log_time = 0.0
 		self._last_position_log_time = 0.0
 		self._last_attitude_log_time = 0.0
 
 		self._mission_phase = PHASE_WAITING_FOR_STREAMS
-		self._phase_start_time = self.time.wall_sec()
+		self._phase_start_time = self.time.monotonic_sec()
 		self._streams_ready_logged = False
 		self._closed_loop_logged = False
 		self._lost_target_since = None
@@ -658,11 +745,15 @@ class BeeLandNode(Node):
 		# actually produced a new command.
 		self._last_controlled_flow_timestamp = None
 
-		# Wall-clock latency diagnostics. These do not feed the controller; they
+		# Monotonic-clock latency diagnostics. These do not feed the controller; they
 		# only tell us whether delay comes from vision processing, control polling,
 		# the fixed PX4 publication cadence, or simulator real-time factor.
-		self._latest_camera_cb_start_wall = None
-		self._latest_camera_cb_end_wall = None
+		self._latest_camera_source_timestamp_sec = None
+		self._latest_camera_source_clock = ""
+		self._latest_camera_receipt_wall_sec = None
+		self._latest_camera_receipt_monotonic_sec = None
+		self._latest_camera_cb_start_monotonic = None
+		self._latest_camera_cb_end_monotonic = None
 		self._latest_camera_cb_duration_ms = None
 		# Per-stage breakdown of on_camera, added to find which stage actually
 		# owns camera_cb_duration_ms's ~40-200ms wall-clock cost -- isolated
@@ -708,24 +799,39 @@ class BeeLandNode(Node):
 		# Frame-arrival wall time of the flow currently in _latest_flow, carried
 		# across the process boundary so on_control_timer can close the
 		# frame->command measurement when this sample actually produces a command.
-		self._latest_flow_frame_wall = None
-		self._prev_vision_result_frame_wall = None
-		self._last_control_compute_start_wall = None
-		self._last_control_compute_end_wall = None
+		self._vision_frame_receipts = OrderedDict()
+		self._vision_receipt_lock = threading.Lock()
+		self._latest_flow_frame_receipt_wall_sec = None
+		self._latest_flow_frame_receipt_monotonic_sec = None
+		self._latest_vision_result_available_monotonic_sec = None
+		self._latest_vision_result_available_wall_sec = None
+		self._prev_vision_result_frame_monotonic = None
+		self._last_control_compute_start_wall_sec = None
+		self._last_control_compute_start_monotonic_sec = None
+		self._last_control_compute_end_wall_sec = None
+		self._last_control_compute_end_monotonic_sec = None
 		self._last_control_compute_duration_ms = None
-		self._last_control_period_wall_sec = None
+		self._last_control_period_monotonic_sec = None
 		self._last_control_dt_vision_sec = None
-		self._latest_setpoint_compute_wall = None
+		self._latest_setpoint_compute_wall_sec = None
+		self._latest_setpoint_compute_monotonic_sec = None
 		self._latest_setpoint_flow_timestamp = None
-		self._prev_px4_publish_wall = None
-		self._last_px4_publish_wall = None
-		self._last_px4_publish_period_wall_sec = None
+		self._latest_setpoint_source_clock = ""
+		self._latest_setpoint_source_frame_receipt_wall_sec = None
+		self._latest_setpoint_source_frame_receipt_monotonic_sec = None
+		self._last_control_flow_age_ms = None
+		self._prev_px4_publish_monotonic_sec = None
+		self._last_px4_publish_wall_sec = None
+		self._last_px4_publish_timestamp_us = None
+		self._last_px4_publish_monotonic_sec = None
+		self._last_px4_publish_period_monotonic_sec = None
 		self._last_px4_command_age_ms = None
 		self._last_px4_flow_age_ms = None
 		self._px4_publish_count = 0
 
 		self._control_dt_fallback_logged = False
-		self._image_stamp_fallback_logged = False
+		self._camera_zero_stamp_logged = False
+		self._camera_missing_stamp_logged = False
 
 		# MAVSDK subsystem (takeoff + terminal motor-stop), extracted into its own
 		# thread/event-loop module. The node reads worker.takeoff_done/error and
@@ -754,6 +860,9 @@ class BeeLandNode(Node):
 		self._px4_nav_state = None
 		self._px4_arming_state = None
 		self._px4_failsafe = None
+		self._vehicle_status_source_px4_sec = None
+		self._vehicle_status_receipt_wall_sec = None
+		self._vehicle_status_receipt_monotonic_sec = None
 		self._px4_offboard_confirmed = False
 		self._px4_offboard_reengage_count = 0
 		self._last_nav_state_logged = None
@@ -761,7 +870,9 @@ class BeeLandNode(Node):
 		# Touchdown is a mission-level terminal event, not a visual-control input.
 		# The contact signal comes from Gazebo/TouchPlugin through ros_gz_bridge.
 		self._touchdown_detected = False
-		self._touchdown_time = None
+		self._touchdown_receipt_wall_sec = None
+		self._touchdown_receipt_monotonic_sec = None
+		self._touchdown_source = ""
 		self._touchdown_message_count = 0
 
 		# Optical-flow de-rotation (see derotation.py). CameraGeometry derives
@@ -901,6 +1012,28 @@ class BeeLandNode(Node):
 			self.on_touchdown,
 			camera_qos,
 		)
+		# PRIMARY: raw gear-pad contacts, one subscription per pad (see above). The
+		# legacy Bool
+		# subscription above stays as a fallback -- both funnel into the same
+		# latched touchdown state, and the first to fire wins (idempotent).
+		if GzContacts is not None:
+			for topic in (GEAR_CONTACTS_LEFT_TOPIC, GEAR_CONTACTS_RIGHT_TOPIC):
+				self.create_subscription(
+					GzContacts,
+					topic,
+					self.on_gear_contacts,
+					camera_qos,
+				)
+			self.get_logger().info(
+				f"Gear-contact touchdown detection enabled: "
+				f"{GEAR_CONTACTS_LEFT_TOPIC}, {GEAR_CONTACTS_RIGHT_TOPIC} "
+				f"(touchdown = pad contact with '*{TOUCHDOWN_TARGET_SUBSTRING}*')."
+			)
+		else:
+			self.get_logger().warning(
+				"ros_gz_interfaces not available: raw gear-contact touchdown "
+				f"disabled; relying on the legacy {TOUCHDOWN_TOPIC} Bool only."
+			)
 		self._publish_touchdown_status(False)
 		self.get_logger().info(
 			f"Touchdown detection enabled: listening on {TOUCHDOWN_TOPIC}. "
@@ -974,7 +1107,7 @@ class BeeLandNode(Node):
 			"longer blocks the control/setpoint timers on vision."
 		)
 
-	def _ship_frame_to_vision(self, frame, timestamp, body_rates, frame_wall):
+	def _ship_frame_to_vision(self, frame, timestamp, body_rates, frame_receipt_wall):
 		"""Hand one camera frame to the vision worker. Non-blocking.
 
 		If the worker is momentarily behind and the shallow input queue is full,
@@ -984,15 +1117,16 @@ class BeeLandNode(Node):
 		works in px/s off each frame's own timestamp, so a skipped frame simply
 		widens the baseline for the next one.
 
-		frame_wall is this process's wall clock at frame arrival; it rides along
+		frame_receipt_wall is the raw SYSTEM wall receipt timestamp. It rides along
 		and is echoed back in the VisionResult so the drain thread can measure
-		the true frame->available round trip. ship_perf is a perf_counter taken
+		which source frame a result belongs to. Durations do NOT use this field;
+		ship_perf is a perf_counter taken
 		right before the put, used by the worker to measure the inbound IPC leg
 		(A-instrumentation) -- perf_counter is a shared monotonic clock across
 		processes on Linux, so worker_recv - ship_perf is a valid duration.
 		"""
 		ship_perf = time.perf_counter()
-		payload = (frame, timestamp, body_rates, frame_wall, ship_perf)
+		payload = (frame, timestamp, body_rates, frame_receipt_wall, ship_perf)
 		try:
 			self._vision_in_q.put_nowait(payload)
 		except queue.Full:
@@ -1062,32 +1196,64 @@ class BeeLandNode(Node):
 			+ ipc_out_ms
 		)
 
-		# Effective processed-frame period: gap between the arrival wall-times of
-		# consecutive results the worker actually returned. If this grows well
-		# past the camera period, the worker is not keeping up and _latest_flow
-		# is going stale.
-		if (
-			self._prev_vision_result_frame_wall is not None
-			and result.frame_wall is not None
-		):
-			self._latest_vision_result_period_ms = 1000.0 * (
-				result.frame_wall - self._prev_vision_result_frame_wall
-			)
-		self._prev_vision_result_frame_wall = result.frame_wall
-
 		# Diagnostics fields (thread-written, executor-read; diagnostics only).
 		self._latest_worker_target_acquisition_ms = result.target_acquisition_ms
 		self._latest_worker_optical_flow_ms = result.optical_flow_ms
 		self._latest_ipc_in_ms = result.ipc_in_ms
 		self._latest_ipc_out_ms = ipc_out_ms
 		self._latest_frame_to_available_ms = frame_to_available_ms
-		# Frame-arrival wall time of the sample now in _latest_flow, so
-		# on_control_timer can close frame->command when it drives a command.
-		self._latest_flow_frame_wall = result.frame_wall
+		# Recover the raw receipt timestamps that belonged to this source frame.
+		flow_stamp = float(getattr(result.flow, "timestamp", 0.0) or 0.0)
+		with self._vision_receipt_lock:
+			receipt = self._vision_frame_receipts.pop(flow_stamp, None)
+		if receipt is not None:
+			self._latest_flow_frame_receipt_wall_sec = receipt[0]
+			self._latest_flow_frame_receipt_monotonic_sec = receipt[1]
+			self._latest_flow_source_clock = receipt[2]
+		else:
+			# The raw wall receipt survives in the worker result even if the richer
+			# parent-side mapping was evicted after an exceptional backlog.
+			self._latest_flow_frame_receipt_wall_sec = result.frame_wall
+			self._latest_flow_frame_receipt_monotonic_sec = None
+			self._latest_flow_source_clock = ""
+
+		# Processed-frame period is a duration, so use the recovered monotonic
+		# receipt time rather than the epoch wall stamp echoed by the worker.
+		frame_mono = self._latest_flow_frame_receipt_monotonic_sec
+		if frame_mono is not None and self._prev_vision_result_frame_monotonic is not None:
+			self._latest_vision_result_period_ms = 1000.0 * (
+				frame_mono - self._prev_vision_result_frame_monotonic
+			)
+		if frame_mono is not None:
+			self._prev_vision_result_frame_monotonic = frame_mono
+		self._latest_vision_result_available_monotonic_sec = drain_perf
+		self._latest_vision_result_available_wall_sec = self.time.wall_sec()
+		self._vision_result_count += 1
 
 		# Control state LAST, target before flow (see _vision_drain_loop docstring).
 		self._latest_target = result.target
 		self._latest_flow = result.flow
+		# One atomic, internally coherent bundle for CSV rows. If the executor reads
+		# while a new result is being published, it gets either the complete old
+		# bundle or the complete new one, never mixed target/flow/receipt metadata.
+		self._latest_vision_bundle = (
+			result.target,
+			result.flow,
+			{
+				"source_clock": self._latest_flow_source_clock,
+				"frame_receipt_wall_sec": self._latest_flow_frame_receipt_wall_sec,
+				"frame_receipt_monotonic_sec": self._latest_flow_frame_receipt_monotonic_sec,
+				"result_available_wall_sec": self._latest_vision_result_available_wall_sec,
+				"result_available_monotonic_sec": self._latest_vision_result_available_monotonic_sec,
+				"result_count": self._vision_result_count,
+				"worker_target_acquisition_ms": result.target_acquisition_ms,
+				"worker_optical_flow_ms": result.optical_flow_ms,
+				"ipc_in_ms": result.ipc_in_ms,
+				"ipc_out_ms": ipc_out_ms,
+				"frame_to_available_ms": frame_to_available_ms,
+				"vision_result_period_ms": self._latest_vision_result_period_ms,
+			},
+		)
 
 	def _check_vision_worker_alive(self):
 		"""Liveness check, called from on_control_timer (executor thread). If the
@@ -1156,10 +1322,13 @@ class BeeLandNode(Node):
 
 	def on_camera(self, msg: Image):
 		self._image_count += 1
-		now = self.time.wall_sec()
-		self._latest_camera_cb_start_wall = now
-		if VERBOSE_STREAM_LOGS and now - self._last_image_log_time >= 1.0:
-			self._last_image_log_time = now
+		receipt_wall = self.time.wall_sec()
+		receipt_monotonic = self.time.monotonic_sec()
+		self._latest_camera_receipt_wall_sec = receipt_wall
+		self._latest_camera_receipt_monotonic_sec = receipt_monotonic
+		self._latest_camera_cb_start_monotonic = receipt_monotonic
+		if VERBOSE_STREAM_LOGS and receipt_monotonic - self._last_image_log_time >= 1.0:
+			self._last_image_log_time = receipt_monotonic
 			self.get_logger().info(f"image #{self._image_count}: {msg.width}x{msg.height}, encoding={msg.encoding}")
 
 		try:
@@ -1168,20 +1337,31 @@ class BeeLandNode(Node):
 			self.get_logger().error(f"cv_bridge conversion failed: {exc}")
 			return
 
-		t_bridge = self.time.wall_sec()
+		t_bridge = self.time.monotonic_sec()
 
 		# Keep camera orientation independent of whether the debug window is open.
 		frame = cv2.rotate(src, cv2.ROTATE_180)
-		t_rotate = self.time.wall_sec()
+		t_rotate = self.time.monotonic_sec()
 
 		if SHOW_CAMERA:
 			with suppress_stderr_fd(True):
 				cv2.imshow("Bee Land - Camera", frame)
 				cv2.waitKey(1)
-		t_show = self.time.wall_sec()
+		t_show = self.time.monotonic_sec()
 
-		stamp = self._image_timestamp_sec(msg)
-		self.time.observe_sim_timestamp(stamp)
+		stamp, stamp_clock = self._image_timestamp(msg)
+		if stamp is None:
+			return
+		self._latest_camera_source_timestamp_sec = stamp
+		self._latest_camera_source_clock = stamp_clock
+		if stamp_clock == "gazebo_sim":
+			self.time.observe_sim_timestamp(stamp, receipt_wall_sec=receipt_wall)
+		stamp_is_new = (
+			self._prev_camera_stamp is None
+			or stamp > self._prev_camera_stamp + 1e-12
+		)
+		if not stamp_is_new:
+			self._camera_nonincreasing_stamp_drop_count += 1
 
 		# Mean body rate over THIS inter-frame interval, for de-rotation. dt is a
 		# SIM-family difference (stamp - previous stamp); the buffer then walks
@@ -1191,13 +1371,14 @@ class BeeLandNode(Node):
 		# the rate stream is up, which makes optical_flow take its legacy
 		# no-de-rotation path.
 		body_rates = None
-		if self._prev_camera_stamp is not None:
+		if stamp_is_new and self._prev_camera_stamp is not None:
 			dt_cam = stamp - self._prev_camera_stamp
 			omega_mean, _n, ok = self._rate_buffer.mean_recent(dt_cam)
 			if ok:
 				body_rates = omega_mean
-		self._prev_camera_stamp = stamp
-		t_body_rate = self.time.wall_sec()
+		if stamp_is_new:
+			self._prev_camera_stamp = stamp
+		t_body_rate = self.time.monotonic_sec()
 
 		# v2.0: hand the frame to the out-of-process vision pipeline instead of
 		# running target_acquisition/optical_flow inline. This returns almost
@@ -1209,13 +1390,20 @@ class BeeLandNode(Node):
 		# so the "have we ever received a frame" gates (_ready_to_start and the
 		# top of on_control_timer) fire as soon as the first frame arrives, just
 		# as before.
-		self._latest_frame = frame
-		self._ship_frame_to_vision(frame, stamp, body_rates, now)
+		if stamp_is_new:
+			self._latest_frame = frame
+			with self._vision_receipt_lock:
+				self._vision_frame_receipts[stamp] = (
+					receipt_wall, receipt_monotonic, stamp_clock
+				)
+				while len(self._vision_frame_receipts) > 512:
+					self._vision_frame_receipts.popitem(last=False)
+			self._ship_frame_to_vision(frame, stamp, body_rates, receipt_wall)
 
-		self._latest_camera_cb_end_wall = self.time.wall_sec()
+		self._latest_camera_cb_end_monotonic = self.time.monotonic_sec()
 		self._latest_camera_cb_duration_ms = (
-			1000.0 * (self._latest_camera_cb_end_wall - self._latest_camera_cb_start_wall)
-			if self._latest_camera_cb_start_wall is not None else None
+			1000.0 * (self._latest_camera_cb_end_monotonic - self._latest_camera_cb_start_monotonic)
+			if self._latest_camera_cb_start_monotonic is not None else None
 		)
 
 		# Per-stage breakdown -- diagnostics-only. bridge/rotate/show/body_rate
@@ -1226,7 +1414,7 @@ class BeeLandNode(Node):
 		# these on_camera stages NO LONGER sum to camera_cb_duration_ms (which is
 		# now just the light ship-the-frame path, and should be small) -- that is
 		# the whole point of the v2.0 split.
-		self._latest_stage_bridge_ms = 1000.0 * (t_bridge - now)
+		self._latest_stage_bridge_ms = 1000.0 * (t_bridge - receipt_monotonic)
 		self._latest_stage_rotate_ms = 1000.0 * (t_rotate - t_bridge)
 		self._latest_stage_show_camera_ms = 1000.0 * (t_show - t_rotate)
 		self._latest_stage_body_rate_ms = 1000.0 * (t_body_rate - t_show)
@@ -1237,18 +1425,22 @@ class BeeLandNode(Node):
 		OscillatingPlatformController on its own dedicated topic (see
 		PLATFORM_POSE_TOPIC and MovingPlatformController.cpp's publishPose) --
 		no entity matching needed, since every message on this topic IS the
-		platform, by construction. Position is exact; Pose carries no
-		velocity, so velocity is finite-differenced against the previous
-		message using this callback's own receipt time (same time.time()
-		pattern as on_camera/on_local_position), then smoothed -- raw
-		frame-to-frame differencing of real, slightly-jittery pose telemetry
-		amplifies noise the same way it would for optical flow (see
-		optical_flow.py's module docstring for the same argument). Stored in
+		platform, by construction. Position is exact; Pose carries no source
+		timestamp and no twist. For diagnostics only, its wall receipt instant is
+		mapped onto the camera/Gazebo SIM clock with TimeManager's local affine
+		fit, and velocity is finite-differenced on that estimated SIM axis. This
+		avoids the old RTF scaling error caused by differentiating against wall
+		time. Stored in
 		the SDF world's own ENU convention; platform_motion.relative_motion()
 		handles the NED conversion when this is logged alongside
 		vehicle_state. Diagnostics-only -- never read by control_law.
 		"""
-		now = self.time.wall_sec()
+		receipt_wall = self.time.wall_sec()
+		receipt_monotonic = self.time.monotonic_sec()
+		sim_estimate = self.time.sim_at_wall_sec(receipt_wall)
+		self._platform_pose_receipt_wall_sec = receipt_wall
+		self._platform_pose_receipt_monotonic_sec = receipt_monotonic
+		self._platform_pose_estimated_sim_sec = sim_estimate
 		x, y, z = msg.position.x, msg.position.y, msg.position.z
 
 		self._platform_pose_count += 1
@@ -1259,13 +1451,15 @@ class BeeLandNode(Node):
 				"Platform tracking is live."
 			)
 
-		if self._prev_platform_pose_t is not None:
-			dt = now - self._prev_platform_pose_t
+		if self._prev_platform_pose_sim_estimate_sec is not None and sim_estimate is not None:
+			dt = sim_estimate - self._prev_platform_pose_sim_estimate_sec
 			if dt > 1e-3:
+				self._platform_velocity_dt_sim_estimated_sec = dt
 				px, py, pz = self._prev_platform_pose_xyz
 				raw_v = ((x - px) / dt, (y - py) / dt, (z - pz) / dt)
 
-				alpha = PLATFORM_VELOCITY_SMOOTHING
+				tau = max(1e-6, PLATFORM_VELOCITY_SMOOTHING_TAU_SIM_SEC)
+				alpha = math.exp(-dt / tau)
 				if not self._has_filtered_platform_velocity:
 					self._platform_velocity_filtered = raw_v
 					self._has_filtered_platform_velocity = True
@@ -1274,14 +1468,55 @@ class BeeLandNode(Node):
 					self._platform_velocity_filtered = tuple(
 						alpha * fv[i] + (1.0 - alpha) * raw_v[i] for i in range(3)
 					)
+				self._platform_velocity_source = "pose_difference_on_estimated_sim_time"
 
-		self._prev_platform_pose_t = now
+		if sim_estimate is not None:
+			self._prev_platform_pose_sim_estimate_sec = sim_estimate
 		self._prev_platform_pose_xyz = (x, y, z)
 
 		vx, vy, vz = self._platform_velocity_filtered
 		self._platform_state = PlatformState(
-			timestamp=now, x=x, y=y, z=z, vx=vx, vy=vy, vz=vz,
+			timestamp=sim_estimate or 0.0, x=x, y=y, z=z, vx=vx, vy=vy, vz=vz,
 		)
+
+	def on_gear_contacts(self, msg):
+		"""Raw landing-gear contact stream (gz.msgs.Contacts bridged).
+
+		Touchdown criterion: any contact in this message pairs a gear pad with a
+		collision whose scoped name contains TOUCHDOWN_TARGET_SUBSTRING (the
+		platform). The sensor only watches the two pad collisions, so one side of
+		every contact is by construction a pad; we filter the OTHER side by name.
+		Ground-plane contacts at spawn therefore do NOT latch -- the name filter is
+		what makes sitting on the ground before takeoff a non-event.
+
+		Same latch as on_touchdown: first platform contact wins, later messages are
+		no-ops. No dwell filter -- with the deck now a dynamic body the pads stop AT
+		the surface, so the first platform-named contact IS the touchdown.
+		"""
+		if self._touchdown_detected:
+			return
+		try:
+			contacts = getattr(msg, "contacts", []) or []
+		except Exception:
+			return
+
+		for contact in contacts:
+			names = (
+				str(getattr(getattr(contact, "collision1", None), "name", "")),
+				str(getattr(getattr(contact, "collision2", None), "name", "")),
+			)
+			if any(TOUCHDOWN_TARGET_SUBSTRING in n for n in names):
+				self._touchdown_detected = True
+				self._touchdown_receipt_wall_sec = self.time.wall_sec()
+				self._touchdown_receipt_monotonic_sec = self.time.monotonic_sec()
+				self._touchdown_source = "gear_contacts"
+				self.get_logger().warning(
+					f"Gear-pad touchdown: contact {names[0]} <-> {names[1]}"
+				)
+				self._publish_touchdown_status(True)
+				if self._mission_phase == PHASE_CLOSED_LOOP:
+					self._enter_landed_phase("landing-gear contact with platform")
+				return
 
 	def on_touchdown(self, msg: Bool):
 		"""Gazebo/TouchPlugin contact event bridged from /bee_platform/touched.
@@ -1299,7 +1534,9 @@ class BeeLandNode(Node):
 			return
 
 		self._touchdown_detected = True
-		self._touchdown_time = self.time.wall_sec()
+		self._touchdown_receipt_wall_sec = self.time.wall_sec()
+		self._touchdown_receipt_monotonic_sec = self.time.monotonic_sec()
+		self._touchdown_source = "legacy_touch_bool"
 		self.get_logger().warning(
 			"Gazebo touchdown detected: platform contact is stable."
 		)
@@ -1315,8 +1552,15 @@ class BeeLandNode(Node):
 		This callback merges roll/pitch/yaw from /fmu/out/vehicle_attitude into the
 		shared VehicleState object without feeding it to the visual control law.
 		"""
-		now = self.time.wall_sec()
-		self.time.observe_px4_timestamp(msg.timestamp)
+		receipt_wall = self.time.wall_sec()
+		receipt_monotonic = self.time.monotonic_sec()
+		self._vehicle_attitude_receipt_wall_sec = receipt_wall
+		self._vehicle_attitude_receipt_monotonic_sec = receipt_monotonic
+		attitude_sample_us = getattr(msg, "timestamp_sample", 0)
+		self._vehicle_attitude_sample_px4_sec = (
+			float(attitude_sample_us) / 1e6 if attitude_sample_us else None
+		)
+		self.time.observe_px4_timestamp(msg.timestamp, receipt_wall_sec=receipt_wall)
 		self._have_vehicle_attitude = True
 		self._vehicle_attitude_count += 1
 
@@ -1335,8 +1579,8 @@ class BeeLandNode(Node):
 		self._vehicle_state.attitude_yaw = yaw
 		self._vehicle_state.attitude_source = "vehicle_attitude"
 
-		if VERBOSE_STREAM_LOGS and now - self._last_attitude_log_time >= 1.0:
-			self._last_attitude_log_time = now
+		if VERBOSE_STREAM_LOGS and receipt_monotonic - self._last_attitude_log_time >= 1.0:
+			self._last_attitude_log_time = receipt_monotonic
 			self.get_logger().info(
 				f"vehicle attitude: roll={roll:.3f} rad, pitch={pitch:.3f} rad, yaw={yaw:.3f} rad"
 			)
@@ -1352,7 +1596,16 @@ class BeeLandNode(Node):
 		/fmu/out streams. Never feeds the control law directly; the de-rotated
 		flow does.
 		"""
-		self.time.observe_px4_timestamp(msg.timestamp)
+		self._vehicle_angular_velocity_count += 1
+		receipt_wall = self.time.wall_sec()
+		self._vehicle_angular_velocity_source_px4_sec = msg.timestamp / 1e6
+		angular_sample_us = getattr(msg, "timestamp_sample", 0)
+		self._vehicle_angular_velocity_sample_px4_sec = (
+			float(angular_sample_us) / 1e6 if angular_sample_us else None
+		)
+		self._vehicle_angular_velocity_receipt_wall_sec = receipt_wall
+		self._vehicle_angular_velocity_receipt_monotonic_sec = self.time.monotonic_sec()
+		self.time.observe_px4_timestamp(msg.timestamp, receipt_wall_sec=receipt_wall)
 		self._rate_buffer.add(msg.timestamp / 1e6, msg.xyz)
 
 	def on_vehicle_status(self, msg: VehicleStatus):
@@ -1361,6 +1614,15 @@ class BeeLandNode(Node):
 		transition, and warns loudly if offboard is lost after being achieved
 		(the classic 'commands ignored, vehicle holds level and sinks' failure).
 		"""
+		self._vehicle_status_count += 1
+		receipt_wall = self.time.wall_sec()
+		self._vehicle_status_receipt_wall_sec = receipt_wall
+		self._vehicle_status_receipt_monotonic_sec = self.time.monotonic_sec()
+		status_timestamp_us = getattr(msg, "timestamp", 0)
+		if status_timestamp_us:
+			self._vehicle_status_source_px4_sec = float(status_timestamp_us) / 1e6
+			self.time.observe_px4_timestamp(status_timestamp_us, receipt_wall_sec=receipt_wall)
+
 		self._px4_nav_state = int(getattr(msg, "nav_state", -1))
 		self._px4_arming_state = int(getattr(msg, "arming_state", -1))
 		self._px4_failsafe = bool(getattr(msg, "failsafe", False))
@@ -1391,16 +1653,24 @@ class BeeLandNode(Node):
 				self._px4_offboard_confirmed = False
 
 	def on_local_position(self, msg: VehicleLocalPosition):
-		now = self.time.wall_sec()
-		self.time.observe_px4_timestamp(msg.timestamp)
+		self._vehicle_local_position_count += 1
+		receipt_wall = self.time.wall_sec()
+		receipt_monotonic = self.time.monotonic_sec()
+		self._vehicle_local_position_receipt_wall_sec = receipt_wall
+		self._vehicle_local_position_receipt_monotonic_sec = receipt_monotonic
+		local_position_sample_us = getattr(msg, "timestamp_sample", 0)
+		self._vehicle_local_position_sample_px4_sec = (
+			float(local_position_sample_us) / 1e6 if local_position_sample_us else None
+		)
+		self.time.observe_px4_timestamp(msg.timestamp, receipt_wall_sec=receipt_wall)
 		self._have_local_position = True
-		if VERBOSE_STREAM_LOGS and now - self._last_position_log_time >= 1.0:
-			self._last_position_log_time = now
+		if VERBOSE_STREAM_LOGS and receipt_monotonic - self._last_position_log_time >= 1.0:
+			self._last_position_log_time = receipt_monotonic
 			self.get_logger().info(f"local position: x={msg.x:.2f} m, y={msg.y:.2f} m, z={msg.z:.2f} m")
 
 		previous = self._vehicle_state
 		self._vehicle_state = VehicleState(
-			timestamp=now,
+			timestamp=receipt_wall,
 			x=msg.x,
 			y=msg.y,
 			z=msg.z,
@@ -1434,18 +1704,18 @@ class BeeLandNode(Node):
 		)
 
 	def on_mission_timer(self):
-		now = self.time.wall_sec()
+		now = self.time.monotonic_sec()
 
 		if (
 			PLATFORM_POSE_TOPIC
 			and self._platform_pose_count == 0
 			and not self._platform_pose_stall_logged
-			and now - self._node_start_time >= 10.0
+			and now - self._node_start_steady >= 10.0
 		):
 			self._platform_pose_stall_logged = True
 			self.get_logger().warning(
 				f"No platform pose received on {PLATFORM_POSE_TOPIC} after "
-				f"{now - self._node_start_time:.0f}s. diagnostics will log empty "
+				f"{now - self._node_start_steady:.0f}s. diagnostics will log empty "
 				"platform_*/relative_* fields until this is fixed. Check, in order: "
 				f"(1) `gz topic -l` shows {PLATFORM_POSE_TOPIC} and `gz topic -e -t "
 				"<that topic>` shows live data, not just a topic name that exists -- if "
@@ -1461,7 +1731,9 @@ class BeeLandNode(Node):
 			# Keep the terminal state latched and keep publishing an explicit zero-
 			# thrust command until the MAVSDK takeoff worker confirms motor stop or the node
 			# is shut down by the user.
-			self._latest_setpoint = self._landed_zero_thrust_setpoint()
+			self._install_nonvisual_setpoint(
+				self._landed_zero_thrust_setpoint(), "landed_zero_thrust"
+			)
 			self._publish_touchdown_status(True)
 			return
 
@@ -1469,7 +1741,9 @@ class BeeLandNode(Node):
 			# Keep streaming a safe inertial hold setpoint instead of simply
 			# stopping ROS 2 PX4 offboard. Stopping the stream can trigger a PX4
 			# offboard failsafe while the vehicle still has velocity.
-			self._latest_setpoint = self._neutral_visual_hold_setpoint()
+			self._install_nonvisual_setpoint(
+				self._neutral_visual_hold_setpoint(), "abort_neutral_hover"
+			)
 			return
 
 		if self._mission_phase == PHASE_WAITING_FOR_STREAMS:
@@ -1489,12 +1763,15 @@ class BeeLandNode(Node):
 
 		if self._mission_phase == PHASE_PRESTREAM:
 			# Let the direct ROS 2 PX4 publisher stream a stable hover setpoint before switching to offboard.
-			self._latest_setpoint = AttitudeSetpoint(
-				timestamp=getattr(self._latest_target, "timestamp", 0.0),
-				roll=0.0,
-				pitch=0.0,
-				yaw=0.0,
-				thrust=self.control_law.hover_thrust,
+			self._install_nonvisual_setpoint(
+				AttitudeSetpoint(
+					timestamp=getattr(self._latest_target, "timestamp", 0.0),
+					roll=0.0,
+					pitch=0.0,
+					yaw=0.0,
+					thrust=self.control_law.hover_thrust,
+				),
+				"prestream_hover",
 			)
 			if now - self._phase_start_time >= OFFBOARD_PRESTREAM_SEC:
 				self.get_logger().info("Requesting PX4 offboard mode through ROS 2/uXRCE-DDS.")
@@ -1617,6 +1894,7 @@ class BeeLandNode(Node):
 			# heartbeat and the setpoint so PX4 sees them as one coherent pair.
 			tx_us = self.time.px4_tx_timestamp_us()
 			publish_wall = tx_us / 1e6
+			publish_monotonic = self.time.monotonic_sec()
 
 			self.px4_interface.publish_heartbeat(tx_us)
 			self.px4_interface.publish_attitude_setpoint(
@@ -1627,27 +1905,35 @@ class BeeLandNode(Node):
 				timestamp_us=tx_us,
 			)
 
-			if self._prev_px4_publish_wall is not None:
-				self._last_px4_publish_period_wall_sec = publish_wall - self._prev_px4_publish_wall
-			self._prev_px4_publish_wall = publish_wall
-			self._last_px4_publish_wall = publish_wall
+			if self._prev_px4_publish_monotonic_sec is not None:
+				self._last_px4_publish_period_monotonic_sec = (
+					publish_monotonic - self._prev_px4_publish_monotonic_sec
+				)
+			self._prev_px4_publish_monotonic_sec = publish_monotonic
+			self._last_px4_publish_wall_sec = publish_wall
+			self._last_px4_publish_timestamp_us = tx_us
+			self._last_px4_publish_monotonic_sec = publish_monotonic
 			self._px4_publish_count += 1
 
-			if self._latest_setpoint_compute_wall is not None:
+			if self._latest_setpoint_compute_monotonic_sec is not None:
 				self._last_px4_command_age_ms = 1000.0 * (
-					publish_wall - self._latest_setpoint_compute_wall
+					publish_monotonic - self._latest_setpoint_compute_monotonic_sec
 				)
 
-			flow_wall = self.time.sim_to_wall_sec(getattr(self._latest_flow, "timestamp", None))
 			self._last_px4_flow_age_ms = (
-				1000.0 * (publish_wall - flow_wall) if flow_wall is not None else None
+				1000.0 * (
+					publish_monotonic
+					- self._latest_setpoint_source_frame_receipt_monotonic_sec
+				)
+				if self._latest_setpoint_source_frame_receipt_monotonic_sec is not None
+				else None
 			)
 		except Exception as exc:
 			self._px4_offboard_error = repr(exc)
 			self.get_logger().error(f"PX4 direct setpoint publication failed: {repr(exc)}")
 
 	def on_control_timer(self):
-		now = self.time.wall_sec()
+		now = self.time.monotonic_sec()
 
 		# v2.0 (B): results are now drained into _latest_target/_latest_flow by
 		# the event-driven _vision_drain_loop thread the instant they arrive, so
@@ -1656,17 +1942,24 @@ class BeeLandNode(Node):
 		# thread would sit blocked in get() and never notice a dead worker.
 		self._check_vision_worker_alive()
 
-		if self._latest_flow is None or self._latest_frame is None:
+		vision_bundle = self._latest_vision_bundle
+		if vision_bundle is None or self._latest_frame is None:
 			return
+		current_target, current_flow, current_vision_meta = vision_bundle
+		self._diagnostics_vision_bundle = vision_bundle
 
 		if self._mission_phase == PHASE_LANDED:
-			self._latest_setpoint = self._landed_zero_thrust_setpoint()
+			self._install_nonvisual_setpoint(
+				self._landed_zero_thrust_setpoint(), "landed_zero_thrust"
+			)
 			self._publish_touchdown_status(True)
 			self._write_diagnostics_row()
 			return
 
 		if self._mission_phase == PHASE_ABORTED:
-			self._latest_setpoint = self._neutral_visual_hold_setpoint()
+			self._install_nonvisual_setpoint(
+				self._neutral_visual_hold_setpoint(), "abort_neutral_hover"
+			)
 			self._write_diagnostics_row()
 			return
 
@@ -1684,7 +1977,9 @@ class BeeLandNode(Node):
 		if ENABLE_INERTIAL_SAFETY_ABORTS:
 			if abs(self._vehicle_state.vz) > SAFETY_VZ_LIMIT:
 				self._abort(f"vertical velocity safety limit exceeded: vz={self._vehicle_state.vz:.3f} m/s")
-				self._latest_setpoint = self._neutral_visual_hold_setpoint()
+				self._install_nonvisual_setpoint(
+					self._neutral_visual_hold_setpoint(), "abort_neutral_hover"
+				)
 				self._write_diagnostics_row()
 				return
 
@@ -1696,12 +1991,14 @@ class BeeLandNode(Node):
 					"lateral velocity safety limit exceeded: "
 					f"vx={self._vehicle_state.vx:.3f} m/s, vy={self._vehicle_state.vy:.3f} m/s"
 				)
-				self._latest_setpoint = self._neutral_visual_hold_setpoint()
+				self._install_nonvisual_setpoint(
+					self._neutral_visual_hold_setpoint(), "abort_neutral_hover"
+				)
 				self._write_diagnostics_row()
 				return
 
-		target_ok = bool(getattr(self._latest_target, "found", False))
-		flow_ok = bool(getattr(self._latest_flow, "valid", False))
+		target_ok = bool(getattr(current_target, "found", False))
+		flow_ok = bool(getattr(current_flow, "valid", False))
 
 		if not (target_ok and flow_ok):
 			if self._lost_target_since is None:
@@ -1711,14 +2008,16 @@ class BeeLandNode(Node):
 					f"target/flow lost for >= {LOST_TARGET_TIMEOUT_SEC:.1f}s "
 					f"(target_found={target_ok}, flow_valid={flow_ok})"
 				)
-				self._latest_setpoint = self._neutral_visual_hold_setpoint()
+				self._install_nonvisual_setpoint(
+					self._neutral_visual_hold_setpoint(), "abort_neutral_hover"
+				)
 				self._write_diagnostics_row()
 				return
 		else:
 			self._lost_target_since = None
 
 		if COMPUTE_CONTROL_ONLY_ON_NEW_VISION:
-			flow_stamp = float(getattr(self._latest_flow, "timestamp", 0.0))
+			flow_stamp = float(getattr(current_flow, "timestamp", 0.0))
 			if flow_stamp <= 0.0:
 				return
 			if (
@@ -1732,35 +2031,42 @@ class BeeLandNode(Node):
 			self._last_controlled_flow_timestamp = flow_stamp
 
 		control_compute_start_wall = self.time.wall_sec()
-		if self._last_control_compute_start_wall is not None:
-			self._last_control_period_wall_sec = (
-				control_compute_start_wall - self._last_control_compute_start_wall
+		control_compute_start_monotonic = self.time.monotonic_sec()
+		if self._last_control_compute_start_monotonic_sec is not None:
+			self._last_control_period_monotonic_sec = (
+				control_compute_start_monotonic - self._last_control_compute_start_monotonic_sec
 			)
-		self._last_control_compute_start_wall = control_compute_start_wall
+		self._last_control_compute_start_wall_sec = control_compute_start_wall
+		self._last_control_compute_start_monotonic_sec = control_compute_start_monotonic
+		flow_receipt_mono = current_vision_meta.get("frame_receipt_monotonic_sec")
+		self._last_control_flow_age_ms = (
+			1000.0 * (control_compute_start_monotonic - flow_receipt_mono)
+			if flow_receipt_mono is not None else None
+		)
 
 		# v2.0 headline latency: frame arrival (on_camera) -> this command,
 		# spanning the whole out-of-process vision round trip PLUS the wait for a
 		# control tick to pick the result up. Measured only on the ticks that
 		# actually consume a NEW vision sample (this point is past the
-		# COMPUTE_CONTROL_ONLY_ON_NEW_VISION gate), in this process's wall clock.
+		# COMPUTE_CONTROL_ONLY_ON_NEW_VISION gate), on the local steady clock.
 		# This is the number that decides whether v2.0 helped the loop -- compare
 		# it against v1.0's blocking on_camera duration (~11-18ms).
-		if self._latest_flow_frame_wall is not None:
+		if flow_receipt_mono is not None:
 			self._latest_frame_to_command_ms = 1000.0 * (
-				control_compute_start_wall - self._latest_flow_frame_wall
+				control_compute_start_monotonic - flow_receipt_mono
 			)
 
 		# Mission routine: probe -> gate -> scheduled-gain descent. Feed it
 		# last cycle's ACTUAL commanded thrust (the efference copy of what has
 		# really been acting on the vehicle since the previous tick) before
 		# that field gets overwritten below by this tick's new setpoint.
-		t_vision = float(getattr(self._latest_flow, "timestamp", now))
-		dt = self._control_dt_sec()
+		t_vision = float(getattr(current_flow, "timestamp", now))
+		dt = self._control_dt_sec(t_vision)
 		self._last_control_dt_vision_sec = dt
 		previous_thrust = float(getattr(self._latest_setpoint, "thrust", self.control_law.hover_thrust))
 
 		previous_substate = self.mission.substate
-		tgt = self._latest_target
+		tgt = current_target
 		mc = self.mission.update(
 			t_vision, dt, previous_thrust,
 			offset_x=float(getattr(tgt, "offset_x", 0.0)),
@@ -1812,13 +2118,15 @@ class BeeLandNode(Node):
 					"descent; holding visual hover."
 				)
 			self._abort("mission gate infeasible: platform motion exceeds achievable gain band")
-			self._latest_setpoint = self._neutral_visual_hold_setpoint()
+			self._install_nonvisual_setpoint(
+				self._neutral_visual_hold_setpoint(), "abort_neutral_hover"
+			)
 			self._write_diagnostics_row()
 			return
 
 		self._latest_setpoint = self.control_law.compute(
-			self._latest_target,
-			self._latest_flow,
+			current_target,
+			current_flow,
 			dt,
 			divergence_setpoint=mc.divergence_setpoint,
 			thrust_gain_override=mc.thrust_gain_override,
@@ -1826,15 +2134,25 @@ class BeeLandNode(Node):
 			lateral_d_scale=mc.lateral_d_scale,
 			enable_integral=mc.enable_integral,
 		)
-		self._latest_setpoint_compute_wall = control_compute_start_wall
-		self._latest_setpoint_flow_timestamp = getattr(self._latest_flow, "timestamp", None)
-		self._last_control_compute_end_wall = self.time.wall_sec()
+		self._latest_setpoint_compute_wall_sec = control_compute_start_wall
+		self._latest_setpoint_compute_monotonic_sec = control_compute_start_monotonic
+		self._latest_setpoint_source_kind = "visual_flow_control"
+		self._latest_setpoint_flow_timestamp = getattr(current_flow, "timestamp", None)
+		self._latest_setpoint_source_clock = current_vision_meta.get("source_clock", "")
+		self._latest_setpoint_source_frame_receipt_wall_sec = current_vision_meta.get(
+			"frame_receipt_wall_sec"
+		)
+		self._latest_setpoint_source_frame_receipt_monotonic_sec = flow_receipt_mono
+		self._last_control_compute_end_wall_sec = self.time.wall_sec()
+		self._last_control_compute_end_monotonic_sec = self.time.monotonic_sec()
 		self._last_control_compute_duration_ms = (
-			1000.0 * (self._last_control_compute_end_wall - control_compute_start_wall)
+			1000.0 * (
+				self._last_control_compute_end_monotonic_sec - control_compute_start_monotonic
+			)
 		)
 		self._write_diagnostics_row()
 
-	def _control_dt_sec(self) -> float:
+	def _control_dt_sec(self, current_timestamp: float) -> float:
 		"""Return the control step in the same clock as optical flow.
 
 		OpticalFlowEstimator converts px/frame into px/s using FlowResult.timestamp,
@@ -1843,7 +2161,7 @@ class BeeLandNode(Node):
 		timestamps, not a PX4 timestamp and not wall-clock time. This keeps the
 		units of flow/divergence [1/s] and controller dt [s] consistent.
 		"""
-		current = float(getattr(self._latest_flow, "timestamp", 0.0))
+		current = float(current_timestamp)
 		previous = self._prev_control_flow_timestamp
 		self._prev_control_flow_timestamp = current
 
@@ -1870,38 +2188,49 @@ class BeeLandNode(Node):
 
 		return delta
 
-	def _image_timestamp_sec(self, msg: Image) -> float:
+	def _image_timestamp(self, msg: Image):
 		"""Return the timestamp used by target acquisition and optical flow.
 
 		Preferred source: sensor_msgs/Image.header.stamp, normally filled by
-		ros_gz_bridge from Gazebo simulation time. If it is missing/zero, fall back
-		to PX4's simulated timestamp if available. Wall-clock is only a last-resort
-		startup fallback. The returned value is only compared to previous image
-		timestamps, never to PX4/wall timestamps by absolute value.
+		ros_gz_bridge from Gazebo simulation time. A literal zero stamp is accepted
+		as the valid first Gazebo instant; switching that frame to PX4/wall time
+		would create a one-frame clock-family jump as soon as Gazebo advances.
+
+		PX4 time is used only when the Image message genuinely lacks a header/stamp
+		object. If neither source exists, the frame is rejected rather than assigned
+		wall time: a missing frame is safer and more diagnosable than optical-flow
+		units silently changing with simulator RTF.
 		"""
 		stamp = getattr(getattr(msg, "header", None), "stamp", None)
-		stamp_sec = self._ros_stamp_to_sec(stamp)
-		if stamp_sec > 0.0:
-			return stamp_sec
+		if stamp is not None:
+			stamp_sec = self._ros_stamp_to_sec(stamp)
+			if stamp_sec == 0.0 and not self._camera_zero_stamp_logged:
+				self._camera_zero_stamp_logged = True
+				self.get_logger().warning(
+					"Camera Image.header.stamp is exactly zero. Treating it as "
+					"Gazebo SIM t=0 and waiting for the bridge stamp to advance; "
+					"the vision clock will not fall back to PX4/wall time."
+				)
+			return stamp_sec, "gazebo_sim"
 
 		px4_time = float(getattr(self._vehicle_state, "px4_timestamp_sec", 0.0))
 		if px4_time > 0.0:
-			if not self._image_stamp_fallback_logged:
-				self._image_stamp_fallback_logged = True
+			if not self._camera_missing_stamp_logged:
+				self._camera_missing_stamp_logged = True
 				self.get_logger().warning(
-					"Camera Image.header.stamp is zero; using PX4 timestamp as the "
-					"vision timestamp. Prefer fixing the camera bridge so images carry "
-					"Gazebo sim time."
+					"Camera message has no header stamp object; using PX4 boot time "
+					"consistently as the vision source clock. Fix the bridge so images "
+					"carry Gazebo SIM time."
 				)
-			return px4_time
+			return px4_time, "px4_boot"
 
-		if not self._image_stamp_fallback_logged:
-			self._image_stamp_fallback_logged = True
-			self.get_logger().warning(
-				"Camera Image.header.stamp and PX4 timestamp are unavailable; "
-				"temporarily using wall-clock for vision timestamps."
+		if not self._camera_missing_stamp_logged:
+			self._camera_missing_stamp_logged = True
+			self.get_logger().error(
+				"Camera message has no header stamp and PX4 time is unavailable; "
+				"dropping the frame instead of mixing wall time into vision."
 			)
-		return self.time.wall_sec()
+		return None, "unavailable"
 
 	@staticmethod
 	def _quat_wxyz_to_euler(q):
@@ -1943,78 +2272,143 @@ class BeeLandNode(Node):
 			return 0.0
 
 	def _write_diagnostics_row(self):
+		log_wall = self.time.wall_sec()
+		log_monotonic = self.time.monotonic_sec()
+		vision_bundle = self._diagnostics_vision_bundle or self._latest_vision_bundle
+		if vision_bundle is None:
+			logged_target = self._latest_target
+			logged_flow = self._latest_flow
+			logged_vision_meta = {}
+		else:
+			logged_target, logged_flow, logged_vision_meta = vision_bundle
 		self.diagnostics.write(
-			wall_timestamp=self.time.wall_sec(),
-			target=self._latest_target,
-			flow=self._latest_flow,
+			log_wall_timestamp_sec=log_wall,
+			log_monotonic_timestamp_sec=log_monotonic,
+			target=logged_target,
+			flow=logged_flow,
 			setpoint=self._latest_setpoint,
 			vehicle_state=self._vehicle_state,
 			platform_state=self._platform_state,
-			px4_wall_offset_sec=self.time.px4_wall_offset_sec(),
-			sim_wall_offset_sec=self.time.sim_wall_offset_sec(),
+			timestamps=self._timestamp_telemetry(logged_vision_meta),
+			clock=self.time.clock_snapshot(),
 			mission=self._mission_telemetry(),
 			px4_nav_state=self._px4_nav_state,
 			px4_arming_state=self._px4_arming_state,
 			px4_failsafe=self._px4_failsafe,
 			divergence_integral=self.control_law.divergence_integral,
-			timing=self._timing_telemetry(),
+			timing=self._timing_telemetry(logged_vision_meta),
 		)
 
-	def _timing_telemetry(self):
-		"""Timing/latency diagnostics only -- never feeds the controller."""
-		flow_wall = self.time.sim_to_wall_sec(getattr(self._latest_flow, "timestamp", None))
-		control_wall = self._last_control_compute_start_wall
-		flow_age_at_control_ms = (
-			1000.0 * (control_wall - flow_wall)
-			if control_wall is not None and flow_wall is not None else None
-		)
+	def _timestamp_telemetry(self, vision_meta=None):
+		"""Raw source and receipt timestamps only; no hidden epoch conversion."""
+		vision_meta = vision_meta or {}
 		return {
-			"camera_cb_start_wall_sec": self._latest_camera_cb_start_wall,
-			"camera_cb_end_wall_sec": self._latest_camera_cb_end_wall,
-			"camera_cb_duration_ms": self._latest_camera_cb_duration_ms,
+			"camera_message_count": self._image_count,
+			"camera_nonincreasing_stamp_drop_count": self._camera_nonincreasing_stamp_drop_count,
+			"camera_source_timestamp_sec": self._latest_camera_source_timestamp_sec,
+			"camera_source_clock": self._latest_camera_source_clock,
+			"camera_receipt_wall_sec": self._latest_camera_receipt_wall_sec,
+			"camera_receipt_monotonic_sec": self._latest_camera_receipt_monotonic_sec,
+			"vision_frame_receipt_wall_sec": vision_meta.get("frame_receipt_wall_sec"),
+			"vision_frame_receipt_monotonic_sec": vision_meta.get("frame_receipt_monotonic_sec"),
+			"vision_result_available_monotonic_sec": vision_meta.get("result_available_monotonic_sec"),
+			"vision_result_available_wall_sec": vision_meta.get("result_available_wall_sec"),
+			"vision_result_count": vision_meta.get("result_count", 0),
+			"vision_source_clock": vision_meta.get("source_clock", ""),
+			"command_source_flow_timestamp_sec": self._latest_setpoint_flow_timestamp,
+			"command_source_kind": self._latest_setpoint_source_kind,
+			"command_source_clock": self._latest_setpoint_source_clock,
+			"command_source_frame_receipt_wall_sec": self._latest_setpoint_source_frame_receipt_wall_sec,
+			"command_source_frame_receipt_monotonic_sec": self._latest_setpoint_source_frame_receipt_monotonic_sec,
+			"command_compute_wall_sec": self._latest_setpoint_compute_wall_sec,
+			"command_compute_monotonic_sec": self._latest_setpoint_compute_monotonic_sec,
+			"vehicle_local_position_publication_px4_sec": getattr(self._vehicle_state, "px4_timestamp_sec", None),
+			"vehicle_local_position_sample_px4_sec": self._vehicle_local_position_sample_px4_sec,
+			"vehicle_local_position_message_count": self._vehicle_local_position_count,
+			"vehicle_local_position_receipt_wall_sec": self._vehicle_local_position_receipt_wall_sec,
+			"vehicle_local_position_receipt_monotonic_sec": self._vehicle_local_position_receipt_monotonic_sec,
+			"vehicle_attitude_publication_px4_sec": getattr(self._vehicle_state, "attitude_timestamp", None),
+			"vehicle_attitude_sample_px4_sec": self._vehicle_attitude_sample_px4_sec,
+			"vehicle_attitude_message_count": self._vehicle_attitude_count,
+			"vehicle_attitude_receipt_wall_sec": self._vehicle_attitude_receipt_wall_sec,
+			"vehicle_attitude_receipt_monotonic_sec": self._vehicle_attitude_receipt_monotonic_sec,
+			"vehicle_angular_velocity_publication_px4_sec": self._vehicle_angular_velocity_source_px4_sec,
+			"vehicle_angular_velocity_sample_px4_sec": self._vehicle_angular_velocity_sample_px4_sec,
+			"vehicle_angular_velocity_message_count": self._vehicle_angular_velocity_count,
+			"vehicle_angular_velocity_receipt_wall_sec": self._vehicle_angular_velocity_receipt_wall_sec,
+			"vehicle_angular_velocity_receipt_monotonic_sec": self._vehicle_angular_velocity_receipt_monotonic_sec,
+			"vehicle_status_publication_px4_sec": self._vehicle_status_source_px4_sec,
+			"vehicle_status_message_count": self._vehicle_status_count,
+			"vehicle_status_receipt_wall_sec": self._vehicle_status_receipt_wall_sec,
+			"vehicle_status_receipt_monotonic_sec": self._vehicle_status_receipt_monotonic_sec,
+			"platform_pose_receipt_wall_sec": self._platform_pose_receipt_wall_sec,
+			"platform_pose_message_count": self._platform_pose_count,
+			"platform_pose_receipt_monotonic_sec": self._platform_pose_receipt_monotonic_sec,
+			"platform_pose_estimated_sim_sec": self._platform_pose_estimated_sim_sec,
+			"platform_velocity_dt_estimated_sim_sec": self._platform_velocity_dt_sim_estimated_sec,
+			"platform_velocity_source": self._platform_velocity_source,
+			"platform_velocity_smoothing_tau_sim_sec": PLATFORM_VELOCITY_SMOOTHING_TAU_SIM_SEC,
+			"px4_publish_wall_sec": self._last_px4_publish_wall_sec,
+			"px4_publish_timestamp_us": self._last_px4_publish_timestamp_us,
+			"px4_publish_monotonic_sec": self._last_px4_publish_monotonic_sec,
+			"touchdown_detected": self._touchdown_detected,
+			"touchdown_receipt_wall_sec": self._touchdown_receipt_wall_sec,
+			"touchdown_receipt_monotonic_sec": self._touchdown_receipt_monotonic_sec,
+			"touchdown_source": self._touchdown_source,
+		}
+
+	def _timing_telemetry(self, vision_meta=None):
+		"""Durations and periods on the monotonic clock; never controller inputs."""
+		vision_meta = vision_meta or {}
+		return {
+			"camera_callback_start_monotonic_sec": self._latest_camera_cb_start_monotonic,
+			"camera_callback_end_monotonic_sec": self._latest_camera_cb_end_monotonic,
+			"camera_callback_duration_ms": self._latest_camera_cb_duration_ms,
 			"stage_bridge_ms": self._latest_stage_bridge_ms,
 			"stage_rotate_ms": self._latest_stage_rotate_ms,
 			"stage_show_camera_ms": self._latest_stage_show_camera_ms,
 			"stage_body_rate_ms": self._latest_stage_body_rate_ms,
-			# v2.0: these two on_camera sub-stages are structurally empty now
-			# (target_acquisition/optical_flow moved out of process). Kept as
-			# columns so the on_camera decomposition schema is unchanged; the
-			# real per-call cost is in worker_* below.
 			"stage_target_acquisition_ms": self._latest_stage_target_acquisition_ms,
 			"stage_optical_flow_ms": self._latest_stage_optical_flow_ms,
-			# v2.0 out-of-process vision measurements. worker_* = the worker's own
-			# perf_counter cost of each call (compute moved, not reduced -- expect
-			# ~v1.0 numbers here). frame_to_available/frame_to_command = the true
-			# cross-boundary latencies the v1.0-era stage timers never captured;
-			# frame_to_command is the one to compare against v1.0's blocking
-			# on_camera (~11-18ms). vision_result_period_ms >> camera period means
-			# the worker is falling behind; vision_dropped_frames counts frames
-			# shed at the shallow input queue under load.
-			"worker_target_acquisition_ms": self._latest_worker_target_acquisition_ms,
-			"worker_optical_flow_ms": self._latest_worker_optical_flow_ms,
-			# A: IPC legs. ipc_in + worker compute + ipc_out == frame_to_available.
-			# ipc_out is now near-pure IPC (no poll wait) because the drain thread
-			# picks results up on arrival, so any residual in
-			# frame_to_command - frame_to_available is the control-tick grid wait.
-			"ipc_in_ms": self._latest_ipc_in_ms,
-			"ipc_out_ms": self._latest_ipc_out_ms,
-			"frame_to_available_wall_ms": self._latest_frame_to_available_ms,
-			"frame_to_command_wall_ms": self._latest_frame_to_command_ms,
-			"vision_result_period_wall_ms": self._latest_vision_result_period_ms,
+			"worker_target_acquisition_ms": vision_meta.get(
+				"worker_target_acquisition_ms", self._latest_worker_target_acquisition_ms
+			),
+			"worker_optical_flow_ms": vision_meta.get(
+				"worker_optical_flow_ms", self._latest_worker_optical_flow_ms
+			),
+			"ipc_in_ms": vision_meta.get("ipc_in_ms", self._latest_ipc_in_ms),
+			"ipc_out_ms": vision_meta.get("ipc_out_ms", self._latest_ipc_out_ms),
+			"frame_to_available_ms": vision_meta.get(
+				"frame_to_available_ms", self._latest_frame_to_available_ms
+			),
+			"frame_to_command_ms": self._latest_frame_to_command_ms,
+			"vision_result_period_ms": vision_meta.get(
+				"vision_result_period_ms", self._latest_vision_result_period_ms
+			),
 			"vision_dropped_frames": self._vision_dropped_frames,
-			"control_compute_start_wall_sec": self._last_control_compute_start_wall,
-			"control_compute_end_wall_sec": self._last_control_compute_end_wall,
+			"control_compute_start_monotonic_sec": self._last_control_compute_start_monotonic_sec,
+			"control_compute_end_monotonic_sec": self._last_control_compute_end_monotonic_sec,
 			"control_compute_duration_ms": self._last_control_compute_duration_ms,
-			"control_period_wall_sec": self._last_control_period_wall_sec,
-			"control_dt_vision_sec": self._last_control_dt_vision_sec,
-			"flow_age_at_control_wall_ms": flow_age_at_control_ms,
-			"px4_publish_wall_sec": self._last_px4_publish_wall,
-			"px4_publish_period_wall_sec": self._last_px4_publish_period_wall_sec,
+			"control_period_monotonic_sec": self._last_control_period_monotonic_sec,
+			"control_dt_source_sec": self._last_control_dt_vision_sec,
+			"flow_age_at_control_ms": self._last_control_flow_age_ms,
+			"px4_publish_period_monotonic_sec": self._last_px4_publish_period_monotonic_sec,
 			"command_age_at_px4_publish_ms": self._last_px4_command_age_ms,
-			"flow_age_at_px4_publish_wall_ms": self._last_px4_flow_age_ms,
+			"flow_age_at_px4_publish_ms": self._last_px4_flow_age_ms,
 			"px4_publish_count": self._px4_publish_count,
-			"sim_rtf_estimate": self.time.sim_rtf_estimate(),
-			"px4_rtf_estimate": self.time.px4_rtf_estimate(),
+			"mavsdk_start_requested_monotonic_sec": self.mavsdk.timing_start_requested,
+			"mavsdk_worker_loop_started_monotonic_sec": self.mavsdk.timing_worker_loop_started,
+			"mavsdk_connected_monotonic_sec": self.mavsdk.timing_connected,
+			"mavsdk_health_ready_monotonic_sec": self.mavsdk.timing_health_ready,
+			"mavsdk_takeoff_commanded_monotonic_sec": self.mavsdk.timing_takeoff_commanded,
+			"mavsdk_takeoff_done_monotonic_sec": self.mavsdk.timing_takeoff_done,
+			"mavsdk_motor_stop_requested_monotonic_sec": self.mavsdk.timing_motor_stop_requested,
+			"mavsdk_motor_stop_picked_up_monotonic_sec": self.mavsdk.timing_motor_stop_picked_up,
+			"mavsdk_pre_motor_stop_done_monotonic_sec": self.mavsdk.timing_pre_motor_stop_done,
+			"mavsdk_disarm_attempted_monotonic_sec": self.mavsdk.timing_disarm_attempted,
+			"mavsdk_disarm_result_monotonic_sec": self.mavsdk.timing_disarm_result,
+			"mavsdk_kill_attempted_monotonic_sec": self.mavsdk.timing_kill_attempted,
+			"mavsdk_kill_result_monotonic_sec": self.mavsdk.timing_kill_result,
 		}
 
 	def _mission_telemetry(self):
@@ -2063,7 +2457,9 @@ class BeeLandNode(Node):
 			"k_ceiling_leg": gate.k_ceiling_leg,
 			"k_target": gate.k_target,
 			"k_floor": gate.k_floor,
+			"k_probe": gate.k_descend_start,
 			"k_descend_start": gate.k_descend_start,
+			"near_field_height_m": NEAR_FIELD_HEIGHT_M,
 			"ceiling_margin": gate.ceiling_margin,
 			"k_over_ceiling_leg": None if landed else info.get("k_over_ceiling_leg"),
 			# h_pred only exists during descent; blank otherwise. DIAGNOSTIC ONLY --
@@ -2076,8 +2472,8 @@ class BeeLandNode(Node):
 			# they never revise it, NEAR_PROBE_DECAY_TAU_SEC is too long or the hold
 			# is too short to see an excursion.
 			"peak_accel": self.mission.probe_result.peak_accel,
-			"peak_accel_at_handoff": self.mission.peak_accel_at_handoff,
-			"probe_total_duration_sec": self.mission.probe_result.total_duration_sec,
+			"probe_peak_accel_at_handoff": self.mission.peak_accel_at_handoff,
+			"probe_total_elapsed_sec": self.mission.probe_result.total_duration_sec,
 			"feasible": gate.feasible,
 			# Per-step probe internals (accel / mean / residual / percentile / peak).
 			# peak_accel is a slow envelope; these are what it is built from, and are
@@ -2105,7 +2501,26 @@ class BeeLandNode(Node):
 		"""Invoked by MavsdkWorker (on the worker thread) just before disarm, so
 		our outgoing setpoint is a zero-thrust hold and nothing fights the stop.
 		A single attribute assignment -- safe to call cross-thread."""
-		self._latest_setpoint = self._landed_zero_thrust_setpoint()
+		self._install_nonvisual_setpoint(
+			self._landed_zero_thrust_setpoint(), "mavsdk_zero_thrust_latch"
+		)
+
+	def _install_nonvisual_setpoint(self, setpoint: AttitudeSetpoint, source_kind: str):
+		"""Install a setpoint that was not formed from a new optical-flow sample.
+
+		This keeps command provenance coherent in the CSV: flow-source fields are
+		cleared, while the local compute/install timestamps and source kind are
+		updated to the actual event that replaced the previous visual command.
+		"""
+		self._latest_setpoint = setpoint
+		self._latest_setpoint_source_kind = str(source_kind)
+		self._latest_setpoint_compute_wall_sec = self.time.wall_sec()
+		self._latest_setpoint_compute_monotonic_sec = self.time.monotonic_sec()
+		self._latest_setpoint_flow_timestamp = None
+		self._latest_setpoint_source_clock = ""
+		self._latest_setpoint_source_frame_receipt_wall_sec = None
+		self._latest_setpoint_source_frame_receipt_monotonic_sec = None
+		return setpoint
 
 	def _landed_zero_thrust_setpoint(self) -> AttitudeSetpoint:
 		"""Terminal setpoint after confirmed touchdown.
@@ -2141,7 +2556,9 @@ class BeeLandNode(Node):
 		)
 
 		self.get_logger().warning(f"LANDING COMPLETE: {reason}. Entering landed phase.")
-		self._latest_setpoint = self._landed_zero_thrust_setpoint()
+		self._install_nonvisual_setpoint(
+			self._landed_zero_thrust_setpoint(), "landed_zero_thrust"
+		)
 		self._publish_touchdown_status(True)
 		if ENABLE_TOUCHDOWN_MOTOR_STOP:
 			self.mavsdk.request_motor_stop()
@@ -2172,7 +2589,7 @@ class BeeLandNode(Node):
 		if phase != self._mission_phase:
 			self.get_logger().info(f"Mission phase: {self._mission_phase} -> {phase}")
 		self._mission_phase = phase
-		self._phase_start_time = self.time.wall_sec()
+		self._phase_start_time = self.time.monotonic_sec()
 
 	def _abort(self, reason: str):
 		if self._mission_phase != PHASE_ABORTED:
