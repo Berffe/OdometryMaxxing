@@ -17,6 +17,8 @@ To copy files from Windows to Linux (in the Linux terminal):
 ```bash
 cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Gazebo_defs/* ~/PX4-Autopilot/BEE_LAND/
 
+cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/bridge.sh ~/PX4-Autopilot/BEE_LAND/
+
 cp -r ~/PX4-Autopilot/BEE_LAND/logs/* /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/OpenLoop_Test/logs
 
 cp -r ~/PX4-Autopilot/BEE_LAND/logs/* /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Flight_Analysis/logs

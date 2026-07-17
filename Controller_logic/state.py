@@ -1,97 +1,41 @@
-"""
-Shared, ROS-free data containers passed between bee_node.py and the algorithm
-modules, so the vision/control code can be imported and tested without rclpy.
+"""ROS-free data exchanged by the BEE_LAND controller modules.
+
+Architecture boundary
+---------------------
+The live controller is visual-only after handoff. This module therefore
+contains only:
+
+* visual measurements produced from camera frames;
+* the attitude/thrust command formed from those measurements; and
+* the minimal contact latch allowed to cross from Gazebo truth into the
+terminal touchdown path.
+
+Simulation position, velocity, height, platform motion, forces, and other gold-
+standard values deliberately do NOT appear here. They belong to the independent
+truth log and are merged with controller diagnostics only in ``analyse_log.py``.
 """
 
 from dataclasses import dataclass
 
 
 @dataclass
-class VehicleState:
-	"""PX4 local-position estimate (NED), for diagnostics/handoff only.
-
-	NED sign convention: z grows more negative when climbing, vz > 0 = descending.
-	Not used by the control law after visual handoff.
-
-	timestamp is the WALL-clock receipt time of this state, in seconds (from
-	TimeManager.wall_sec() in bee_node.py's on_local_position) -- i.e. when the
-	node received the estimate, not a sim/PX4 stamp. It shares the WALL family
-	with the diagnostics t_sec origin. The raw PX4 time for this estimate is
-	kept separately in px4_timestamp_sec (converted from PX4 microseconds), so
-	the two clocks are never conflated; cross-family alignment goes through
-	TimeManager's measured offsets (see clock.py), never raw subtraction.
-	Defaults to 0.0 when no estimate has been received yet.
-	"""
-
-	timestamp: float = 0.0
-	x: float = 0.0
-	y: float = 0.0
-	z: float = 0.0
-	vx: float = 0.0
-	vy: float = 0.0
-	vz: float = 0.0
-	yaw: float = 0.0  # VehicleLocalPosition.heading [rad]
-	px4_timestamp_sec: float = 0.0
-
-	# Actual attitude, merged in from a separate PX4 topic (VehicleAttitude or
-	# the VehicleOdometry fallback -- see calibration_node.py's
-	# VEHICLE_ATTITUDE_TOPICS/VEHICLE_ODOMETRY_TOPICS) on top of the
-	# local-position fields above, which arrive on their own topic and
-	# callback. attitude_timestamp <= 0.0 means none received yet -- checked
-	# before trusting roll/pitch/attitude_yaw for anything (e.g.
-	# REQUIRE_ATTITUDE_BEFORE_CALIBRATION, MAVSDK_HOLD_CURRENT_YAW).
-	attitude_timestamp: float = 0.0
-	roll: float = 0.0
-	pitch: float = 0.0
-	attitude_yaw: float = 0.0
-	attitude_source: str = ""  # "vehicle_attitude" or "vehicle_odometry"
-
-
-@dataclass
 class FlowResult:
-	"""Output of OpticalFlowEstimator.update().
+	"""Output of ``OpticalFlowEstimator.update()``.
 
-	timestamp uses the same simulation-time base as TargetEstimate and
-	VehicleState. In the ROS node it comes from the camera Image.header.stamp,
-	so mean flow and divergence are expressed per simulated second.
+	``timestamp`` is the source camera timestamp in Gazebo simulation seconds.
+	It is the time base used for optical-flow units, control ``dt`` and mission
+	progression. It must never be replaced by wall receipt time.
 
-	Control inputs (used by control_law.py):
-	    mean_flow_x_norm / mean_flow_y_norm : normalized image velocity [1/s], in
-	        the same convention as TargetEstimate.offset_x/y. Closed-loop control
-	        uses these because the identified models have state [offset, flow_norm].
-	    divergence : filtered divergence [1/s], used by the thrust loop.
+	Control-facing fields
+	---------------------
+	``mean_flow_x_norm`` / ``mean_flow_y_norm``
+		Normalized image velocity [1/s], in the same image convention as the
+		target offsets.
+	``divergence``
+		Filtered divergence [1/s] used by the vertical controller.
 
-	Debug / log-only:
-	    mean_flow_x / mean_flow_y : same velocity in px/s, kept for camera
-	        debugging and logging. Relation: *_norm = *_px_s / (0.5 * image_dim),
-	        so the normalized field is the px/s field rescaled (recoverable).
-	    raw_divergence : unfiltered divergence; logged separately because the
-	        filter adds phase lag that matters for identification.
-	    fit_quality : weighted R^2 of the affine divergence fit (see
-	        optical_flow.py's _fit_divergence_affine), in roughly [~negative,
-	        1.0]; 1.0 is a well-supported fit, 0.0 is no better than the
-	        weighted mean flow, negative means the affine model fit worse
-	        than that baseline. DIAGNOSIS-ONLY as of this writing: logged
-	        (diagnostics_writer.py's flow_fit_quality column) so a degraded-
-	        but-still-numeric divergence can be told apart from a
-	        well-supported one, but not yet read by control_law.py or
-	        mission_routine.py -- a low fit_quality does not currently change
-	        any command.
-	    roi_* : ROI the flow was computed in (target box), x1/y1 exclusive.
-
-	De-rotation diagnostics (see optical_flow.py + derotation.py):
-	    derotated : True if ego-rotation removal ran on this frame (a derotator
-	        was configured AND body rates were available for the interval). When
-	        False, the *_raw fields below equal their de-rotated counterparts and
-	        divergence_prederotation equals raw_divergence -- de-rotation was a
-	        no-op, so raw and corrected coincide.
-	    mean_flow_x_raw / mean_flow_y_raw : mean flow in px/s BEFORE de-rotation.
-	        The de-rotated mean flow is the existing mean_flow_x / mean_flow_y, so
-	        (raw - de-rotated) is exactly the rotational component removed.
-	    divergence_prederotation : unfiltered divergence [1/s] of the pre-de-
-	        rotation field. The gap to raw_divergence is how much ego-rotation was
-	        biasing the divergence estimate. LOG-ONLY (like fit_quality): not read
-	        by control_law.py or mission_routine.py.
+	Remaining fields are diagnostics-only and preserve the current optical-flow
+	and optional de-rotation interfaces.
 	"""
 
 	timestamp: float = 0.0
@@ -119,24 +63,15 @@ class FlowResult:
 
 @dataclass
 class TargetEstimate:
-	"""Output of TargetAcquisition.update() -- what the controller tracks.
+	"""Output of ``TargetAcquisition.update()``.
 
-	timestamp uses the same simulation-time base as FlowResult.
+	``timestamp`` is the source camera timestamp in Gazebo simulation seconds.
 
-	offset_x/y : centroid offset from image center, normalized to [-1, 1].
-	area_fraction : detection area / frame area, in [0, 1]; the scheduling
-	    variable for the identified visual models.
-	fov_saturated : the detection's bounding box touches all four image
-	    borders -- the true target exceeds the camera's field of view, not
-	    just fills it. cv2.boundingRect is mechanically capped at the image
-	    array's own dimensions, so area_fraction/detection_width/height stop
-	    tracking true range entirely once this is True (confirmed: identical
-	    output across a 3x range of true target size). found stays True --
-	    a real contour is still selected -- but the geometry it reports is a
-	    frame-size artifact, not a measurement. Consumers that use these
-	    fields as a scheduling or identification variable should treat rows
-	    with fov_saturated=True as uninformative, not as a steady operating
-	    point.
+	``offset_x`` and ``offset_y`` are centroid offsets normalized to [-1, 1].
+	``area_fraction`` and the detection dimensions stop carrying range
+	information once ``fov_saturated`` becomes true; the visual controller may
+	continue using offsets and divergence, but consumers must not interpret the
+	saturated box geometry as a physical size measurement.
 	"""
 
 	timestamp: float = 0.0
@@ -151,35 +86,12 @@ class TargetEstimate:
 
 
 @dataclass
-class PlatformState:
-	"""
-	Known/commanded landing-platform motion, for diagnostics and relative-
-	motion analysis only -- the control law never sees this (see
-	control_law.py: visual-only by design, divergence/offset are its only
-	inputs). Reconstructed analytically by platform_motion.py from the
-	OscillatingPlatformController SDF plugin's own amplitude/frequency/phase,
-	since the plugin does not publish its pose to ROS.
-
-	Same x/y/z, vx/vy/vz shape as VehicleState, but in the SDF world's own
-	frame/units -- see platform_motion.py's module docstring for the NED-vs-
-	ENU sign/axis caveat before comparing directly against VehicleState.
-	"""
-
-	timestamp: float = 0.0
-	x: float = 0.0
-	y: float = 0.0
-	z: float = 0.0
-	vx: float = 0.0
-	vy: float = 0.0
-	vz: float = 0.0
-
-
-@dataclass
 class AttitudeSetpoint:
-	"""Desired attitude/thrust consumed by the MAVSDK/PX4 backend.
+	"""Visual command consumed by the PX4 publication adapter.
 
-	timestamp follows the same simulation-time base as the visual measurement
-	that produced the command.
+	``timestamp`` is the camera/flow simulation timestamp that produced the
+	command. It is provenance only. ``PX4Interface`` independently stamps the
+	outgoing uXRCE-DDS messages with a fresh system-wall timestamp.
 	"""
 
 	timestamp: float = 0.0
@@ -187,3 +99,25 @@ class AttitudeSetpoint:
 	pitch: float = 0.0
 	yaw: float = 0.0
 	thrust: float = 0.0  # normalized collective thrust, [0, 1]
+
+
+@dataclass
+class ContactState:
+	"""Minimal Gazebo-truth subset allowed into the live controller.
+
+	The truth plugin publishes a much richer atomic packet, but ``bee_node``
+	extracts only this terminal-event subset. No position, velocity, distance,
+	divergence truth or force measurement may enter the controller state.
+
+	``sim_timestamp`` is the Gazebo physics timestamp of the truth packet.
+	Receipt wall/monotonic times are transport diagnostics owned by
+	``bee_node`` / ``DiagnosticsWriter`` and are intentionally not stored here.
+	"""
+
+	valid: bool = False
+	sequence: int = -1
+	sim_timestamp: float = 0.0
+	left_contact: bool = False
+	right_contact: bool = False
+	any_contact: bool = False
+	confirmed: bool = False

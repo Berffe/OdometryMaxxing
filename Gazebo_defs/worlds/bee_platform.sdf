@@ -198,8 +198,8 @@
 		<y_frequency>0.0</y_frequency>
 		<y_phase>0.0</y_phase>
 
-		<z_amplitude>0.3</z_amplitude>
-		<z_frequency>0.3</z_frequency>
+		<z_amplitude>0.8</z_amplitude>
+		<z_frequency>0.1</z_frequency>
 		<z_phase>0.0</z_phase>
 	</plugin>
 
@@ -214,6 +214,47 @@
 		<time>0.01</time>
 		<enabled>true</enabled>
 	</plugin>
+
+
+
 	</model>
+
+	<!-- Gazebo-native landing truth: WORLD plugin, not a model plugin. -->
+	<plugin filename="libBeeLandingTruth.so" name="custom::BeeLandingTruth">
+	<drone_model>bee_x500_0</drone_model>
+	<platform_model>bee_platform</platform_model>
+
+	<drone_base_link>base_link</drone_base_link>
+	<camera_link>bee_camera_link</camera_link>
+	<platform_link>platform_link</platform_link>
+
+	<!-- True skid undersides, expressed in base_link coordinates. These are the
+		physical feet, not the sensing-pad bottom 3 mm below them. -->
+	<left_pad_point_base>0 -0.132 -0.227</left_pad_point_base>
+	<right_pad_point_base>0 0.132 -0.227</right_pad_point_base>
+	<skid_half_length_m>0.125</skid_half_length_m>
+	<skid_half_width_m>0.0075</skid_half_width_m>
+
+	<!-- platform_link origin is at the cylinder centre; top surface is +0.1 m. -->
+	<platform_top_offset_m>0.1</platform_top_offset_m>
+
+	<publish_rate_hz>100</publish_rate_hz>
+	<truth_topic>/bee_land/truth</truth_topic>
+
+	<!-- Raw contact sensors run at 250 Hz. A short SIM-time dwell rejects a
+		one-message contact flicker without introducing wall/RTF dependence. -->
+	<contact_confirmation_sec>0.04</contact_confirmation_sec>
+	<contact_stale_timeout_sec>0.03</contact_stale_timeout_sec>
+	<contact_target_substring>bee_platform</contact_target_substring>
+
+	<!-- The defaults below reconstruct the auto-generated sensor topic names.
+		Override left_contact_topic/right_contact_topic only if model names differ. -->
+	<gear_link>bee_gear_contact_link</gear_link>
+	<left_contact_sensor>landing_gear_contact_sensor_left</left_contact_sensor>
+	<right_contact_sensor>landing_gear_contact_sensor_right</right_contact_sensor>
+
+	<divergence_min_distance_m>0.05</divergence_min_distance_m>
+	<minimum_view_alignment>0.90</minimum_view_alignment>
+	</plugin>
 </world>
 </sdf>

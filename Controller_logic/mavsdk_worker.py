@@ -12,15 +12,15 @@ robustly than raw offboard: the initial guided takeoff, and the terminal
 disarm/kill.
 
 INTERFACE (what the node uses):
-    worker = MavsdkWorker(logger, on_pre_motor_stop=..., <config...>)
-    worker.start()                 # spawn the worker thread (idempotent)
-    worker.takeoff_started         # bool
-    worker.takeoff_done            # bool  -> node advances past MAVSDK_TAKEOFF
-    worker.takeoff_error           # None | str -> node aborts if set
-    worker.request_motor_stop()    # after confirmed touchdown
-    worker.motor_stop_done         # bool
-    worker.motor_stop_error        # None | str
-    worker.request_stop()          # tell the worker loop to exit (shutdown)
+	worker = MavsdkWorker(logger, on_pre_motor_stop=..., <config...>)
+	worker.start()                 # spawn the worker thread (idempotent)
+	worker.takeoff_started         # bool
+	worker.takeoff_done            # bool  -> node advances past MAVSDK_TAKEOFF
+	worker.takeoff_error           # None | str -> node aborts if set
+	worker.request_motor_stop()    # after confirmed touchdown
+	worker.motor_stop_done         # bool
+	worker.motor_stop_error        # None | str
+	worker.request_stop()          # tell the worker loop to exit (shutdown)
 
 on_pre_motor_stop is an optional zero-argument callback invoked once, on the
 worker thread, immediately before the disarm/kill attempt. The node uses it to
@@ -46,17 +46,17 @@ contact and motors actually stopping (see bee_node.py's touchdown handling +
 platform_motion.py's PLATFORM_TOP_SURFACE_OFFSET_M for how that gap was
 found: ~19cm of apparent leg interpenetration in one logged landing). Fixed
 here two ways:
-  1. An asyncio.Event wakes the worker loop the instant request_motor_stop()
-     fires, instead of waiting out the next poll tick -- see _wake_event.
-  2. When enable_kill_fallback is set (the SITL/moving-platform case this
-     whole mechanism exists for), the doomed disarm() attempt is skipped
-     entirely and kill() is issued directly -- see _try_motor_stop.
-  3. Every stage now gets a monotonic timestamp (self.timing_*), so the next
-     landing log can show which stage actually dominates rather than assume
-     it -- these are diagnostics-only, read by nothing in this file, plain
-     time.monotonic() (not clock.py's WALL/SIM/PX4 family: this is a
-     same-process duration measurement, not a cross-system correlation, so
-     it doesn't need that taxonomy).
+1. An asyncio.Event wakes the worker loop the instant request_motor_stop()
+	fires, instead of waiting out the next poll tick -- see _wake_event.
+2. When enable_kill_fallback is set (the SITL/moving-platform case this
+	whole mechanism exists for), the doomed disarm() attempt is skipped
+	entirely and kill() is issued directly -- see _try_motor_stop.
+3. Every stage now gets a monotonic timestamp (self.timing_*), so the next
+	landing log can show which stage actually dominates rather than assume
+	it -- these are diagnostics-only, read by nothing in this file, plain
+	time.monotonic() (not clock.py's WALL/SIM/PX4 family: this is a
+	same-process duration measurement, not a cross-system correlation, so
+	it doesn't need that taxonomy).
 """
 
 import asyncio
@@ -134,6 +134,16 @@ class MavsdkWorker:
 		self.timing_kill_attempted = None
 		self.timing_kill_result = None
 
+		# Takeoff-side milestones on the same monotonic clock. These let the CSV
+		# separate MAVSDK connection/health/settling/climb time from the later ROS
+		# offboard handoff without mixing in PX4, SIM, or epoch-wall timestamps.
+		self.timing_start_requested = None
+		self.timing_worker_loop_started = None
+		self.timing_connected = None
+		self.timing_health_ready = None
+		self.timing_takeoff_commanded = None
+		self.timing_takeoff_done = None
+
 	# ---- node-facing controls ------------------------------------------------
 	def start(self) -> None:
 		"""Spawn the worker thread (idempotent). Sets takeoff_error instead of
@@ -144,6 +154,7 @@ class MavsdkWorker:
 			self.takeoff_error = "mavsdk is not installed in this Python environment"
 			return
 		self.takeoff_started = True
+		self.timing_start_requested = time.monotonic()
 		self._logger.info(f"Starting MAVSDK takeoff to {self._takeoff_altitude_m:.2f} m.")
 		self._thread = threading.Thread(
 			target=self._run_thread, name="mavsdk_takeoff", daemon=True
@@ -186,6 +197,7 @@ class MavsdkWorker:
 		# from the node's thread (see _wake()).
 		self._wake_event = asyncio.Event()
 		self._loop = asyncio.get_running_loop()
+		self.timing_worker_loop_started = time.monotonic()
 
 		self._free_port(self._port_to_free)
 		drone = System()
@@ -199,6 +211,7 @@ class MavsdkWorker:
 			"MAVSDK connection",
 		)
 		self._logger.info("MAVSDK: connected.")
+		self.timing_connected = time.monotonic()
 
 		self._logger.info("MAVSDK: waiting for global/home/local position estimates...")
 		await self._wait_for_condition(
@@ -208,6 +221,7 @@ class MavsdkWorker:
 			"global/home/local position health",
 		)
 		self._logger.info("MAVSDK: all position estimates OK.")
+		self.timing_health_ready = time.monotonic()
 
 		await asyncio.sleep(self._ekf2_settle)
 		home_position = await self._wait_for_condition(
@@ -227,6 +241,7 @@ class MavsdkWorker:
 		await drone.action.arm()
 		self._logger.info("MAVSDK: takeoff command.")
 		await drone.action.takeoff()
+		self.timing_takeoff_commanded = time.monotonic()
 
 		await self._wait_for_condition(
 			drone.telemetry.position(),
@@ -240,6 +255,7 @@ class MavsdkWorker:
 		)
 		self._logger.info("MAVSDK: reached takeoff altitude; hovering.")
 		self.takeoff_done = True
+		self.timing_takeoff_done = time.monotonic()
 
 		# MAVSDK is kept only for takeoff and terminal motor-stop actions.
 		# Closed-loop attitude/thrust setpoints are published directly to PX4 via
@@ -347,7 +363,7 @@ class MavsdkWorker:
 		messages nobody is consuming, indefinitely -- exactly the kind of
 		background, GIL-touching activity that could explain vision work
 		running slower in-process than standalone (see the
-        vision-latency investigation this fixes a real candidate for).
+		vision-latency investigation this fixes a real candidate for).
 		contextlib.aclosing guarantees aclose() runs on every exit path --
 		condition met, timeout (asyncio.wait_for cancels _inner(), which
 		propagates as CancelledError through the `async for`, still
