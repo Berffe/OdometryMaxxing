@@ -80,6 +80,99 @@
 	</joint>
 	<!-- BELLY CAMERA SENSOR ADDITION -->
 
+	<!-- DRONE-SIDE LANDING-GEAR CONTACT SENSORS
+	     One lightweight fixed link carries two independent collision pads.
+	     The link name and sensor names intentionally match the auto-generated
+	     Gazebo topic paths used by BeeLandingTruth and bridge.sh. -->
+	<link name="bee_gear_contact_link">
+		<!-- Physical skid underside is approximately z = -0.227 m.
+		     These sensing pads are centered 3 mm lower. -->
+		<pose relative_to="base_link">0 0 -0.230 0 0 0</pose>
+
+		<inertial>
+			<mass>0.005</mass>
+			<inertia>
+				<ixx>1.0e-5</ixx>
+				<iyy>3.0e-5</iyy>
+				<izz>3.0e-5</izz>
+				<ixy>0</ixy>
+				<ixz>0</ixz>
+				<iyz>0</iyz>
+			</inertia>
+		</inertial>
+
+		<collision name="landing_gear_contact_collision_left">
+			<pose>0 -0.132 0 0 0 0</pose>
+			<geometry>
+				<box>
+					<size>0.25 0.015 0.002</size>
+				</box>
+			</geometry>
+		</collision>
+
+		<collision name="landing_gear_contact_collision_right">
+			<pose>0 0.132 0 0 0 0</pose>
+			<geometry>
+				<box>
+					<size>0.25 0.015 0.002</size>
+				</box>
+			</geometry>
+		</collision>
+
+		<!-- Small visuals are useful during bring-up and may be removed later. -->
+		<visual name="landing_gear_contact_visual_left">
+			<pose>0 -0.132 0 0 0 0</pose>
+			<geometry>
+				<box>
+					<size>0.25 0.015 0.002</size>
+				</box>
+			</geometry>
+			<material>
+				<ambient>0.8 0.1 0.1 0.35</ambient>
+				<diffuse>0.8 0.1 0.1 0.35</diffuse>
+			</material>
+			<transparency>0.65</transparency>
+		</visual>
+
+		<visual name="landing_gear_contact_visual_right">
+			<pose>0 0.132 0 0 0 0</pose>
+			<geometry>
+				<box>
+					<size>0.25 0.015 0.002</size>
+				</box>
+			</geometry>
+			<material>
+				<ambient>0.1 0.1 0.8 0.35</ambient>
+				<diffuse>0.1 0.1 0.8 0.35</diffuse>
+			</material>
+			<transparency>0.65</transparency>
+		</visual>
+
+		<sensor name="landing_gear_contact_sensor_left" type="contact">
+			<always_on>true</always_on>
+			<update_rate>250</update_rate>
+			<visualize>false</visualize>
+			<contact>
+				<collision>landing_gear_contact_collision_left</collision>
+			</contact>
+		</sensor>
+
+		<sensor name="landing_gear_contact_sensor_right" type="contact">
+			<always_on>true</always_on>
+			<update_rate>250</update_rate>
+			<visualize>false</visualize>
+			<contact>
+				<collision>landing_gear_contact_collision_right</collision>
+			</contact>
+		</sensor>
+	</link>
+
+	<joint name="bee_gear_contact_joint" type="fixed">
+		<parent>base_link</parent>
+		<child>bee_gear_contact_link</child>
+	</joint>
+	<!-- DRONE-SIDE LANDING-GEAR CONTACT SENSORS -->
+
 	<plugin filename="gz-sim-multicopter-motor-model-system"
 	name="gz::sim::systems::MulticopterMotorModel">
 	<jointName>rotor_0_joint</jointName>

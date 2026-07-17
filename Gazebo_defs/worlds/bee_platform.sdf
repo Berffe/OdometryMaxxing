@@ -234,6 +234,14 @@
 	<right_pad_point_base>0 0.132 -0.227</right_pad_point_base>
 	<skid_half_length_m>0.125</skid_half_length_m>
 	<skid_half_width_m>0.0075</skid_half_width_m>
+	
+	<left_contact_topic>
+	/world/bee_platform/model/bee_x500_0/link/bee_gear_contact_link/sensor/landing_gear_contact_sensor_left/contact
+	</left_contact_topic>
+
+	<right_contact_topic>
+	/world/bee_platform/model/bee_x500_0/link/bee_gear_contact_link/sensor/landing_gear_contact_sensor_right/contact
+	</right_contact_topic>
 
 	<!-- platform_link origin is at the cylinder centre; top surface is +0.1 m. -->
 	<platform_top_offset_m>0.1</platform_top_offset_m>

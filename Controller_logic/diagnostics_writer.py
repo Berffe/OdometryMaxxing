@@ -1,45 +1,148 @@
-"""Small event-oriented controller logger.
+"""Controller-event and Gazebo-truth CSV logging.
 
-The controller log contains only what the controller knew and did. Gazebo truth
-is recorded separately and merged by analyse_log using SIM time.
+The controller CSV records what the visual controller knew and commanded.
+The truth CSV records every atomic Gazebo truth packet without reconstruction.
+The two files share a run id and are merged later by ``analyse_log.py`` on
+Gazebo SIM time.
 """
 from __future__ import annotations
 
 import csv
+import queue
+import threading
 import time
 from pathlib import Path
+from typing import Mapping, Optional
+
+from .truth_layout import TRUTH_FIELDS
+
+
+class _AsyncCsvSink:
+	"""Small non-blocking CSV sink used for the dense truth stream."""
+
+	def __init__(self, path: Path, fieldnames, *, queue_size: int = 2048,
+				flush_every_rows: int = 100):
+		self.path = str(path)
+		self._fieldnames = list(fieldnames)
+		self._queue: queue.Queue = queue.Queue(maxsize=max(1, int(queue_size)))
+		self._flush_every_rows = max(1, int(flush_every_rows))
+		self._stop = object()
+		self.dropped_rows = 0
+		self._thread = threading.Thread(
+			target=self._run, name=f"csv:{path.name}", daemon=True)
+		self._thread.start()
+
+	def submit(self, row: Mapping):
+		try:
+			self._queue.put_nowait(dict(row))
+		except queue.Full:
+			# Truth is dense. Dropping a row under pathological disk pressure is
+			# safer than blocking the ROS executor / controller.
+			self.dropped_rows += 1
+
+	def close(self):
+		try:
+			self._queue.put(self._stop, timeout=1.0)
+		except queue.Full:
+			pass
+		self._thread.join(timeout=3.0)
+
+	def _run(self):
+		Path(self.path).parent.mkdir(parents=True, exist_ok=True)
+		with open(self.path, "w", newline="", encoding="utf-8") as handle:
+			writer = csv.DictWriter(handle, fieldnames=self._fieldnames)
+			writer.writeheader()
+			count = 0
+			while True:
+				item = self._queue.get()
+				if item is self._stop:
+					break
+				writer.writerow({k: item.get(k, "") for k in self._fieldnames})
+				count += 1
+				if count % self._flush_every_rows == 0:
+					handle.flush()
+			handle.flush()
 
 
 class DiagnosticsWriter:
-	SCHEMA_VERSION = "4.0-controller"
+	CONTROLLER_SCHEMA_VERSION = "4.4-controller"
+	TRUTH_LOG_SCHEMA_VERSION = "1.0-truth-log"
 
-	def __init__(self, output_dir="logs", filename=None, flush_every_row=True):
+	def __init__(self, output_dir="logs", filename=None, *,
+				controller_flush_every_rows: int = 25,
+				truth_queue_size: int = 2048):
 		root = Path(output_dir)
 		root.mkdir(parents=True, exist_ok=True)
-		filename = filename or time.strftime("bee_controller_%Y%m%d_%H%M%S.csv")
-		self.filepath = str(root / filename)
+		run_id = time.strftime("%Y%m%d_%H%M%S")
+		filename = filename or f"bee_controller_{run_id}.csv"
+		controller_path = root / filename
+		if filename.startswith("bee_controller_"):
+			truth_name = "bee_truth_" + filename[len("bee_controller_"):]
+		else:
+			truth_name = f"bee_truth_{run_id}.csv"
+		truth_path = root / truth_name
+
+		self.filepath = str(controller_path)
+		self.truth_filepath = str(truth_path)
 		self._start_wall = time.time()
 		self._start_mono = time.monotonic()
-		self._flush = bool(flush_every_row)
-		self._file = open(self.filepath, "w", newline="", encoding="utf-8")
-		self._writer = csv.DictWriter(self._file, fieldnames=self._fieldnames())
-		self._writer.writeheader()
+		self._controller_flush_every_rows = max(1, int(controller_flush_every_rows))
+		self._controller_row_count = 0
+		self._controller_file = open(
+			self.filepath, "w", newline="", encoding="utf-8")
+		self._controller_writer = csv.DictWriter(
+			self._controller_file, fieldnames=self._fieldnames())
+		self._controller_writer.writeheader()
+		self._truth_sink = _AsyncCsvSink(
+			truth_path,
+			[
+				"truth_log_schema_version",
+				"truth_receipt_wall_timestamp_sec",
+				"truth_receipt_monotonic_timestamp_sec",
+			] + list(TRUTH_FIELDS),
+			queue_size=truth_queue_size,
+			flush_every_rows=100,
+		)
+
+	@property
+	def truth_dropped_rows(self) -> int:
+		return int(self._truth_sink.dropped_rows)
+
+	def write_truth(self, truth: Mapping, *, receipt_wall_sec: float,
+					receipt_monotonic_sec: float):
+		row = {
+			"truth_log_schema_version": self.TRUTH_LOG_SCHEMA_VERSION,
+			"truth_receipt_wall_timestamp_sec": float(receipt_wall_sec),
+			"truth_receipt_monotonic_timestamp_sec": float(receipt_monotonic_sec),
+		}
+		row.update(truth)
+		self._truth_sink.submit(row)
 
 	def write(self, *, target=None, flow=None, setpoint=None, mission=None,
 			timing=None, contact=None, publish=None, event="", event_detail="",
-			divergence_integral=None, vision_sequence=None):
+			divergence_integral=None, vision_sequence=None,
+			controller_phase="", px4_status: Optional[Mapping] = None):
 		wall, mono = time.time(), time.monotonic()
 		row = {k: "" for k in self._fieldnames()}
 		row.update({
-			"diagnostics_schema_version": self.SCHEMA_VERSION,
+			"diagnostics_schema_version": self.CONTROLLER_SCHEMA_VERSION,
 			"log_wall_timestamp_sec": wall,
 			"log_monotonic_timestamp_sec": mono,
 			"log_elapsed_wall_sec": wall - self._start_wall,
 			"log_elapsed_monotonic_sec": mono - self._start_mono,
 			"event": event,
 			"event_detail": event_detail,
+			"controller_phase": controller_phase,
 			"vision_sequence": self._value(vision_sequence),
 		})
+		if px4_status:
+			row.update({
+				"px4_nav_state": self._value(px4_status.get("nav_state")),
+				"px4_arming_state": self._value(px4_status.get("arming_state")),
+				"px4_failsafe": self._bool_value(px4_status.get("failsafe")),
+				"px4_offboard_confirmed": self._bool_value(
+					px4_status.get("offboard_confirmed")),
+			})
 		if target is not None:
 			row.update({
 				"vision_sim_timestamp_sec": self._value(target.timestamp),
@@ -105,25 +208,33 @@ class DiagnosticsWriter:
 				"px4_publish_wall_timestamp_sec": publish.wall_timestamp_sec,
 				"px4_publish_monotonic_timestamp_sec": publish.monotonic_timestamp_sec,
 			})
-		self._writer.writerow(row)
-		if self._flush:
-			self._file.flush()
+		self._controller_writer.writerow(row)
+		self._controller_row_count += 1
+		if self._controller_row_count % self._controller_flush_every_rows == 0:
+			self._controller_file.flush()
 
 	def close(self):
-		if not self._file.closed:
-			self._file.flush()
-			self._file.close()
+		self._truth_sink.close()
+		if not self._controller_file.closed:
+			self._controller_file.flush()
+			self._controller_file.close()
 
 	@staticmethod
 	def _value(value):
 		return "" if value is None else value
+
+	@staticmethod
+	def _bool_value(value):
+		return "" if value is None else int(bool(value))
 
 	@classmethod
 	def _fieldnames(cls):
 		base = [
 			"diagnostics_schema_version", "log_wall_timestamp_sec",
 			"log_monotonic_timestamp_sec", "log_elapsed_wall_sec",
-			"log_elapsed_monotonic_sec", "event", "event_detail", "vision_sequence",
+			"log_elapsed_monotonic_sec", "event", "event_detail",
+			"controller_phase", "px4_nav_state", "px4_arming_state",
+			"px4_failsafe", "px4_offboard_confirmed", "vision_sequence",
 			"vision_sim_timestamp_sec", "target_found", "target_offset_x",
 			"target_offset_y", "target_detection_width_px", "target_detection_height_px",
 			"target_confidence", "target_area_fraction", "target_fov_saturated",
