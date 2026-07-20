@@ -1,2348 +1,927 @@
-"""
-Analyse BEE_LAND diagnostics CSV logs with a coherent timestamp basis.
+"""BEE_LAND paired-log analyser.
 
-Default output is intentionally synthetic: a small set of high-signal plots and
-one text summary. Extra legacy/detail plots can be enabled with --full.
+The analyser consumes two independent CSV files:
 
-Usage:
+* bee_controller_*.csv: sparse/event-oriented controller and vision log.
+* bee_truth_*.csv: dense Gazebo-native physical truth log.
 
-	# One CSV -> write plots directly into results/test9
-	python analyse_log.py logs/bee_diagnostics_XXXXXXXX.csv results/test9
-
-	# Whole folder -> write one subfolder per CSV: results/test1, test2, ...
-	python analyse_log.py logs
-
-	# Current moving-platform tests
-	python analyse_log.py logs/bee_diagnostics_XXXXXXXX.csv results/test9 \
-		--platform-frequency-hz 0.2
-
-Default generated files -- the core loop: did we SEE the target, did the PROBE
-measure the platform, did the GATE pick a sane gain window, did the DESCENT do
-what was asked:
-
-	- summary.txt
-	- target_detection_summary.png        target offsets/area/confidence (phase-shaded)
-	- detection_boxes_fov.png             field-of-view reconstruction
-	- probe_acceleration.png              what peak_accel is built from, step by step
-	- gain_schedule.png                   k(t) inside the [k_min, k_ceiling] window
-	- vertical_divergence.png             the loop's ERROR signal: D vs D*, + integral
-	- vertical_descent.png                the PHYSICAL outcome: closing rate, height, thrust
-	- closing_rate_spectrum.png           when relative_vz_m_s or vehicle_vz_m_s is available
-
-Optional with --full -- narrower or more diagnostic questions. Not less useful,
-just not what you look at on every run:
-
-	- lateral_control.png
-	- flow_derotation.png                 raw vs de-rotated optical flow (ego-rotation removal)
-	- divergence_consistency.png          vision divergence vs. kinematic ground truth
-	- height_prediction.png               open-loop h_pred vs measured (diagnostic only)
-	- platform_motion_frequency.png       when platform_z_m is available
-	- drone_platform_position_xyz.png     drone and platform positions on x/y/z (phase-shaded)
-	- vehicle_position_xyz.png
-	- platform_position_xyz.png
-	- platform_velocity_xyz.png
-	- relative_motion_xyz.png
-
-Timestamp policy:
-
-	The controller now uses image / visual timestamps for target acquisition,
-	optical flow, divergence, and control dt. This analyser follows the same
-	convention by default: it uses flow_timestamp_sec if valid, then
-	target_timestamp_sec, then command_timestamp_sec. It never mixes PX4 epoch
-	timestamps with visual timestamps by absolute value. Wall time is used only
-	as a fallback and for estimating real-time factor.
+All physical comparisons use Gazebo simulation time.  The truth stream is never
+reconstructed from PX4, receipt, or wall timestamps.
 """
 
 from __future__ import annotations
 
 import argparse
 import math
-import os
+import sys
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Sequence, Tuple
+from typing import Iterable, Optional
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-from matplotlib.patches import Rectangle
 
 
-# ---------------------------------------------------------------------------
-# Display labels
-# ---------------------------------------------------------------------------
-#
-# ONE place that maps a CSV column to the words that appear on a figure. Plots
-# call label_for("mission_k_floor") rather than hardcoding a string, so a name
-# is chosen once and every figure agrees. Anything not listed falls back to a
-# readable de-snake_cased version of the column, so a new column still plots
-# sensibly before it gets a curated name here.
-#
-# Conventions: state what the quantity IS, then its role in parentheses where
-# the role is the reason it is on the plot ("k_min (Herisse floor)"). Units go
-# on the axis label, not the series label.
-
-COLUMN_LABELS: dict[str, str] = {
-	# --- target / vision ---
-	"target_offset_x": "horizontal offset (P-term input)",
-	"target_offset_y": "vertical offset (P-term input)",
-	"target_area_fraction": "target area fraction",
-	"target_confidence": "detection confidence",
-	"target_fov_saturated": "FOV saturated (area no longer tracks range)",
-	"target_detection_width_px": "detection width",
-	"target_detection_height_px": "detection height",
-
-	# --- optical flow ---
-	"flow_divergence_1_s": "divergence (filtered, control input)",
-	"flow_raw_divergence_1_s": "divergence (raw, unfiltered)",
-	"flow_divergence_prederotation_1_s": "divergence before de-rotation",
-	"flow_mean_x_norm_s": "horizontal flow (D-term input)",
-	"flow_mean_y_norm_s": "vertical flow (D-term input)",
-	"flow_mean_x_px_s": "horizontal flow",
-	"flow_mean_y_px_s": "vertical flow",
-	"flow_mean_x_raw_px_s": "horizontal flow before de-rotation",
-	"flow_mean_y_raw_px_s": "vertical flow before de-rotation",
-	"flow_fit_quality": "divergence fit quality (weighted R\u00b2)",
-
-	# --- commands ---
-	"command_thrust": "thrust command",
-	"command_thrust_integral": "divergence integral",
-	"command_roll_rad": "roll command",
-	"command_pitch_rad": "pitch command",
-
-	# --- vehicle / platform ---
-	"vehicle_vz_m_s": "vehicle vertical velocity",
-	"relative_z_m": "height above platform (measured)",
-	"relative_vz_m_s": "closing rate (measured)",
-	"platform_z_m": "platform height",
-	"platform_vz_m_s": "platform vertical velocity",
-
-	# --- mission: gain window ---
-	# The descent gain rides the de Croon ceiling AT LEG HEIGHT; k_min survives
-	# only as a hard floor beneath it. Naming keeps that hierarchy legible.
-	"mission_thrust_gain_k": "k(t) (scheduled thrust gain)",
-	"mission_k_explore": "k_explore (exploration gain, schedule start)",
-	"mission_k_min": "k_min (Herisse floor: peak accel / D*)",
-	"mission_k_ceiling_leg": "k_ceiling (de Croon limit at leg height)",
-	"mission_k_target": "k_target (margin \u00d7 ceiling: what k(t) aims for)",
-	"mission_k_floor": "k_floor (schedule asymptote = max(k_min, k_target))",
-	"mission_k_probe": "k_probe (near-field probe gain; descent starts here)",
-	"mission_k_descend_start": "k_descend_start (= k_probe)",
-	"mission_k_over_ceiling_leg": "k(t) / k_ceiling (fraction of the limit used)",
-	"mission_ceiling_margin": "ceiling margin",
-	"mission_h_crit_m": "h_crit (height where ceiling meets floor)",
-	"mission_h_pred_m": "h_pred (open-loop prediction, diagnostic only)",
-	"mission_divergence_setpoint_1_s": "D* (commanded divergence)",
-	"mission_lateral_p_scale": "lateral P scale",
-	"mission_lateral_d_scale": "lateral D scale",
-
-	# --- mission: platform probe ---
-	"mission_peak_accel_m_s2": "peak accel (envelope \u2192 gate)",
-	"mission_probe_accel_m_s2": "commanded accel",
-	"mission_probe_mean_accel_m_s2": "EMA bias removed (hover trim + descent term)",
-	"mission_probe_residual_accel_m_s2": "residual |accel \u2212 bias| (the measurement)",
-	"mission_probe_percentile_accel_m_s2": "window percentile (envelope target)",
-	"mission_probe_peak_accel_at_handoff_m_s2": "peak at far\u2192near handoff",
+PHASE_LABELS = {
+	"center": "CENTER",
+	"approach_probe": "APPROACH PROBE",
+	"final_probe": "FINAL PROBE",
+	"descend": "DESCENT",
+	"infeasible": "INFEASIBLE",
+	"landed": "LANDED",
 }
 
 
-def label_for(column: str) -> str:
-	"""Figure label for a CSV column. Falls back to a de-snake_cased name."""
-	if column in COLUMN_LABELS:
-		return COLUMN_LABELS[column]
-	return column.replace("_", " ")
+PHASE_COLORS = {
+	"center": "#4C78A8",
+	"approach_probe": "#F2CF5B",
+	"final_probe": "#F28E2B",
+	"descend": "#59A14F",
+	"landed": "#B07AA1",
+	"infeasible": "#E15759",
+}
 
 
-# ---------------------------------------------------------------------------
-# I/O and columns
-# ---------------------------------------------------------------------------
+PHASE_ALPHA = 0.055
 
 
-def read_log(csv_path: str | Path) -> pd.DataFrame:
-	df = pd.read_csv(csv_path)
-	if df.empty:
-		raise ValueError(f"CSV file is empty: {csv_path}")
-	return df
+@dataclass(frozen=True)
+class AnalysisData:
+	controller: pd.DataFrame
+	control: pd.DataFrame
+	truth: pd.DataFrame
+	t0: float
+	t1: float
 
 
-def truncate_to_duration(df: pd.DataFrame, max_duration_sec: Optional[float], csv_path: str | Path) -> pd.DataFrame:
-	"""Drop rows beyond max_duration_sec of WALL-clock run time (t_sec), e.g.
-	after accidentally leaving the sim running. Deliberately keys on t_sec
-	specifically -- the one column every log has that is always wall-clock
-	(see diagnostics_writer.py) -- not on --time-base's chosen column, which
-	may be sim-time and run at a different rate under the sim's real-time
-	factor (see mission_routine.py's CLOCK note)."""
-	if max_duration_sec is None:
-		return df
-	if "t_sec" not in df.columns:
-		print(f"  --max-duration-sec ignored for {csv_path}: no t_sec column in this log.")
-		return df
+def _num(df: pd.DataFrame, name: str, default: float = np.nan) -> pd.Series:
+	if name not in df.columns:
+		return pd.Series(default, index=df.index, dtype=float)
+	return pd.to_numeric(df[name], errors="coerce")
 
-	t_sec = pd.to_numeric(df["t_sec"], errors="coerce")
-	keep = t_sec <= float(max_duration_sec)
-	n_dropped = int((~keep).sum())
-	if n_dropped == 0:
-		return df
 
-	truncated = df.loc[keep].reset_index(drop=True)
-	if truncated.empty:
-		raise ValueError(
-			f"--max-duration-sec={max_duration_sec:g} leaves no rows for {csv_path} "
-			f"(t_sec starts at {t_sec.min():g}). Check the value or drop the flag for this log."
+def _bool(df: pd.DataFrame, name: str) -> pd.Series:
+	return _num(df, name, 0.0).fillna(0.0) > 0.5
+
+
+def _clean_string(series: pd.Series) -> pd.Series:
+	return series.fillna("").astype(str).str.strip().str.lower()
+
+
+def _read_csv(path: Path) -> pd.DataFrame:
+	try:
+		return pd.read_csv(path, low_memory=False)
+	except Exception as exc:
+		raise RuntimeError(f"Could not read {path}: {exc}") from exc
+
+
+def _classify_file(df: pd.DataFrame) -> str:
+	cols = set(df.columns)
+	if "truth_sim_time_sec" in cols and "truth_drone_position_z_m" in cols:
+		return "truth"
+	if "flow_sim_timestamp_sec" in cols and "controller_phase" in cols:
+		return "controller"
+	return "unknown"
+
+
+def _load_pair(path_a: Path, path_b: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
+	a = _read_csv(path_a)
+	b = _read_csv(path_b)
+	kind_a = _classify_file(a)
+	kind_b = _classify_file(b)
+	if kind_a == "controller" and kind_b == "truth":
+		return a, b
+	if kind_a == "truth" and kind_b == "controller":
+		return b, a
+	raise ValueError(
+		"Expected one controller CSV and one truth CSV. "
+		f"Detected {path_a.name}={kind_a}, {path_b.name}={kind_b}."
+	)
+
+
+def _prepare(controller: pd.DataFrame, truth: pd.DataFrame) -> AnalysisData:
+	controller = controller.copy()
+	truth = truth.copy()
+
+	controller["_sim_time"] = _num(controller, "flow_sim_timestamp_sec")
+	missing = ~np.isfinite(controller["_sim_time"])
+	controller.loc[missing, "_sim_time"] = _num(
+		controller.loc[missing], "command_source_sim_timestamp_sec"
+	)
+	missing = ~np.isfinite(controller["_sim_time"])
+	controller.loc[missing, "_sim_time"] = _num(
+		controller.loc[missing], "contact_truth_sim_timestamp_sec"
+	)
+
+	truth["_sim_time"] = _num(truth, "truth_sim_time_sec")
+	truth = truth[np.isfinite(truth["_sim_time"])].copy()
+	truth = truth.sort_values("_sim_time").drop_duplicates("_sim_time", keep="last")
+
+	# Control rows are the rows produced by fresh visual results.  Explicit
+	# events may carry the previous cached visual result, so exclude them from
+	# sampled control curves except mission-transition rows when needed only for
+	# phase boundary detection.
+	event = _clean_string(controller.get("event", pd.Series("", index=controller.index)))
+	control_mask = (
+		np.isfinite(controller["_sim_time"])
+		& _bool(controller, "flow_valid")
+		& _num(controller, "vision_sequence").notna()
+		& (event == "")
+	)
+	control = controller[control_mask].copy()
+	if control.empty:
+		# Compatibility fallback for logs whose normal control rows have an
+		# explicit "control" event.
+		control_mask = (
+			np.isfinite(controller["_sim_time"])
+			& _bool(controller, "flow_valid")
+			& event.isin(["", "control"])
 		)
-	print(f"  --max-duration-sec={max_duration_sec:g}: dropped {n_dropped}/{len(df)} rows "
-	      f"beyond t_sec={max_duration_sec:g} (log ran to t_sec={t_sec.max():g}).")
-	return truncated
+		control = controller[control_mask].copy()
+
+	control = control.sort_values("_sim_time")
+	if "vision_sequence" in control.columns:
+		control = control.drop_duplicates("vision_sequence", keep="last")
+	else:
+		control = control.drop_duplicates("_sim_time", keep="last")
+
+	finite_control = control["_sim_time"].to_numpy(float)
+	finite_truth = truth["_sim_time"].to_numpy(float)
+	if finite_truth.size == 0:
+		raise ValueError("Truth CSV contains no finite truth_sim_time_sec values.")
+
+	if finite_control.size:
+		# Begin with the first controller sample for a mission-focused view, but
+		# retain the truth tail through node shutdown.  This is essential for
+		# post-touchdown settling and disarmed-state diagnostics.
+		t0 = max(float(np.nanmin(finite_truth)), float(np.nanmin(finite_control)))
+		t1 = float(np.nanmax(finite_truth))
+	else:
+		t0 = float(np.nanmin(finite_truth))
+		t1 = float(np.nanmax(finite_truth))
+	if not np.isfinite(t0) or not np.isfinite(t1) or t1 <= t0:
+		raise ValueError("Controller and truth logs do not have an overlapping SIM-time interval.")
+
+	return AnalysisData(controller=controller, control=control, truth=truth, t0=t0, t1=t1)
 
 
-def numeric_column(df: pd.DataFrame, name: str, default: float = np.nan) -> np.ndarray:
-	if name not in df.columns:
-		return np.full(len(df), default, dtype=float)
-	return pd.to_numeric(df[name], errors="coerce").to_numpy(dtype=float)
+def _clip_max_time(data: AnalysisData, max_time: Optional[float]) -> AnalysisData:
+	"""Clip both logs to a relative plot-time limit.
 
-
-def bool_column(df: pd.DataFrame, name: str, default: bool = False) -> np.ndarray:
-	if name not in df.columns:
-		return np.full(len(df), default, dtype=bool)
-
-	raw = df[name]
-	if raw.dtype == bool:
-		return raw.to_numpy(dtype=bool)
-	if raw.dtype == object:
-		cleaned = raw.astype(str).str.lower().str.strip()
-		return cleaned.isin(["1", "true", "yes", "y"]).to_numpy(dtype=bool)
-	return pd.to_numeric(raw, errors="coerce").fillna(0).to_numpy(dtype=float) > 0.5
-
-
-def ensure_output_dir(output_dir: str | Path):
-	os.makedirs(output_dir, exist_ok=True)
-
-
-def save_current_figure(output_dir: str | Path, filename: str):
-	path = Path(output_dir) / filename
-	plt.tight_layout()
-	plt.savefig(path, dpi=160)
-	plt.close()
-	print(f"Saved: {path}")
-
-
-# ---------------------------------------------------------------------------
-# Timebase handling
-# ---------------------------------------------------------------------------
-
-
-TIME_BASE_COLUMNS = {
-	"flow": "flow_timestamp_sec",
-	"target": "target_timestamp_sec",
-	"command": "command_timestamp_sec",
-	"vehicle_px4": "vehicle_px4_timestamp_sec",
-	"vehicle": "vehicle_timestamp_sec",
-	"wall": "wall_timestamp",
-	"t_sec": "t_sec",
-}
-
-
-def _valid_time_column(df: pd.DataFrame, column: str) -> Tuple[bool, np.ndarray, str]:
-	if column not in df.columns:
-		return False, np.arange(len(df), dtype=float), f"missing {column}"
-
-	raw = numeric_column(df, column)
-	finite = np.isfinite(raw)
-	if np.count_nonzero(finite) < max(3, int(0.25 * len(df))):
-		return False, raw, f"too few finite samples in {column}"
-
-	# Use finite values in row order. Repeated timestamps are tolerated, but the
-	# column must have positive elapsed time and mostly non-negative increments.
-	values = raw[finite]
-	diffs = np.diff(values)
-	positive_span = float(np.nanmax(values) - np.nanmin(values))
-	if not np.isfinite(positive_span) or positive_span <= 1e-9:
-		return False, raw, f"degenerate span in {column}"
-
-	nonnegative_fraction = float(np.mean(diffs >= -1e-9)) if len(diffs) else 1.0
-	if nonnegative_fraction < 0.90:
-		return False, raw, f"not mostly monotonic in {column}"
-
-	return True, raw, "ok"
-
-
-def choose_time_base(df: pd.DataFrame, requested: str = "auto") -> Tuple[np.ndarray, str, str]:
-	"""Return elapsed time, source column, and a human-readable description."""
-	if requested != "auto":
-		column = TIME_BASE_COLUMNS[requested]
-		ok, raw, reason = _valid_time_column(df, column)
-		if not ok:
-			raise ValueError(f"Requested time base '{requested}' is invalid: {reason}")
-		return _normalize_elapsed(raw), column, f"requested {requested} ({column})"
-
-	# Match the current controller's actual visual timebase first. PX4 time is
-	# deliberately late in the list because its absolute epoch may be unrelated
-	# to Gazebo image time.
-	priority = [
-		"flow_timestamp_sec",
-		"target_timestamp_sec",
-		"command_timestamp_sec",
-		"t_sec",
-		"wall_timestamp",
-		"vehicle_timestamp_sec",
-		"vehicle_px4_timestamp_sec",
-	]
-
-	reasons = []
-	for column in priority:
-		ok, raw, reason = _valid_time_column(df, column)
-		if ok:
-			return _normalize_elapsed(raw), column, f"auto-selected {column}"
-		reasons.append(f"{column}: {reason}")
-
-	return np.arange(len(df), dtype=float), "sample_index", "fallback sample index; " + "; ".join(reasons)
-
-
-def _normalize_elapsed(raw: np.ndarray) -> np.ndarray:
-	raw = np.asarray(raw, dtype=float)
-	finite = np.isfinite(raw)
-	if not np.any(finite):
-		return np.arange(len(raw), dtype=float)
-	t0 = float(raw[finite][0])
-	return raw - t0
-
-
-def median_positive_dt(t: np.ndarray) -> float:
-	finite = np.isfinite(t)
-	values = t[finite]
-	if len(values) < 2:
-		return float("nan")
-	diffs = np.diff(values)
-	diffs = diffs[np.isfinite(diffs) & (diffs > 1e-9)]
-	if len(diffs) == 0:
-		return float("nan")
-	return float(np.median(diffs))
-
-
-def estimate_rtf(df: pd.DataFrame, analysis_t: np.ndarray) -> Optional[float]:
-	"""Estimate sim/visual time advance divided by wall time advance."""
-	wall_t = None
-	if "t_sec" in df.columns:
-		wall_t = _normalize_elapsed(numeric_column(df, "t_sec"))
-	elif "wall_timestamp" in df.columns:
-		wall_t = _normalize_elapsed(numeric_column(df, "wall_timestamp"))
-
-	if wall_t is None:
-		return None
-
-	sim_dt = np.diff(analysis_t)
-	wall_dt = np.diff(wall_t)
-	mask = np.isfinite(sim_dt) & np.isfinite(wall_dt) & (sim_dt > 1e-9) & (wall_dt > 1e-9)
-	if np.count_nonzero(mask) < 3:
-		return None
-	return float(np.median(sim_dt[mask] / wall_dt[mask]))
-
-
-# ---------------------------------------------------------------------------
-# TOuchdown helpers
-# ---------------------------------------------------------------------------
-
-def _first_true_index(mask: np.ndarray) -> Optional[int]:
-	idx = np.where(np.asarray(mask, dtype=bool))[0]
-	return int(idx[0]) if len(idx) else None
-
-
-def _flying_mask(df: pd.DataFrame) -> np.ndarray:
-	"""Rows where the vehicle is actually FLYING -- i.e. not the post-touchdown
-	LANDED hold.
-
-	Any statistic about the descent (achieved divergence, thrust, tracking error,
-	touchdown velocity) must exclude LANDED rows, which are the vehicle sitting on
-	the platform at zero thrust. Before the LANDED substate existed those rows were
-	labelled "descend" and silently dominated: in one run 1437 of 2065 "descend"
-	rows were post-touchdown, and the descent's achieved divergence read 0.012
-	instead of its true 0.238.
+	``max_time`` is expressed in simulated seconds after ``data.t0``. The
+	clipping is applied before plotting and summary generation.
 	"""
-	if "mission_substate" not in df.columns:
-		return np.ones(len(df), dtype=bool)
-	return df["mission_substate"].astype(str).fillna("").to_numpy() != "landed"
+	if max_time is None:
+		return data
+	if not np.isfinite(max_time) or max_time <= 0.0:
+		raise ValueError("--max-time must be a finite value greater than zero.")
+
+	clipped_t1 = min(data.t1, data.t0 + float(max_time))
+	controller = data.controller[
+		np.isfinite(data.controller["_sim_time"])
+		& (data.controller["_sim_time"] >= data.t0)
+		& (data.controller["_sim_time"] <= clipped_t1)
+	].copy()
+	control = data.control[
+		np.isfinite(data.control["_sim_time"])
+		& (data.control["_sim_time"] >= data.t0)
+		& (data.control["_sim_time"] <= clipped_t1)
+	].copy()
+	truth = data.truth[
+		np.isfinite(data.truth["_sim_time"])
+		& (data.truth["_sim_time"] >= data.t0)
+		& (data.truth["_sim_time"] <= clipped_t1)
+	].copy()
+	if truth.empty:
+		raise ValueError("--max-time leaves no Gazebo truth samples to plot.")
+	return AnalysisData(controller=controller, control=control, truth=truth, t0=data.t0, t1=clipped_t1)
 
 
-def _after_descend_start_mask(df: pd.DataFrame) -> np.ndarray:
-	"""Rows at/after the first DESCEND sample, or all rows for older logs.
-
-	Touchdown heuristics should not accidentally trigger on a pre-flight zero
-	thrust sample, so when mission_substate is available we only search once the
-	mission has actually entered DESCEND.
-	"""
-	mask = np.ones(len(df), dtype=bool)
-	if "mission_substate" not in df.columns:
-		return mask
-	sub = df["mission_substate"].astype(str).fillna("").to_numpy()
-	descend_idxs = np.where(sub == "descend")[0]
-	if len(descend_idxs) == 0:
-		return mask
-	mask[:] = False
-	mask[int(descend_idxs[0]):] = True
-	return mask
+def _relative_time(values: Iterable[float], t0: float) -> np.ndarray:
+	return np.asarray(values, dtype=float) - t0
 
 
-def _detect_touchdown(df: pd.DataFrame, t: np.ndarray) -> Optional[dict]:
-	"""Best-effort touchdown detector for log analysis.
-
-	Preferred signal is an explicit touchdown/landed boolean if present. The
-	current logs usually expose touchdown indirectly by command_thrust dropping
-	to zero after DESCEND, so that is the main fallback. If neither is available,
-	use |relative_z| approaching zero after DESCEND.
-	"""
-	after_descend = _after_descend_start_mask(df)
-
-	# BEST signal: the explicit LANDED substate. bee_node latches it via
-	# MissionRoutine.mark_landed() the instant its own touchdown detector fires, so
-	# this is the node's own verdict rather than a heuristic reconstructed from the
-	# thrust trace. Everything below is a fallback for logs written before the
-	# substate existed.
-	if "mission_substate" in df.columns:
-		sub = df["mission_substate"].astype(str).fillna("").to_numpy()
-		idx = _first_true_index(sub == "landed")
-		if idx is not None:
-			return {"idx": idx, "t": float(t[idx]), "source": "mission_substate=landed"}
-
-	for col in (
-		"touchdown",
-		"touchdown_detected",
-		"landed",
-		"vehicle_landed",
-		"contact_detected",
-		"in_contact",
-	):
-		if col in df.columns:
-			idx = _first_true_index(bool_column(df, col) & after_descend)
-			if idx is not None:
-				return {"idx": idx, "t": float(t[idx]), "source": col}
-
-	if "command_thrust" in df.columns:
-		thrust = numeric_column(df, "command_thrust")
-		finite = np.isfinite(thrust)
-		seen_positive = np.maximum.accumulate(finite & (thrust > 1e-4))
-		mask = finite & seen_positive & after_descend & (thrust <= 1e-6)
-		idx = _first_true_index(mask)
-		if idx is not None:
-			return {"idx": idx, "t": float(t[idx]), "source": "command_thrust<=0"}
-
-	if "relative_z_m" in df.columns:
-		relz = numeric_column(df, "relative_z_m")
-		height = np.abs(relz)
-		finite = np.isfinite(height)
-		seen_above = np.maximum.accumulate(finite & after_descend & (height > 0.10))
-		mask = finite & after_descend & seen_above & (height <= 0.03)
-		idx = _first_true_index(mask)
-		if idx is not None:
-			return {"idx": idx, "t": float(t[idx]), "source": "|relative_z|<=0.03m"}
-
-	return None
-
-
-def _smooth_until_index(t: np.ndarray, y: np.ndarray, end_idx: Optional[int], window_sec: float = 0.6) -> np.ndarray:
-	"""Smooth y only up to end_idx inclusive; keep the rest NaN.
-
-	For touchdown velocity, this deliberately prevents post-contact samples from
-	being used by the centered rolling window at the end of the pre-contact trace.
-	"""
-	y = np.asarray(y, dtype=float)
-	y_smooth = np.full_like(y, np.nan, dtype=float)
-	if len(y) == 0:
-		return y_smooth
-	end = len(y) if end_idx is None else max(0, min(len(y), int(end_idx) + 1))
-	if end <= 0:
-		return y_smooth
-	y_smooth[:end] = _rolling_smooth(np.asarray(t[:end], dtype=float), y[:end], window_sec=window_sec)
-	return y_smooth
-
-
-def _touchdown_velocity(df: pd.DataFrame, t: np.ndarray, window_sec: float = 0.6) -> Optional[dict]:
-	"""Return raw and smoothed relative z-velocity at touchdown, if detectable."""
-	touch = _detect_touchdown(df, t)
-	if touch is None or "relative_vz_m_s" not in df.columns:
-		return None
-	vz = numeric_column(df, "relative_vz_m_s")
-	vz_s = _smooth_until_index(t, vz, touch["idx"], window_sec=window_sec)
-	idx = int(touch["idx"])
-	raw = float(vz[idx]) if idx < len(vz) and np.isfinite(vz[idx]) else float("nan")
-	smoothed = float(vz_s[idx]) if idx < len(vz_s) and np.isfinite(vz_s[idx]) else raw
-	out = dict(touch)
-	out.update({"relative_vz_raw": raw, "relative_vz_smoothed": smoothed, "smooth_window_sec": float(window_sec)})
-	if "relative_z_m" in df.columns:
-		relz = numeric_column(df, "relative_z_m")
-		if idx < len(relz) and np.isfinite(relz[idx]):
-			out["relative_z_m"] = float(relz[idx])
+def _interp_truth(data: AnalysisData, column: str, at_sim_time: np.ndarray) -> np.ndarray:
+	if column not in data.truth.columns:
+		return np.full_like(at_sim_time, np.nan, dtype=float)
+	t = data.truth["_sim_time"].to_numpy(float)
+	y = _num(data.truth, column).to_numpy(float)
+	good = np.isfinite(t) & np.isfinite(y)
+	if good.sum() < 2:
+		return np.full_like(at_sim_time, np.nan, dtype=float)
+	t = t[good]
+	y = y[good]
+	order = np.argsort(t)
+	t = t[order]
+	y = y[order]
+	out = np.interp(at_sim_time, t, y)
+	out[(at_sim_time < t[0]) | (at_sim_time > t[-1])] = np.nan
 	return out
 
 
-def _append_touchdown_summary(df: pd.DataFrame, t: np.ndarray, lines: list):
-	touch = _touchdown_velocity(df, t)
-	if touch is None:
-		return
-
-	z_note = ""
-	if "relative_z_m" in touch:
-		z_note = f", relative_z={touch['relative_z_m']:+.3f} m"
-	lines.append(
-		f"Touchdown relative z-velocity (closing +, smoothed {touch['smooth_window_sec']:.1f}s): "
-		f"{touch['relative_vz_smoothed']:+.4f} m/s "
-		f"(raw {touch['relative_vz_raw']:+.4f} m/s, t={touch['t']:.3f}s, "
-		f"source={touch['source']}{z_note})"
-	)
-
-# ---------------------------------------------------------------------------
-# Frequency helpers
-# ---------------------------------------------------------------------------
-
-
-def sine_fit_at_frequency(t: np.ndarray, y: np.ndarray, frequency_hz: float) -> Optional[dict]:
-	if frequency_hz is None or frequency_hz <= 0.0:
-		return None
-	mask = np.isfinite(t) & np.isfinite(y)
-	if np.count_nonzero(mask) < 8:
-		return None
-
-	tt = t[mask]
-	yy = y[mask]
-	w = 2.0 * math.pi * frequency_hz
-	X = np.column_stack([np.ones_like(tt), np.sin(w * tt), np.cos(w * tt)])
-	coeff, *_ = np.linalg.lstsq(X, yy, rcond=None)
-	offset, a_sin, b_cos = [float(v) for v in coeff]
-	y_hat = X @ coeff
-	amp = float(math.hypot(a_sin, b_cos))
-	phase = float(math.atan2(b_cos, a_sin))
-	rmse = float(np.sqrt(np.mean((yy - y_hat) ** 2)))
-	return {
-		"frequency_hz": float(frequency_hz),
-		"period_s": 1.0 / float(frequency_hz),
-		"amplitude": amp,
-		"offset": offset,
-		"phase_rad": phase,
-		"rmse": rmse,
-		"t": tt,
-		"fit": y_hat,
-	}
-
-
-def dominant_frequency_fft(
-	t: np.ndarray,
-	y: np.ndarray,
-	min_frequency_hz: float = 0.01,
-	max_frequency_hz: float = 2.0,
-) -> Optional[dict]:
-	mask = np.isfinite(t) & np.isfinite(y)
-	if np.count_nonzero(mask) < 20:
-		return None
-
-	tt = t[mask]
-	yy = y[mask]
-	order = np.argsort(tt)
-	tt = tt[order]
-	yy = yy[order]
-
-	span = float(tt[-1] - tt[0])
-	dt = median_positive_dt(tt)
-	if not np.isfinite(dt) or dt <= 1e-9 or span <= 0.0:
-		return None
-
-	n = int(max(32, math.floor(span / dt) + 1))
-	t_uniform = np.linspace(tt[0], tt[-1], n)
-	y_uniform = np.interp(t_uniform, tt, yy)
-	y_uniform = y_uniform - float(np.mean(y_uniform))
-
-	freqs = np.fft.rfftfreq(n, d=(t_uniform[1] - t_uniform[0]))
-	spec = np.abs(np.fft.rfft(y_uniform))
-	valid = (freqs >= min_frequency_hz) & (freqs <= max_frequency_hz)
-	if not np.any(valid):
-		return None
-
-	idxs = np.where(valid)[0]
-	idx = int(idxs[np.argmax(spec[valid])])
-	return {
-		"frequency_hz": float(freqs[idx]),
-		"period_s": float(1.0 / freqs[idx]) if freqs[idx] > 1e-12 else float("inf"),
-		"freqs": freqs,
-		"spectrum": spec,
-	}
-
-
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
-
-
-def compute_summary(
-	df: pd.DataFrame,
-	t: np.ndarray,
-	time_column: str,
-	time_description: str,
-	expected_platform_frequency_hz: Optional[float],
-) -> str:
-	lines = []
-	lines.append("BEE_LAND log summary")
-	lines.append("====================")
-	lines.append(f"Rows: {len(df)}")
-	lines.append(f"Time base: {time_description}")
-	lines.append(f"Analysis time span: {np.nanmin(t):.3f} s -> {np.nanmax(t):.3f} s")
-	lines.append(f"Median analysis dt: {median_positive_dt(t):.4f} s")
-
-	rtf = estimate_rtf(df, t)
-	if rtf is not None:
-		lines.append(f"Median visual/sim time per wall time: {rtf:.3f}")
-
-	if "target_found" in df.columns:
-		target_found = bool_column(df, "target_found")
-		lines.append(f"Target found ratio: {np.mean(target_found):.3f}")
-	if "flow_valid" in df.columns:
-		flow_valid = bool_column(df, "flow_valid")
-		lines.append(f"Flow valid ratio: {np.mean(flow_valid):.3f}")
-	if "target_fov_saturated" in df.columns:
-		sat = bool_column(df, "target_fov_saturated")
-		lines.append(f"FOV saturated samples: {np.count_nonzero(sat)} / {len(sat)}")
-
-	for col, label in [
-		("command_roll_rad", "roll command [rad]"),
-		("command_pitch_rad", "pitch command [rad]"),
-		("command_thrust", "thrust command [-]"),
-		("flow_divergence_1_s", "flow divergence [1/s]"),
-		("relative_z_m", "relative z [m]"),
-		("relative_vz_m_s", "relative vz [m/s]"),
-	]:
-		if col in df.columns:
-			y = numeric_column(df, col)
-			finite = y[np.isfinite(y)]
-			if len(finite):
-				lines.append(
-					f"{label}: min={np.min(finite):.4g}, median={np.median(finite):.4g}, max={np.max(finite):.4g}"
-				)
-
-	if "platform_z_m" in df.columns:
-		z = numeric_column(df, "platform_z_m")
-		finite = z[np.isfinite(z)]
-		if len(finite):
-			lines.append(
-				f"Platform z range: {np.min(finite):.4f} m -> {np.max(finite):.4f} m "
-				f"(peak-to-peak {np.max(finite) - np.min(finite):.4f} m)"
-			)
-
-		dom = dominant_frequency_fft(t, z, min_frequency_hz=0.01, max_frequency_hz=2.0)
-		if dom is not None:
-			lines.append(
-				f"Platform z dominant frequency: {dom['frequency_hz']:.4f} Hz "
-				f"(period {dom['period_s']:.3f} s)"
-			)
-
-		fit = sine_fit_at_frequency(t, z, expected_platform_frequency_hz)
-		if fit is not None:
-			lines.append(
-				f"Platform z fit at expected frequency {expected_platform_frequency_hz:.4f} Hz: "
-				f"amplitude={fit['amplitude']:.4f} m, offset={fit['offset']:.4f} m, "
-				f"RMSE={fit['rmse']:.5f} m"
-			)
-
-	_append_mission_summary(df, t, lines)
-	_append_touchdown_summary(df, t, lines)
-	_append_latency_summary(df, lines)
-
-	return "\n".join(lines) + "\n"
-
-
-def _last_finite(df: pd.DataFrame, col: str) -> Optional[float]:
-	if col not in df.columns:
-		return None
-	y = numeric_column(df, col)
-	y = y[np.isfinite(y)]
-	return float(y[-1]) if len(y) else None
-
-
-def _append_mission_summary(df: pd.DataFrame, t: np.ndarray, lines: list):
-	"""Mission routine: bounds, feasibility verdict, phase durations, and the
-	open-loop height-prediction error -- the numbers needed to tune the bounds."""
-	if "mission_substate" not in df.columns:
-		return
-	sub = df["mission_substate"].astype(str).fillna("").to_numpy()
-	if not np.any((sub != "") & (sub != "nan")):
-		return
-
-	lines.append("")
-	lines.append("Mission (probe -> gate -> scheduled-gain descent)")
-	lines.append("-------------------------------------------------")
-
-	peak = _last_finite(df, "mission_peak_accel_m_s2")
-	k_min = _last_finite(df, "mission_k_min")
-	k_explore = _last_finite(df, "mission_k_explore")
-	h_crit = _last_finite(df, "mission_h_crit_m")
-	feasible = _last_finite(df, "mission_feasible")
-	if peak is not None:
-		lines.append(f"Probe peak platform accel: {peak:.4f} m/s^2")
-	if k_min is not None and k_explore is not None:
-		lines.append(f"k_min (Herisse floor): {k_min:.4f}   k_explore (hand-tuned initial gain): {k_explore:.4f}")
-	if h_crit is not None:
-		lines.append(f"h_crit (gain hits floor): {h_crit:.4f} m")
-
-	# --- CALIBRATION READOUT for NEAR_FIELD_HEIGHT_M ---------------------------
-	# The whole gain schedule is anchored on the height at which the near-field
-	# trigger fires (bee_node.NEAR_FIELD_HEIGHT_M): k_probe = margin *
-	# k_ceiling(that height). It is a camera-geometry constant, so unlike h0 it is
-	# directly measurable -- here it is, from relative_z_m at the FINAL_PROBE
-	# transition. Copy the measured number back into NEAR_FIELD_HEIGHT_M.
-	if "relative_z_m" in df.columns:
-		entry_idx = _first_true_index(sub == "final_probe")
-		if entry_idx is not None:
-			h_meas = numeric_column(df, "relative_z_m")[entry_idx]
-			if np.isfinite(h_meas):
-				h_meas = abs(float(h_meas))
-				assumed = _last_finite(df, "mission_near_field_height_m")
-				line = f"Height at FINAL_PROBE entry (MEASURED): {h_meas:.3f} m"
-				if assumed is not None and np.isfinite(assumed) and assumed > 0.0:
-					err = 100.0 * (assumed - h_meas) / h_meas
-					line += f"   vs NEAR_FIELD_HEIGHT_M = {assumed:.3f} m ({err:+.0f}%)"
-					if assumed > h_meas * 1.15:
-						line += "\n  WARNING: the anchor is HIGHER than reality -> k_probe was set"
-						line += "\n  above the true ceiling at the probe height. Lower it."
-				lines.append(line)
-
-	k_probe = _last_finite(df, "mission_k_probe")
-	k_ceiling = _last_finite(df, "mission_k_ceiling_leg")
-	k_floor = _last_finite(df, "mission_k_floor")
-	if k_probe is not None and k_floor is not None:
-		lines.append(
-			f"Gain walk-down: k_explore {k_explore:.2f} -> k_probe {k_probe:.2f} "
-			f"(flat through FINAL_PROBE) -> k_floor {k_floor:.2f}"
-		)
-	if k_ceiling is not None:
-		lines.append(f"k_ceiling at leg height: {k_ceiling:.4f}")
-
-	if feasible is not None:
-		lines.append(f"Feasibility verdict: {'FEASIBLE' if feasible >= 0.5 else 'INFEASIBLE'}")
-
-	spans = _mission_phase_spans(df, t)
-	if spans:
-		durations: dict = {}
-		for t0, t1, s in spans:
-			durations[s] = durations.get(s, 0.0) + max(0.0, float(t1 - t0))
-		dur_str = ", ".join(f"{s}={d:.1f}s" for s, d in durations.items())
-		lines.append(f"Phase durations: {dur_str}")
-
-	if "mission_thrust_gain_k" in df.columns:
-		k = numeric_column(df, "mission_thrust_gain_k")
-		kf = k[np.isfinite(k)]
-		if len(kf):
-			lines.append(f"Commanded thrust gain k(t) range: {np.min(kf):.4f} -> {np.max(kf):.4f}")
-
-	if "mission_h_pred_m" in df.columns and "relative_z_m" in df.columns:
-		h_pred = numeric_column(df, "mission_h_pred_m")
-		truth = np.abs(numeric_column(df, "relative_z_m"))
-		mask = np.isfinite(h_pred) & np.isfinite(truth)
-		if np.count_nonzero(mask) >= 3:
-			err = h_pred[mask] - truth[mask]
-			lines.append(
-				f"Open-loop height prediction error (h_pred - |relative_z|): "
-				f"median={np.median(err):+.3f} m, RMS={np.sqrt(np.mean(err**2)):.3f} m, "
-				f"max|err|={np.max(np.abs(err)):.3f} m"
-			)
-			lines.append(
-				"  (large/growing error here means the gain is scheduled at the "
-				"wrong height -- use a more pessimistic descent or a live estimator)"
-			)
-
-	consistency = _divergence_consistency(df, t)
-	if consistency is not None:
-		if "onset_t" in consistency:
-			lines.append(
-				f"Divergence/kinematics decorrelation: SUSTAINED mismatch from "
-				f"t={consistency['onset_t']:.1f}s (height={consistency['onset_height']:.2f} m) "
-				f"through end of log -- flow_divergence stops reflecting the true closing "
-				f"rate there (see divergence_consistency.png). This is a SENSING issue, "
-				f"not a gain issue."
-			)
-		else:
-			lines.append(
-				"Divergence/kinematics decorrelation: none detected -- flow_divergence "
-				"tracked relative_vz/|relative_z| to the end of the log."
-			)
-
-
-def _select_latency_rows(df: pd.DataFrame) -> Tuple[pd.DataFrame, str]:
-	"""Restrict to the regime that actually drives VISION_PROCESSING_LATENCY_
-	BUDGET_SEC: DESCEND phase, pre-touchdown. Far-field/on-ground/post-
-	touchdown frames are systematically cheaper (smaller or trivial ROI, no
-	real motion) and would understate the number that matters if left in.
-	Falls back gracefully to the whole log if mission_substate/command_thrust
-	aren't present (older logs, or logs from phases before descent)."""
-	subset = df
-	description = f"all {len(df)} rows"
-
-	if "mission_substate" in df.columns:
-		mask = df["mission_substate"].astype(str) == "descend"
-		if mask.any():
-			subset = df.loc[mask]
-			description = f"{len(subset)} DESCEND-phase rows"
-			if "command_thrust" in subset.columns:
-				thrust = numeric_column(subset, "command_thrust")
-				pre_touchdown = thrust > 0
-				# Only narrow further if this actually excludes something --
-				# an all-True or all-NaN thrust column means the filter has
-				# nothing to add, so leave description as just DESCEND.
-				if 0 < int(np.sum(pre_touchdown)) < len(subset):
-					subset = subset.loc[pre_touchdown]
-					description = f"{len(subset)} DESCEND-phase rows, pre-touchdown (command_thrust>0)"
-
-	return subset, description
-
-
-# Stage-by-stage on_camera timing (see diagnostics_writer.py's timing_stage_*
-# columns / bee_node.py's on_camera instrumentation). This is a PERMANENT
-# instrumentation feature, not one of the removed investigation-only
-# diagnostics -- every log going forward should have these columns.
-#
-# v2.0 note: target_acquisition/optical_flow moved out of on_camera into a
-# separate vision_worker process (see vision_worker.py / bee_node.py's
-# _ship_frame_to_vision + _drain_vision_results). timing_stage_target_
-# acquisition_ms and timing_stage_optical_flow_ms are therefore EXPECTED
-# BLANK in v2.0-and-later logs -- on_camera no longer runs those two calls, so
-# there is nothing to time there. They are left in this table (not removed)
-# so older, pre-v2.0 logs -- where on_camera ran them inline -- still get a
-# complete on_camera breakdown when re-analysed. The honest v2.0 replacement
-# numbers are in VISION_WORKER_COLUMNS / _append_vision_worker_summary below:
-# worker_*_ms is the same two calls' cost, measured in the worker process
-# instead of on_camera, and is NOT part of the on_camera total anymore.
-LATENCY_STAGE_COLUMNS = [
-	("timing_stage_bridge_ms", "cv_bridge conversion"),
-	("timing_stage_rotate_ms", "cv2.rotate"),
-	("timing_stage_show_camera_ms", "imshow/waitKey debug window"),
-	("timing_stage_body_rate_ms", "body-rate buffer lookup"),
-	("timing_stage_target_acquisition_ms", "target_acquisition.update() [pre-v2.0 only]"),
-	("timing_stage_optical_flow_ms", "optical_flow.update() [pre-v2.0 only]"),
-	("timing_camera_cb_duration_ms", "on_camera TOTAL"),
-]
-
-# v2.0 out-of-process vision pipeline (see vision_worker.py). worker_* are the
-# worker's own measurement of the two calls it now owns -- comparable to the
-# pre-v2.0 timing_stage_target_acquisition_ms/timing_stage_optical_flow_ms
-# numbers above, but measured in a different process, so they are reported
-# separately rather than folded into the on_camera table (that folding was
-# the original v2.0-rollout bug: a worker-side number appearing as an
-# on_camera sub-stage that summed to more than on_camera's own total).
-# frame_to_available/frame_to_command are the real cross-process latencies
-# the pre-v2.0 stage timers never captured -- frame_to_command is the number
-# to compare against a pre-v2.0 log's on_camera TOTAL to judge whether moving
-# vision out of process actually helped the control loop.
-VISION_WORKER_COLUMNS = [
-	("timing_worker_target_acquisition_ms", "worker: target_acquisition.update()"),
-	("timing_worker_optical_flow_ms", "worker: optical_flow.update()"),
-	("timing_frame_to_available_wall_ms", "frame arrival -> result available"),
-	("timing_frame_to_command_wall_ms", "frame arrival -> command computed"),
-	("timing_vision_result_period_wall_ms", "period between processed results"),
-]
-
-
-def _append_latency_summary(df: pd.DataFrame, lines: list):
-	"""Per-stage vision-pipeline latency: mean/median/p95/max in ms, over the
-	DESCEND-phase pre-touchdown rows when available (see _select_latency_rows).
-	No-op (nothing appended) for older logs that predate this instrumentation."""
-	if not any(col in df.columns for col, _ in LATENCY_STAGE_COLUMNS):
-		return
-
-	subset, region_description = _select_latency_rows(df)
-
-	table_rows = []
-	for col, label in LATENCY_STAGE_COLUMNS:
-		if col not in subset.columns:
-			continue
-		values = numeric_column(subset, col)
-		finite = values[np.isfinite(values)]
-		if len(finite) == 0:
-			continue
-		table_rows.append(
-			f"{label:40s}{np.mean(finite):8.2f}{np.median(finite):8.2f}"
-			f"{np.percentile(finite, 95):8.2f}{np.max(finite):8.2f}"
-		)
-	if not table_rows:
-		return
-
-	lines.append("")
-	lines.append("Vision pipeline latency (on_camera stage breakdown, ms)")
-	lines.append("--------------------------------------------------------")
-	lines.append(f"Computed over: {region_description}")
-	lines.append(f"{'stage':40s}{'mean':>8}{'median':>8}{'p95':>8}{'max':>8}")
-	lines.extend(table_rows)
-	if (
-		"timing_stage_target_acquisition_ms" not in subset.columns
-		or numeric_column(subset, "timing_stage_target_acquisition_ms")[
-			np.isfinite(numeric_column(subset, "timing_stage_target_acquisition_ms"))
-		].size == 0
-	):
-		lines.append(
-			"(target_acquisition/optical_flow rows blank/absent above: this is a "
-			"v2.0-or-later log -- those two calls now run in vision_worker, not "
-			"on_camera. See the vision worker table below.)"
-		)
-
-	_append_vision_worker_summary(subset, region_description, lines)
-
-	# Legacy scheduling-delay diagnostic (camera interarrival jitter): only
-	# present in logs captured during the in-process-contention investigation
-	# and since removed from live instrumentation. Included opportunistically
-	# if an old log still has it, so nothing is silently dropped when
-	# re-analysing past runs, but absent from current/future logs.
-	if "timing_camera_interarrival_jitter_ms" in subset.columns:
-		values = numeric_column(subset, "timing_camera_interarrival_jitter_ms")
-		finite = values[np.isfinite(values)]
-		if len(finite):
-			lines.append("")
-			lines.append(
-				f"(legacy, this log only) camera interarrival jitter: "
-				f"mean={np.mean(finite):.2f} median={np.median(finite):.2f} "
-				f"p95={np.percentile(finite, 95):.2f} max={np.max(finite):.2f} ms"
-			)
-
-
-def _append_vision_worker_summary(subset: pd.DataFrame, region_description: str, lines: list):
-	"""v2.0 out-of-process vision worker: per-call cost measured in the worker
-	process, plus the real frame->available and frame->command cross-process
-	latencies (see VISION_WORKER_COLUMNS's docstring above). No-op for logs
-	that predate v2.0 (none of these columns exist yet)."""
-	if not any(col in subset.columns for col, _ in VISION_WORKER_COLUMNS):
-		return
-
-	table_rows = []
-	for col, label in VISION_WORKER_COLUMNS:
-		if col not in subset.columns:
-			continue
-		values = numeric_column(subset, col)
-		finite = values[np.isfinite(values)]
-		if len(finite) == 0:
-			continue
-		table_rows.append(
-			f"{label:40s}{np.mean(finite):8.2f}{np.median(finite):8.2f}"
-			f"{np.percentile(finite, 95):8.2f}{np.max(finite):8.2f}"
-		)
-	if not table_rows:
-		return
-
-	lines.append("")
-	lines.append("Vision worker latency (v2.0 out-of-process pipeline, ms)")
-	lines.append("--------------------------------------------------------")
-	lines.append(f"Computed over: {region_description}")
-	lines.append(f"{'stage':40s}{'mean':>8}{'median':>8}{'p95':>8}{'max':>8}")
-	lines.extend(table_rows)
-
-	if "timing_vision_dropped_frames" in subset.columns:
-		dropped = numeric_column(subset, "timing_vision_dropped_frames")
-		dropped = dropped[np.isfinite(dropped)]
-		if len(dropped):
-			# Monotonically-increasing counter (bee_node._vision_dropped_frames),
-			# so the count over this region is the increase across it, not a
-			# mean/max of the running total.
-			net_dropped = int(np.max(dropped) - np.min(dropped))
-			lines.append(
-				f"Frames dropped at the input queue (worker fell behind): {net_dropped} "
-				f"over {len(dropped)} rows in this region"
-			)
-
-
-def write_summary(output_dir: str | Path, summary: str):
-	path = Path(output_dir) / "summary.txt"
-	path.write_text(summary, encoding="utf-8")
-	print(summary.rstrip())
-	print(f"Saved: {path}")
-
-
-# ---------------------------------------------------------------------------
-# Plotting: synthetic defaults
-# ---------------------------------------------------------------------------
-
-
-def _mark_bool_false(ax, t: np.ndarray, mask_false: np.ndarray, label: str):
-	if np.any(mask_false):
-		ax.scatter(t[mask_false], np.zeros(np.count_nonzero(mask_false)), marker="x", s=24, label=label)
-
-
-def plot_target_detection_summary(df: pd.DataFrame, t: np.ndarray, output_dir: str):
-	required_any = ["target_offset_x", "target_offset_y", "target_area_fraction", "target_confidence"]
-	if not any(c in df.columns for c in required_any):
-		print("Skipping target detection summary. No target columns found.")
-		return
-
-	target_found = bool_column(df, "target_found", default=True)
-	fov_sat = bool_column(df, "target_fov_saturated", default=False)
-
-	fig, axes = plt.subplots(3, 1, figsize=(11, 8), sharex=True)
-	fig.suptitle("Target detection summary")
-
-	# Phase shading: detection quality is only interpretable against WHICH PHASE
-	# it happened in -- e.g. area_fraction crossing FOV_NEAR_AREA_FRACTION is what
-	# TRIGGERS the FINAL_PROBE boundary drawn here, so the two must be read
-	# together.
-	for ax in axes:
-		shade_mission_phases(ax, df, t, label_once=(ax is axes[0]))
-
-	if "target_offset_x" in df.columns:
-		axes[0].plot(t, numeric_column(df, "target_offset_x"), label=label_for("target_offset_x"))
-	if "target_offset_y" in df.columns:
-		axes[0].plot(t, numeric_column(df, "target_offset_y"), label=label_for("target_offset_y"))
-	_mark_bool_false(axes[0], t, ~target_found, "target not found")
-	axes[0].axhline(0.0, linestyle="--", linewidth=1)
-	axes[0].set_ylabel("offset [-]")
-	axes[0].grid(True)
-	axes[0].legend(loc="best")
-
-	if "target_area_fraction" in df.columns:
-		axes[1].plot(t, numeric_column(df, "target_area_fraction"), label=label_for("target_area_fraction"))
-	if np.any(fov_sat):
-		axes[1].scatter(t[fov_sat], numeric_column(df, "target_area_fraction")[fov_sat], marker="o", s=18, label=label_for("target_fov_saturated"))
-	axes[1].set_ylabel("area fraction [-]")
-	axes[1].grid(True)
-	axes[1].legend(loc="best")
-
-	if "target_confidence" in df.columns:
-		axes[2].plot(t, numeric_column(df, "target_confidence"), label=label_for("target_confidence"))
-	axes[2].fill_between(t, 0, 1, where=~target_found, alpha=0.15, label="not found")
-	axes[2].set_ylim(-0.05, 1.05)
-	axes[2].set_ylabel("confidence [-]")
-	axes[2].set_xlabel("time [s]")
-	axes[2].grid(True)
-	axes[2].legend(loc="best")
-
-	save_current_figure(output_dir, "target_detection_summary.png")
-
-
-def plot_lateral_control(df: pd.DataFrame, t: np.ndarray, output_dir: str):
-	have_flow = any(c in df.columns for c in ["flow_mean_x_norm_s", "flow_mean_y_norm_s"])
-	if not any(c in df.columns for c in ["target_offset_x", "target_offset_y", "command_roll_rad", "command_pitch_rad"]):
-		print("Skipping lateral control plot. Missing lateral target/command columns.")
-		return
-
-	n_rows = 3 if have_flow else 2
-	fig, axes = plt.subplots(n_rows, 1, figsize=(11, 6.5 + (2.2 if have_flow else 0)), sharex=True)
-	fig.suptitle("Lateral visual control")
-
-	shade_mission_phases(axes[0], df, t)
-	if "target_offset_x" in df.columns:
-		axes[0].plot(t, numeric_column(df, "target_offset_x"), label=label_for("target_offset_x"))
-	if "target_offset_y" in df.columns:
-		axes[0].plot(t, numeric_column(df, "target_offset_y"), label=label_for("target_offset_y"))
-	axes[0].axhline(0.0, linestyle="--", linewidth=1)
-	axes[0].set_ylabel("image offset [-]\n(P-term input)")
-	axes[0].grid(True)
-	axes[0].legend(loc="best")
-
-	flow_axis = 1 if have_flow else None
-	if have_flow:
-		ax = axes[1]
-		shade_mission_phases(ax, df, t)
-		if "flow_mean_x_norm_s" in df.columns:
-			ax.plot(t, numeric_column(df, "flow_mean_x_norm_s"), label=label_for("flow_mean_x_norm_s"), color="tab:green")
-		if "flow_mean_y_norm_s" in df.columns:
-			ax.plot(t, numeric_column(df, "flow_mean_y_norm_s"), label=label_for("flow_mean_y_norm_s"), color="tab:red")
-		ax.axhline(0.0, linestyle="--", linewidth=1)
-		# Same [-1,1]-per-frame-half-width/height normalization as offset_x/y
-		# above (see optical_flow.py / target_acquisition.py) -- units here are
-		# that same normalized scale per second, i.e. directly comparable in
-		# SPACE to the offset panel, differing only by the /s (this is the
-		# D-term input; compare its noise/lag directly against the P-term
-		# panel above when investigating derivative-term behavior).
-		ax.set_ylabel("normalized flow [1/s]\n(D-term input)")
-		ax.grid(True)
-		ax.legend(loc="best")
-
-	cmd_axis = axes[-1]
-	if "command_roll_rad" in df.columns:
-		cmd_axis.plot(t, numeric_column(df, "command_roll_rad"), label=label_for("command_roll_rad"))
-	if "command_pitch_rad" in df.columns:
-		cmd_axis.plot(t, numeric_column(df, "command_pitch_rad"), label=label_for("command_pitch_rad"))
-	shade_mission_phases(cmd_axis, df, t)
-	cmd_axis.axhline(0.0, linestyle="--", linewidth=1)
-	cmd_axis.set_ylabel("command [rad]")
-	cmd_axis.set_xlabel("time [s]")
-	cmd_axis.grid(True)
-	cmd_axis.legend(loc="best")
-
-	save_current_figure(output_dir, "lateral_control.png")
-
-
-def plot_vertical_divergence(df: pd.DataFrame, t: np.ndarray, output_dir: str, divergence_setpoint: Optional[float] = None):
-	"""The vertical loop's ERROR SIGNAL: what divergence we asked for, what we
-	measured, and what the integrator did about the gap.
-
-	Split out of the old 4-panel vertical_control figure, which crammed the loop's
-	input and its physical outcome onto one unreadable axis stack. This is the
-	"what did the controller SEE" half; plot_vertical_descent is the "what did the
-	vehicle DO" half.
-	"""
-	available = any(c in df.columns for c in ["flow_divergence_1_s", "mission_divergence_setpoint_1_s", "command_thrust_integral"])
-	if not available:
-		print("Skipping vertical divergence plot. Missing divergence columns.")
-		return
-
-	have_integral = "command_thrust_integral" in df.columns and np.any(
-		np.isfinite(numeric_column(df, "command_thrust_integral"))
-	)
-	n_rows = 2 if have_integral else 1
-	fig, axes = plt.subplots(n_rows, 1, figsize=(11, 4.5 * n_rows), sharex=True, squeeze=False)
-	axes = axes[:, 0]
-	fig.suptitle("Vertical loop: divergence tracking")
-
-	ax = axes[0]
-	if "flow_divergence_1_s" in df.columns:
-		ax.plot(t, numeric_column(df, "flow_divergence_1_s"), label=label_for("flow_divergence_1_s"))
-	if "flow_raw_divergence_1_s" in df.columns:
-		ax.plot(t, numeric_column(df, "flow_raw_divergence_1_s"), label=label_for("flow_raw_divergence_1_s"), alpha=0.75)
-	# Prefer the actual per-tick commanded setpoint (probe D*=0 -> descent D*,
-	# possibly ramping), falling back to the static CLI value for old logs.
-	if "mission_divergence_setpoint_1_s" in df.columns and np.any(
-		np.isfinite(numeric_column(df, "mission_divergence_setpoint_1_s"))
-	):
-		ax.plot(t, numeric_column(df, "mission_divergence_setpoint_1_s"),
-		        linestyle=":", linewidth=1.8, color="k", label=label_for("mission_divergence_setpoint_1_s"))
-	elif divergence_setpoint is not None:
-		ax.axhline(divergence_setpoint, linestyle=":", linewidth=1.4, label=f"setpoint {divergence_setpoint:g}")
-	shade_mission_phases(ax, df, t)
-	ax.axhline(0.0, linestyle="--", linewidth=1, color="0.4")
-	ax.set_ylabel("divergence [1/s]")
-	ax.grid(True)
-	ax.legend(loc="best", fontsize=8)
-
-	# Achieved-vs-commanded, stated numerically, over the FLYING descend rows only
-	# (post-touchdown LANDED rows would otherwise drag the mean to zero).
-	if {"mission_substate", "mission_divergence_setpoint_1_s", "flow_divergence_1_s"}.issubset(df.columns):
-		sub = df["mission_substate"].astype(str).fillna("").to_numpy()
-		d = (sub == "descend") & _flying_mask(df)
-		if np.any(d):
-			meas = numeric_column(df, "flow_divergence_1_s")[d]
-			cmd = numeric_column(df, "mission_divergence_setpoint_1_s")[d]
-			meas_m, cmd_m = np.nanmedian(meas), np.nanmedian(cmd)
-			if np.isfinite(meas_m) and np.isfinite(cmd_m) and abs(cmd_m) > 1e-6:
-				ax.set_title(
-					f"DESCEND: measured D = {meas_m:+.3f} /s  vs  commanded D* = {cmd_m:+.3f} /s "
-					f"({100.0 * meas_m / cmd_m:.0f}%)",
-					fontsize=9,
-				)
-
-	if have_integral:
-		ax = axes[1]
-		integral = numeric_column(df, "command_thrust_integral")
-		ax.plot(t, integral, color="tab:purple", label=label_for("command_thrust_integral"))
-		shade_mission_phases(ax, df, t)
-		ax.axhline(0.0, linestyle="--", linewidth=1, color="0.4")
-		finite = integral[np.isfinite(integral)]
-		if len(finite):
-			# Flag likely clamp saturation: sustained runs pinned at the series'
-			# own extreme, which is what windup against divergence_integral_limit
-			# looks like from the outside (the limit itself is not logged).
-			hi, lo = float(np.nanmax(finite)), float(np.nanmin(finite))
-			pinned_hi = np.isclose(integral, hi, atol=max(1e-3, 0.01 * abs(hi)))
-			pinned_lo = np.isclose(integral, lo, atol=max(1e-3, 0.01 * abs(lo)))
-			frac_pinned = float(np.mean(pinned_hi | pinned_lo))
-			note = ""
-			if frac_pinned > 0.05 and (hi - lo) > 1e-6:
-				note = f"  ({frac_pinned*100:.0f}% of samples pinned near an extreme -- possible clamp saturation)"
-			ax.set_title(f"range=[{lo:+.3f}, {hi:+.3f}]{note}", fontsize=9)
-		ax.set_ylabel("thrust_integral_gain_const *\nintegral(divergence error)")
-		ax.grid(True)
-		ax.legend(loc="best", fontsize=8)
-
-	axes[-1].set_xlabel("time [s]")
-	save_current_figure(output_dir, "vertical_divergence.png")
-
-
-def plot_vertical_descent(df: pd.DataFrame, t: np.ndarray, output_dir: str):
-	"""The vertical loop's PHYSICAL OUTCOME: closing rate, height, touchdown, and
-	the thrust command that produced them.
-
-	The other half of the old vertical_control figure (see plot_vertical_divergence).
-	"""
-	available = any(c in df.columns for c in ["relative_vz_m_s", "vehicle_vz_m_s", "relative_z_m", "command_thrust"])
-	if not available:
-		print("Skipping vertical descent plot. Missing velocity/height/thrust columns.")
-		return
-
-	fig, axes = plt.subplots(2, 1, figsize=(11, 9), sharex=True)
-	fig.suptitle("Vertical loop: descent profile and thrust")
-	touch = _touchdown_velocity(df, t)
-
-	# --- closing rate + height, with touchdown marked ---
-	ax = axes[0]
-	left_handles, left_labels = [], []
-	if "relative_vz_m_s" in df.columns:
-		vz = numeric_column(df, "relative_vz_m_s")
-		touch_idx = touch["idx"] if touch is not None else None
-		vz_smooth = _smooth_until_index(t, vz, touch_idx, window_sec=0.6)
-		line_raw, = ax.plot(t, vz, label="closing rate (raw)", alpha=0.35)
-		line_smooth, = ax.plot(t, vz_smooth, label="closing rate (smoothed to touchdown)", linewidth=1.9)
-		left_handles.extend([line_raw, line_smooth])
-		left_labels.extend([line_raw.get_label(), line_smooth.get_label()])
-		if touch is not None and np.isfinite(touch.get("relative_vz_smoothed", np.nan)):
-			marker = ax.scatter(
-				[touch["t"]], [touch["relative_vz_smoothed"]],
-				marker="o", s=48, zorder=5, color="tab:red", label="touchdown",
-			)
-			ax.axvline(touch["t"], linestyle="--", linewidth=1.1, alpha=0.75, color="tab:red")
-			ax.annotate(
-				f"touchdown\n{touch['relative_vz_smoothed']:+.3f} m/s",
-				xy=(touch["t"], touch["relative_vz_smoothed"]),
-				xytext=(8, 12), textcoords="offset points", fontsize=8,
-			)
-			left_handles.append(marker)
-			left_labels.append(marker.get_label())
-	elif "vehicle_vz_m_s" in df.columns:
-		line, = ax.plot(t, numeric_column(df, "vehicle_vz_m_s"), label=label_for("vehicle_vz_m_s"))
-		left_handles.append(line)
-		left_labels.append(line.get_label())
-
-	right_handles, right_labels = [], []
-	if "relative_z_m" in df.columns:
-		ax_alt = ax.twinx()
-		line, = ax_alt.plot(t, numeric_column(df, "relative_z_m"), label=label_for("relative_z_m"),
-		                    alpha=0.55, color="tab:green")
-		right_handles.append(line)
-		right_labels.append(line.get_label())
-		ax_alt.set_ylabel("height above platform [m]")
-
-	shade_mission_phases(ax, df, t)
-	ax.axhline(0.0, linestyle="--", linewidth=1, color="0.4")
-	ax.set_ylabel("closing rate [m/s]")
-	ax.grid(True)
-	if left_handles or right_handles:
-		ax.legend(left_handles + right_handles, left_labels + right_labels, loc="best", fontsize=8)
-
-	# --- thrust command ---
-	ax = axes[1]
-	if "command_thrust" in df.columns:
-		ax.plot(t, numeric_column(df, "command_thrust"), label=label_for("command_thrust"))
-		ax.axhline(0.73, linestyle="--", linewidth=1, color="0.4", label="hover ref 0.73")
-	shade_mission_phases(ax, df, t)
-	ax.set_ylabel("thrust [-]")
-	ax.set_xlabel("time [s]")
-	ax.grid(True)
-	ax.legend(loc="best", fontsize=8)
-
-	save_current_figure(output_dir, "vertical_descent.png")
-
-
-def plot_platform_motion_frequency(
-	df: pd.DataFrame,
-	t: np.ndarray,
-	output_dir: str,
-	expected_frequency_hz: Optional[float],
-):
-	if "platform_z_m" not in df.columns:
-		print("Skipping platform motion plot. Missing platform_z_m.")
-		return
-
-	z = numeric_column(df, "platform_z_m")
-	if np.count_nonzero(np.isfinite(z)) < 8:
-		print("Skipping platform motion plot. Not enough platform_z_m samples.")
-		return
-
-	fit = sine_fit_at_frequency(t, z, expected_frequency_hz)
-	dom = dominant_frequency_fft(t, z, min_frequency_hz=0.01, max_frequency_hz=2.0)
-
-	fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=False)
-	fig.suptitle("Platform vertical motion and frequency")
-
-	axes[0].plot(t, z, label="platform_z_m")
-	if fit is not None:
-		order = np.argsort(fit["t"])
-		axes[0].plot(
-			fit["t"][order],
-			fit["fit"][order],
-			linestyle="--",
-			label=(
-				f"fit {fit['frequency_hz']:.3f} Hz, "
-				f"A={fit['amplitude']:.3f} m, RMSE={fit['rmse']:.4f} m"
-			),
-		)
-	axes[0].set_xlabel("time [s]")
-	axes[0].set_ylabel("platform z [m]")
-	axes[0].grid(True)
-	axes[0].legend(loc="best")
-
-	if dom is not None:
-		axes[1].plot(dom["freqs"], dom["spectrum"], label="|FFT(platform_z)|")
-		axes[1].axvline(dom["frequency_hz"], linestyle="--", label=f"dominant {dom['frequency_hz']:.4f} Hz")
-	if expected_frequency_hz is not None and expected_frequency_hz > 0.0:
-		axes[1].axvline(expected_frequency_hz, linestyle=":", label=f"expected {expected_frequency_hz:.4f} Hz")
-	axes[1].set_xlim(left=0.0, right=1.0)
-	axes[1].set_xlabel("frequency [Hz]")
-	axes[1].set_ylabel("|FFT|")
-	axes[1].grid(True)
-	axes[1].legend(loc="best")
-
-	save_current_figure(output_dir, "platform_motion_frequency.png")
-
-
-
-def plot_drone_platform_position_xyz(df: pd.DataFrame, t: np.ndarray, output_dir: str | Path):
-	"""Three-panel position comparison: drone and platform x/y/z.
-
-	vehicle_z_m is PX4 NED (up is negative), while platform_z_m is Gazebo/SDF
-	ENU (up is positive). For a physically readable overlay, the drone z trace
-	is converted to the platform convention as drone_z_enu = -vehicle_z_m.
-	This keeps the bottom panel in one common vertical coordinate system.
-	"""
-	axis_specs = [
-		("x", "vehicle_x_m", "platform_y_m", lambda v: v + 1.5, "position x [m]"),
-		("y", "vehicle_y_m", "platform_x_m", lambda v: v + 1.5, "position y [m]"),
-		("z", "vehicle_z_m", "platform_z_m", lambda v: -v, "position z [m] (up-positive)"),
-	]
-
-	has_any = any(
-		vehicle_col in df.columns or platform_col in df.columns
-		for _, vehicle_col, platform_col, _, _ in axis_specs
-	)
-	if not has_any:
-		print("Skipping drone/platform position plot. No vehicle/platform position columns found.")
-		return
-
-	fig, axes = plt.subplots(3, 1, figsize=(11, 8), sharex=True)
-	fig.suptitle("Drone and platform position by axis")
-
-	for ax, (axis_name, vehicle_col, platform_col, vehicle_transform, ylabel) in zip(axes, axis_specs):
-		# Shade first so the traces draw on top of it (shade_mission_phases uses
-		# zorder=0, but fill order still matters for the legend).
-		shade_mission_phases(ax, df, t, label_once=(ax is axes[0]))
-		plotted = False
-
-		if vehicle_col in df.columns:
-			vehicle = numeric_column(df, vehicle_col)
-			if vehicle_transform is not None:
-				vehicle = vehicle_transform(vehicle)
-				vehicle_label = "drone z = -vehicle_z_m"
-			else:
-				vehicle_label = f"drone {axis_name}"
-			ax.plot(t, vehicle, label=vehicle_label)
-			plotted = True
-
-		if platform_col in df.columns:
-			platform = numeric_column(df, platform_col)
-			ax.plot(t, platform, label=f"platform {axis_name}")
-			plotted = True
-
-		ax.axhline(0.0, linestyle="--", linewidth=1)
-		ax.set_ylabel(ylabel)
-		ax.grid(True)
-		if plotted:
-			ax.legend(loc="best")
-
-	axes[-1].set_xlabel("time [s]")
-	save_current_figure(output_dir, "drone_platform_position_xyz.png")
-
-def plot_closing_rate_spectrum(
-	df: pd.DataFrame,
-	t: np.ndarray,
-	output_dir: str,
-	expected_frequency_hz: Optional[float],
-):
-	if "relative_vz_m_s" in df.columns and not np.all(np.isnan(numeric_column(df, "relative_vz_m_s"))):
-		sig = numeric_column(df, "relative_vz_m_s")
-		source = "relative_vz_m_s"
-	elif "vehicle_vz_m_s" in df.columns:
-		sig = numeric_column(df, "vehicle_vz_m_s")
-		source = "vehicle_vz_m_s"
-	else:
-		print("Skipping closing-rate spectrum. No relative_vz_m_s or vehicle_vz_m_s.")
-		return
-
-	dom = dominant_frequency_fft(t, sig, min_frequency_hz=0.01, max_frequency_hz=2.0)
-	if dom is None:
-		print("Skipping closing-rate spectrum. Not enough valid samples.")
-		return
-
-	plt.figure(figsize=(11, 5))
-	plt.title(f"Spectrum of closing-rate response ({source})")
-	plt.plot(dom["freqs"], dom["spectrum"], label=f"|FFT({source})|")
-	plt.axvline(dom["frequency_hz"], linestyle="--", label=f"dominant {dom['frequency_hz']:.4f} Hz")
-	if expected_frequency_hz is not None and expected_frequency_hz > 0.0:
-		plt.axvline(expected_frequency_hz, linestyle=":", label=f"expected platform {expected_frequency_hz:.4f} Hz")
-	plt.xlim(left=0.0, right=1.0)
-	plt.xlabel("frequency [Hz]")
-	plt.ylabel("|FFT|")
-	plt.grid(True)
-	plt.legend(loc="best")
-	save_current_figure(output_dir, "closing_rate_spectrum.png")
-
-
-def _rolling_smooth(t: np.ndarray, y: np.ndarray, window_sec: float) -> np.ndarray:
-	"""Centered rolling median over ~window_sec of samples (sample count
-	derived from the median sample spacing, so this doesn't assume a
-	uniform dt). Used to separate a SUSTAINED trend from per-sample
-	optical-flow/velocity noise -- median rather than mean so a handful of
-	spiky outliers (common in relative_vz near the ground, see below)
-	don't drag the smoothed curve toward them."""
-	dt = median_positive_dt(t)
-	if not np.isfinite(dt) or dt <= 1e-9:
-		return y.copy()
-	n = max(1, int(round(window_sec / dt)))
-	if n <= 1:
-		return y.copy()
-	return pd.Series(y).rolling(window=n, center=True, min_periods=max(1, n // 3)).median().to_numpy()
-
-
-def _divergence_consistency(df: pd.DataFrame, t: np.ndarray, min_height_m: float = 0.05) -> Optional[dict]:
-	"""Compare the VISION-based divergence estimate against a 'physical'
-	proxy computed purely from ground-truth kinematics:
-
-		proxy = relative_vz / |relative_z|        (closing_rate / height)
-
-	i.e. the same quantity flow_divergence is meant to estimate from optical
-	flow, computed instead from the logged ground truth. This is a sanity
-	check on the SENSING pipeline, independent of any control-law gain: if
-	flow_divergence and the proxy disagree, the controller is being fed a
-	number that no longer reflects reality, and no gain retune fixes that --
-	only fixing (or working around) the sensing does.
-
-	Scans for a SUSTAINED mismatch by walking backward from the end of the
-	series: if the smoothed |error| is above threshold at the last sample
-	and stays above threshold in an unbroken run back to some onset point,
-	that onset is reported. This deliberately ignores an isolated mid-descent
-	noise spike that recovers -- it is built to catch exactly the terminal,
-	does-not-recover-before-touchdown breakdown (close-range optical-flow
-	degradation stacking with the gain schedule's own k_min-authority loss
-	right at the end of DESCEND), not every noisy sample.
-
-	Returns None if the required columns/data aren't present. Otherwise a
-	dict with the raw/smoothed series (for plotting) and, if found,
-	onset_t / onset_height for the start of the trailing mismatch run.
-	"""
-	required = ["flow_divergence_1_s", "relative_vz_m_s", "relative_z_m"]
-	if not all(c in df.columns for c in required):
-		return None
-
-	div = numeric_column(df, "flow_divergence_1_s")
-	vz = numeric_column(df, "relative_vz_m_s")
-	relz = numeric_column(df, "relative_z_m")
-	if not (np.any(np.isfinite(div)) and np.any(np.isfinite(vz)) and np.any(np.isfinite(relz))):
-		return None
-
-	height = np.abs(relz)
-	# Floor the denominator, not the numerator: right at touchdown height ->
-	# 0 and the true ratio is genuinely unbounded, which is exactly the
-	# regime this is meant to expose -- clip only hard enough to keep the
-	# proxy finite/plottable, not to hide the blow-up.
-	proxy = vz / np.clip(height, min_height_m, None)
-
-	div_s = _rolling_smooth(t, div, window_sec=0.6)
-	proxy_s = _rolling_smooth(t, proxy, window_sec=0.6)
-	err_s = np.abs(div_s - proxy_s)
-
-	# Flag threshold: the larger of a fixed floor (so a quiet near-zero hold
-	# doesn't trip on tiny absolute noise) and a fraction of the proxy's own
-	# typical scale over the series (so a fast, large-divergence descent
-	# gets a proportionally larger tolerance).
-	finite_proxy = proxy_s[np.isfinite(proxy_s)]
-	scale = float(np.nanmedian(np.abs(finite_proxy))) if len(finite_proxy) else 0.0
-	threshold = max(0.15, 0.75 * scale)
-
-	# Both the merge-gap tolerance and the minimum reportable run length are
-	# tied to the smoothing window above (not separate magic numbers): a
-	# "sustained" mismatch shouldn't be trusted as sustained if it's shorter
-	# than the window used to smooth it, and a gap tolerant enough to bridge
-	# a single flicker but not two genuinely separate incidents should be a
-	# fraction of that same window.
-	smoothing_window_sec = 0.6
-	merge_gap_sec = 0.5 * smoothing_window_sec
-	min_run_sec = smoothing_window_sec
-
-	onset_idx = None
-	finite = np.isfinite(err_s) & np.isfinite(height)
-	idxs = np.where(finite)[0]
-	if len(idxs) >= 5:
-		bad = err_s[idxs] > threshold
-
-		# Group into contiguous "bad" runs, then merge runs separated by a
-		# short time gap -- a single sample of accidental agreement (e.g.
-		# right at touchdown, when a disarmed/near-zero vz and a near-zero
-		# divergence both trivially settle near 0 together for a moment)
-		# should not fragment one real sustained breakdown into pieces that
-		# each look too short to flag.
-		runs = []
-		i = 0
-		n = len(idxs)
-		while i < n:
-			if bad[i]:
-				j = i
-				while j + 1 < n and bad[j + 1]:
-					j += 1
-				runs.append([i, j])
-				i = j + 1
-			else:
-				i += 1
-
-		merged = []
-		for r in runs:
-			if merged and (t[idxs[r[0]]] - t[idxs[merged[-1][1]]]) <= merge_gap_sec:
-				merged[-1][1] = r[1]
-			else:
-				merged.append(list(r))
-
-		# Only the LAST merged run can support a "mismatch persists through
-		# the end of the log" claim -- if the tail of the data is back
-		# within tolerance, there is nothing sustained to report even if an
-		# earlier run was long. Require it to reach the final finite sample
-		# and to be longer than min_run_sec, so a single blip surviving the
-		# merge doesn't get reported as an onset.
-		if merged:
-			last = merged[-1]
-			reaches_end = last[1] == n - 1
-			duration = t[idxs[last[1]]] - t[idxs[last[0]]]
-			if reaches_end and duration >= min_run_sec:
-				onset_idx = idxs[last[0]]
-
-	result = {
-		"height": height,
-		"proxy": proxy,
-		"div_smoothed": div_s,
-		"proxy_smoothed": proxy_s,
-		"err_smoothed": err_s,
-		"threshold": threshold,
-	}
-	if onset_idx is not None:
-		result["onset_t"] = float(t[onset_idx])
-		result["onset_height"] = float(height[onset_idx])
-	return result
-
-
-def plot_divergence_consistency(df: pd.DataFrame, t: np.ndarray, output_dir: str | Path):
-	"""Vision-based divergence vs. a ground-truth kinematic proxy
-	(relative_vz / |relative_z|) across the whole log, with DESCEND
-	highlighted. Isolates the SENSING half of the terminal-approach story
-	from the gain-schedule half (mission_routine.py's k_min-authority-loss
-	note covers the latter): flow_divergence undershooting D* for most of
-	DESCEND is the expected, documented gain-schedule gap, but if it instead
-	COLLAPSES toward zero/negative while the true closing rate (relative_vz)
-	is climbing hard right before touchdown, that's the vision pipeline
-	itself decorrelating from reality, not a control response -- retuning
-	gains will not fix it."""
-	consistency = _divergence_consistency(df, t)
-	if consistency is None:
-		print("Skipping divergence consistency plot. Missing flow_divergence_1_s / "
-		      "relative_vz_m_s / relative_z_m, or no finite data.")
-		return
-
-	div = numeric_column(df, "flow_divergence_1_s")
-	dstar = numeric_column(df, "mission_divergence_setpoint_1_s") if "mission_divergence_setpoint_1_s" in df.columns else None
-
-	fig, axes = plt.subplots(3, 1, figsize=(11, 9), sharex=True)
-	fig.suptitle("Divergence sensing consistency: vision estimate vs. kinematic ground truth")
-
-	ax = axes[0]
-	shade_mission_phases(ax, df, t)
-	ax.plot(t, div, color="tab:blue", alpha=0.30, linewidth=1, label="flow_divergence")
-	ax.plot(t, consistency["div_smoothed"], color="tab:blue", linewidth=1.8, label="flow_divergence (smoothed)")
-	ax.plot(t, consistency["proxy"], color="tab:orange", alpha=0.30, linewidth=1,
-	        label="proxy = relative_vz / |relative_z|")
-	ax.plot(t, consistency["proxy_smoothed"], color="tab:orange", linewidth=1.8, label="proxy (smoothed)")
-	if dstar is not None and np.any(np.isfinite(dstar)):
-		ax.plot(t, dstar, linestyle=":", linewidth=1.4, color="0.3", label="commanded D*")
-	ax.axhline(0.0, linestyle="--", linewidth=0.8, color="0.5")
-	if "onset_t" in consistency:
-		ax.axvline(consistency["onset_t"], color="tab:red", linestyle="--", linewidth=1.3)
-	ax.set_ylabel("divergence [1/s]")
-	ax.grid(True, alpha=0.4)
-	ax.legend(loc="best", fontsize=8)
-
-	ax = axes[1]
-	shade_mission_phases(ax, df, t)
-	ax.plot(t, consistency["err_smoothed"], color="tab:red", linewidth=1.6,
-	        label="|flow_divergence - proxy| (smoothed)")
-	ax.axhline(consistency["threshold"], linestyle=":", linewidth=1.3, color="0.3",
-	           label=f"flag threshold {consistency['threshold']:.2f}")
-	if "onset_t" in consistency:
-		ax.axvline(consistency["onset_t"], color="tab:red", linestyle="--", linewidth=1.3)
-		ax.annotate(
-			f"sustained mismatch from\nt={consistency['onset_t']:.1f}s, "
-			f"h={consistency['onset_height']:.2f}m",
-			xy=(consistency["onset_t"], consistency["threshold"]),
-			xytext=(8, 10), textcoords="offset points", fontsize=8, color="tab:red",
-		)
-	ax.set_ylabel("|error| [1/s]")
-	ax.grid(True, alpha=0.4)
-	ax.legend(loc="best", fontsize=8)
-
-	ax = axes[2]
-	shade_mission_phases(ax, df, t)
-	ax.plot(t, consistency["height"], color="tab:purple", linewidth=1.6,
-	        label="|relative_z| (height above platform)")
-	if "onset_t" in consistency:
-		ax.axvline(consistency["onset_t"], color="tab:red", linestyle="--", linewidth=1.3)
-		ax.axhline(consistency["onset_height"], color="tab:red", linestyle=":", linewidth=1.1)
-	ax.set_ylabel("height [m]")
-	ax.set_xlabel("time [s]")
-	ax.grid(True, alpha=0.4)
-	ax.legend(loc="best", fontsize=8)
-
-	save_current_figure(output_dir, "divergence_consistency.png")
-
-
-# ---------------------------------------------------------------------------
-# Optional full/detail plots
-# ---------------------------------------------------------------------------
-
-
-def plot_detection_boxes_fov(
-	df: pd.DataFrame,
-	t: np.ndarray,
-	image_width: int,
-	image_height: int,
-	output_dir: str | Path,
-	max_boxes: int = 120,
-):
-	required = [
-		"target_offset_x",
-		"target_offset_y",
-		"target_detection_width_px",
-		"target_detection_height_px",
-	]
-	missing = [name for name in required if name not in df.columns]
-	if missing:
-		print(f"Skipping detection box plot. Missing columns: {missing}")
-		return
-
-	target_found = bool_column(df, "target_found", default=True)
-	offset_x = numeric_column(df, "target_offset_x")
-	offset_y = numeric_column(df, "target_offset_y")
-	box_w = numeric_column(df, "target_detection_width_px")
-	box_h = numeric_column(df, "target_detection_height_px")
-
-	valid = (
-		target_found
-		& np.isfinite(offset_x)
-		& np.isfinite(offset_y)
-		& np.isfinite(box_w)
-		& np.isfinite(box_h)
-		& (box_w > 0.0)
-		& (box_h > 0.0)
-	)
-	indices = np.where(valid)[0]
-	if len(indices) == 0:
-		print("Skipping detection box plot. No valid target detections.")
-		return
-	if len(indices) > max_boxes:
-		indices = np.linspace(indices[0], indices[-1], max_boxes).astype(int)
-
-	fig, ax = plt.subplots(figsize=(8, 6))
-	ax.set_title("Detection boxes in camera FOV")
-	ax.set_xlabel("image x [px]")
-	ax.set_ylabel("image y [px]")
-	ax.set_xlim(0, image_width)
-	ax.set_ylim(image_height, 0)
-	ax.set_aspect("equal", adjustable="box")
-	ax.add_patch(Rectangle((0, 0), image_width, image_height, fill=False, linewidth=2))
-	ax.axvline(image_width / 2.0, linestyle="--", linewidth=1)
-	ax.axhline(image_height / 2.0, linestyle="--", linewidth=1)
-
-	cmap = plt.get_cmap("viridis")
-	centers_x, centers_y = [], []
-	for k, idx in enumerate(indices):
-		color = cmap(k / max(len(indices) - 1, 1))
-		alpha = 0.25 + 0.75 * k / max(len(indices) - 1, 1)
-		cx = (0.5 * offset_x[idx] + 0.5) * image_width
-		cy = (0.5 * offset_y[idx] + 0.5) * image_height
-		rect = Rectangle(
-			(cx - 0.5 * box_w[idx], cy - 0.5 * box_h[idx]),
-			box_w[idx],
-			box_h[idx],
-			fill=False,
-			linewidth=1.2,
-			edgecolor=(color[0], color[1], color[2], alpha),
-		)
-		ax.add_patch(rect)
-		centers_x.append(cx)
-		centers_y.append(cy)
-
-	ax.plot(centers_x, centers_y, marker=".", linewidth=1.2, label="detection center")
-	ax.legend(loc="best")
-	save_current_figure(output_dir, "detection_boxes_fov.png")
-
-
-def _mission_phase_spans(df: pd.DataFrame, t: np.ndarray):
-	"""Yield (t_start, t_end, substate) spans of contiguous mission substate.
-
-	Used to shade probe / descend / infeasible regions on time-axis plots so
-	the probe->descend handover (and any abort) is visible on every figure.
-	"""
-	if "mission_substate" not in df.columns:
+def _phase_intervals(data: AnalysisData) -> list[tuple[float, float, str]]:
+	df = data.control
+	if df.empty or "mission_substate" not in df.columns:
 		return []
-	sub = df["mission_substate"].astype(str).fillna("").to_numpy()
-	spans = []
-	start_idx = None
-	for i in range(len(sub)):
-		s = sub[i]
-		if s in ("", "nan"):
-			if start_idx is not None:
-				spans.append((t[start_idx], t[i - 1], sub[start_idx]))
-				start_idx = None
+	t = df["_sim_time"].to_numpy(float)
+	phase = _clean_string(df["mission_substate"]).to_numpy()
+	valid = np.isfinite(t) & (phase != "")
+	t = t[valid]
+	phase = phase[valid]
+	if len(t) == 0:
+		return []
+
+	intervals: list[tuple[float, float, str]] = []
+	start = t[0]
+	current = phase[0]
+	for i in range(1, len(t)):
+		if phase[i] != current:
+			intervals.append((start, t[i], current))
+			start = t[i]
+			current = phase[i]
+	intervals.append((start, max(t[-1], data.t1), current))
+
+	# Append terminal LANDED interval from the continuing post-touchdown rows.
+	cphase = _clean_string(data.controller.get("controller_phase", pd.Series("", index=data.controller.index)))
+	mphase = _clean_string(data.controller.get("mission_substate", pd.Series("", index=data.controller.index)))
+	event = _clean_string(data.controller.get("event", pd.Series("", index=data.controller.index)))
+	landed_mask = (cphase == "landed") | (mphase == "landed") | event.isin(["landed", "landed_state"])
+	landed_rows = data.controller[landed_mask & np.isfinite(data.controller["_sim_time"])]
+	if not landed_rows.empty:
+		landed_start = float(landed_rows["_sim_time"].min())
+		if not intervals or landed_start > intervals[-1][0]:
+			if intervals and landed_start < intervals[-1][1]:
+				s, _, p = intervals[-1]
+				intervals[-1] = (s, landed_start, p)
+			intervals.append((landed_start, max(data.t1, landed_start), "landed"))
+	return intervals
+
+
+def _shade_phases(ax, data_or_intervals, labels=True):
+	"""Draw readable mission-phase bands and labels.
+
+	Bands use a stronger fill than before and labels sit near the lower edge
+	of each axis, where they remain visible without obscuring the main traces.
+	"""
+	# Backward-compatible API: existing callers pass AnalysisData and a
+	# ``labels=...`` keyword, while direct callers may pass precomputed intervals.
+	is_analysis_data = isinstance(data_or_intervals, AnalysisData)
+	intervals = (
+		_phase_intervals(data_or_intervals)
+		if is_analysis_data
+		else data_or_intervals
+	)
+	time_origin = data_or_intervals.t0 if is_analysis_data else 0.0
+
+	if not intervals:
+		return
+
+	# _phase_intervals returns (start_sim, end_sim, phase).
+	for start_sim, end_sim, phase in intervals:
+		start = float(start_sim) - time_origin
+		end = float(end_sim) - time_origin
+		if not np.isfinite(start) or not np.isfinite(end) or end <= start:
 			continue
-		if start_idx is None:
-			start_idx = i
-		elif sub[i] != sub[start_idx]:
-			# Close at the boundary sample (t[i]) so the next span starts where
-			# this one ends -- no one-sample unshaded gap between phases.
-			spans.append((t[start_idx], t[i], sub[start_idx]))
-			start_idx = i
-	if start_idx is not None:
-		spans.append((t[start_idx], t[len(sub) - 1], sub[start_idx]))
-	return spans
 
-
-# Mission substates, in the order they occur. "probe"/"probe_hold" are kept for
-# older logs written before the approach/final split.
-_PHASE_COLORS = {
-	"center": ("tab:purple", 0.06),
-	"approach_probe": ("tab:blue", 0.06),
-	"final_probe": ("tab:cyan", 0.09),
-	"descend": ("tab:green", 0.06),
-	"landed": ("tab:gray", 0.12),
-	"infeasible": ("tab:red", 0.10),
-	"probe": ("tab:blue", 0.06),        # legacy
-	"probe_hold": ("tab:cyan", 0.08),   # legacy
-}
-
-_PHASE_LABELS = {
-	"center": "CENTER (acquire + centre)",
-	"approach_probe": "APPROACH_PROBE (descend at D*>0 while probing)",
-	"final_probe": "FINAL_PROBE (near-field hold at D*=0)",
-	"descend": "DESCEND (committed landing)",
-	"landed": "LANDED (touchdown; zero thrust)",
-	"infeasible": "INFEASIBLE (gate refused; holding)",
-	"probe": "PROBE (legacy)",
-	"probe_hold": "PROBE_HOLD (legacy)",
-}
-
-
-def shade_mission_phases(ax, df: pd.DataFrame, t: np.ndarray, label_once: bool = True):
-	"""Shade mission substate spans on a time-axis Axes; mark handovers."""
-	seen = set()
-	for t0, t1, sub in _mission_phase_spans(df, t):
-		color, alpha = _PHASE_COLORS.get(sub, ("tab:gray", 0.06))
-		lbl = None
-		if label_once and sub not in seen:
-			lbl = _PHASE_LABELS.get(sub, sub)
-			seen.add(sub)
-		ax.axvspan(t0, t1, color=color, alpha=alpha, label=lbl, zorder=0)
-
-
-def plot_gain_schedule(df: pd.DataFrame, t: np.ndarray, output_dir: str):
-	"""The probe-driven gain schedule: thrust k(t), lateral scale, and bounds.
-
-	This is the figure that shows the Ho/de Croon profile directly -- k(t)
-	should trace an exponential decay in time (== linear in height) clamped
-	between k_explore (top) and k_min (floor), and the lateral scale should be
-	the same curve normalized to [k_min/k_explore, 1].
-	"""
-	have = [c for c in ("mission_thrust_gain_k", "mission_lateral_p_scale", "mission_lateral_d_scale") if c in df.columns]
-	if not have:
-		print("Skipping gain schedule plot. No mission_* gain columns (old log?).")
-		return
-
-	fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
-	fig.suptitle("Probe-driven gain schedule (Herisse floor / de Croon ceiling)")
-
-	# --- thrust gain k(t) with k_min / k_explore reference bands ---
-	ax = axes[0]
-	shade_mission_phases(ax, df, t)
-	if "mission_thrust_gain_k" in df.columns:
-		ax.plot(t, numeric_column(df, "mission_thrust_gain_k"), label=label_for("mission_thrust_gain_k"), linewidth=1.8)
-	# The gain WINDOW, top to bottom: k_explore (start) / k_ceiling at leg height
-	# (the de Croon limit k(t) now aims just under) / k_floor (the asymptote it
-	# actually settles on) / k_min (the Herisse floor, now only a hard backstop).
-	for col, style, lbl in (
-		("mission_k_explore", (0, (4, 3)), label_for("mission_k_explore")),
-		("mission_k_probe", (0, (8, 2, 2, 2)), label_for("mission_k_probe")),
-		("mission_k_ceiling_leg", (0, (6, 2)), label_for("mission_k_ceiling_leg")),
-		("mission_k_floor", (0, (3, 1, 1, 1)), label_for("mission_k_floor")),
-		("mission_k_min", (0, (1, 2)), label_for("mission_k_min")),
-	):
-		if col in df.columns:
-			y = numeric_column(df, col)
-			finite = y[np.isfinite(y)]
-			if len(finite):
-				ax.axhline(float(np.nanmedian(finite)), linestyle=style, linewidth=1.3, label=lbl)
-	ax.set_ylabel("thrust gain k [m/s]")
-	ax.grid(True)
-	ax.legend(loc="best", fontsize=8)
-
-	# --- lateral P/D scales (INDEPENDENT since the CENTER-phase P/D-split fix;
-	# during DESCEND both track k(t)/k_explore identically -- see mission_
-	# routine.py's _do_descend, so they overlap there; during CENTER they
-	# differ, reflecting the two different historical scale factors being
-	# reversed -- see CENTER_LATERAL_P_SCALE/CENTER_LATERAL_D_SCALE) ---
-	ax = axes[1]
-	shade_mission_phases(ax, df, t)
-	if "mission_lateral_p_scale" in df.columns:
-		ax.plot(t, numeric_column(df, "mission_lateral_p_scale"), label=label_for("mission_lateral_p_scale"), linewidth=1.8)
-	if "mission_lateral_d_scale" in df.columns:
-		ax.plot(t, numeric_column(df, "mission_lateral_d_scale"), label=label_for("mission_lateral_d_scale"), linewidth=1.4, linestyle="--")
-	# overlay normalized thrust gain as a cross-check that DESCEND's lateral
-	# scales ride the same ramp as thrust (should overlap P/D there)
-	if {"mission_thrust_gain_k", "mission_k_explore"}.issubset(df.columns):
-		k = numeric_column(df, "mission_thrust_gain_k")
-		ke = numeric_column(df, "mission_k_explore")
-		with np.errstate(divide="ignore", invalid="ignore"):
-			norm = np.where(ke > 1e-9, k / ke, np.nan)
-		ax.plot(t, norm, linestyle=":", alpha=0.6, label="k(t)/k_explore (cross-check)")
-	ax.set_ylabel("lateral scale [-]")
-	ax.set_xlabel("time [s]")
-	ax.grid(True)
-	ax.legend(loc="best", fontsize=8)
-
-	save_current_figure(output_dir, "gain_schedule.png")
-
-
-def plot_probe_acceleration(df: pd.DataFrame, t: np.ndarray, output_dir: str):
-	"""What the platform probe actually measured, step by step.
-
-	The feasibility gate rests on ONE number -- peak_accel -- via k_min =
-	peak_accel / D*. That number is a leaky-max envelope over a rolling percentile
-	of |commanded accel - EMA bias|, so it can sit high for reasons that have
-	nothing to do with the platform. This figure shows the whole chain it is built
-	from, so the envelope can be judged instead of trusted.
-
-	Top: the raw commanded accel and the EMA bias being subtracted from it.
-	     If the BIAS visibly oscillates rather than sitting flat, the highpass tau
-	     is short enough to be tracking -- and therefore cancelling -- the very
-	     platform motion being measured, and peak_accel is biased LOW.
-	     During APPROACH_PROBE the bias legitimately carries the slow contribution
-	     of the D*>0 descent itself; that is what it is there to remove.
-
-	Bottom: the residual (the actual measurement), the rolling-window percentile
-	     the envelope chases, and the envelope itself.
-	     The envelope should sit ON TOP of the residual's excursions. If it
-	     visibly COASTS above them -- decaying smoothly, never re-raised by a
-	     fresh sample -- the probe is running on a stale measurement: either the
-	     window is too short to catch the platform's slow swing, or
-	     peak_decay_tau is too long.
-
-	The far->near handoff is marked: that is where the time constants are retuned
-	and the near-field samples (better synchronized, hence more trustworthy) are
-	expected to REVISE the carried-over far-field estimate. peak_accel_at_handoff
-	is drawn as a reference line so the size and direction of that revision is one
-	subtraction. If the two never separate, either the near hold is too short to
-	see an excursion or NEAR_PROBE_DECAY_TAU_SEC is too long.
-	"""
-	needed = ("mission_probe_residual_accel_m_s2", "mission_peak_accel_m_s2")
-	if not any(c in df.columns for c in needed):
-		print("Skipping probe acceleration plot. No mission_probe_* columns (old log?).")
-		return
-
-	fig, axes = plt.subplots(2, 1, figsize=(11, 7.5), sharex=True)
-	fig.suptitle("Platform probe: what peak_accel is built from")
-
-	# --- raw commanded accel vs the bias being removed ---
-	ax = axes[0]
-	shade_mission_phases(ax, df, t)
-	for col, kwargs in (
-		("mission_probe_accel_m_s2", dict(linewidth=1.0, alpha=0.65)),
-		("mission_probe_mean_accel_m_s2", dict(linewidth=1.8, linestyle="--")),
-	):
-		if col in df.columns:
-			ax.plot(t, numeric_column(df, col), label=label_for(col), **kwargs)
-	ax.axhline(0.0, color="k", linewidth=0.6, alpha=0.4)
-	ax.set_ylabel("acceleration [m/s$^2$]")
-	ax.grid(True)
-	ax.legend(loc="best", fontsize=8)
-
-	# --- the measurement, the percentile, and the envelope the gate consumes ---
-	ax = axes[1]
-	shade_mission_phases(ax, df, t)
-	if "mission_probe_residual_accel_m_s2" in df.columns:
-		ax.plot(
-			t, numeric_column(df, "mission_probe_residual_accel_m_s2"),
-			label=label_for("mission_probe_residual_accel_m_s2"),
-			linewidth=0.9, alpha=0.55,
-		)
-	if "mission_probe_percentile_accel_m_s2" in df.columns:
-		ax.plot(
-			t, numeric_column(df, "mission_probe_percentile_accel_m_s2"),
-			label=label_for("mission_probe_percentile_accel_m_s2"),
-			linewidth=1.2, linestyle=":",
-		)
-	if "mission_peak_accel_m_s2" in df.columns:
-		ax.plot(
-			t, numeric_column(df, "mission_peak_accel_m_s2"),
-			label=label_for("mission_peak_accel_m_s2"),
-			linewidth=2.0, color="tab:red",
+		color = PHASE_COLORS.get(phase, "#9C9C9C")
+		ax.axvspan(
+			start,
+			end,
+			facecolor=color,
+			alpha=0.20,
+			edgecolor=color,
+			linewidth=0.9,
+			zorder=-20,
 		)
 
-	# Mark the far->near retune and the estimate it carried across.
-	handoff_t = _probe_handoff_time(df, t)
-	if handoff_t is not None:
-		for a in axes:
-			a.axvline(handoff_t, color="k", linestyle="-.", linewidth=1.2, alpha=0.7)
-		axes[1].annotate(
-			"far \u2192 near handoff\n(probe retuned, estimate kept)",
-			xy=(handoff_t, ax.get_ylim()[1]),
-			xytext=(6, -12), textcoords="offset points",
-			fontsize=8, va="top",
+		width = end - start
+		label = PHASE_LABELS.get(phase, phase.replace("_", " ").upper())
+		if width <= 0.15:
+			continue
+
+		if not labels:
+			continue
+
+		# x uses data coordinates; y uses axis coordinates.  This keeps every
+		# phase label aligned in a stable lower strip regardless of y-limits.
+		ax.text(
+			start + 0.5 * width,
+			0.035,
+			label,
+			transform=ax.get_xaxis_transform(),
+			ha="center",
+			va="bottom",
+			fontsize=8.5,
+			fontweight="bold",
+			color=color,
+			alpha=0.98,
+			rotation=0,
+			clip_on=True,
+			zorder=30,
+			bbox={
+				"boxstyle": "round,pad=0.18",
+				"facecolor": "white",
+				"edgecolor": color,
+				"linewidth": 0.7,
+				"alpha": 0.82,
+			},
 		)
 
-	handoff_peak = _last_finite(df, "mission_probe_peak_accel_at_handoff_m_s2")
-	if handoff_peak is not None and np.isfinite(handoff_peak) and handoff_peak > 0.0:
-		ax.axhline(
-			handoff_peak, color="tab:orange", linestyle=(0, (5, 2)), linewidth=1.3,
-			label=label_for("mission_probe_peak_accel_at_handoff_m_s2"),
-		)
 
-	# Where the envelope is COASTING: it is above the percentile it chases, i.e.
-	# no fresh sample is holding it up and it is purely decaying off an old one.
-	# Shaded because it is the single most important failure mode to catch -- a
-	# probe that spends most of its life coasting is reporting a measurement it
-	# took once, not one it keeps making.
-	if {"mission_peak_accel_m_s2", "mission_probe_percentile_accel_m_s2"}.issubset(df.columns):
-		peak = numeric_column(df, "mission_peak_accel_m_s2")
-		pct = numeric_column(df, "mission_probe_percentile_accel_m_s2")
-		active = bool_column(df, "mission_probe_active")
-		coasting = active & np.isfinite(peak) & np.isfinite(pct) & (peak > pct * 1.02)
-		if np.any(coasting):
-			ax.fill_between(
-				t, 0, 1, where=coasting, transform=ax.get_xaxis_transform(),
-				color="tab:red", alpha=0.07, zorder=0,
-				label=f"envelope coasting ({100.0 * np.mean(coasting[active]):.0f}% of probe)",
-			)
-
-	ax.set_ylabel("acceleration [m/s$^2$]")
-	ax.set_xlabel("time [s]")
-	ax.grid(True)
-	ax.legend(loc="best", fontsize=8)
-
-	# The gate's arithmetic, spelled out, so the figure is self-contained.
-	final_peak = _last_finite(df, "mission_peak_accel_m_s2")
-	k_min = _last_finite(df, "mission_k_min")
-	bits = []
-	if final_peak is not None and np.isfinite(final_peak):
-		bits.append(f"peak_accel = {final_peak:.3f} m/s$^2$")
-	if handoff_peak is not None and np.isfinite(handoff_peak) and handoff_peak > 0.0 \
-			and final_peak is not None and np.isfinite(final_peak):
-		delta = 100.0 * (final_peak - handoff_peak) / handoff_peak
-		bits.append(f"near-field revision {delta:+.0f}%")
-	if k_min is not None and np.isfinite(k_min):
-		bits.append(f"k_min = {k_min:.2f}")
-	if bits:
-		ax.set_title("  |  ".join(bits), fontsize=9)
-
-	save_current_figure(output_dir, "probe_acceleration.png")
+def _finish_figure(fig: plt.Figure, axes: Iterable[plt.Axes], data: AnalysisData, path: Path) -> None:
+	axes = list(axes)
+	for i, ax in enumerate(axes):
+		ax.grid(True, alpha=0.25)
+		_shade_phases(ax, data, labels=(i == 0))
+		ax.set_xlim(0.0, max(0.0, data.t1 - data.t0))
+	fig.tight_layout()
+	fig.savefig(path, dpi=170, bbox_inches="tight")
+	plt.close(fig)
 
 
-def _probe_handoff_time(df: pd.DataFrame, t: np.ndarray) -> Optional[float]:
-	"""Time of the far->near probe retune (first sample of the FINAL_PROBE hold)."""
-	if "mission_probe_phase" not in df.columns:
-		return None
-	phase = df["mission_probe_phase"].astype(str).fillna("").to_numpy()
-	idx = _first_true_index(phase == "near")
-	return float(t[idx]) if idx is not None else None
+def _legend(ax: plt.Axes, *, loc: str = "best", ncol: int = 1) -> None:
+	handles, labels = ax.get_legend_handles_labels()
+	if handles:
+		ax.legend(loc=loc, ncol=ncol, framealpha=0.92)
 
 
-def plot_height_prediction(df: pd.DataFrame, t: np.ndarray, output_dir: str):
-	"""Open-loop predicted height h_pred vs measured height above the platform.
+def plot_detections_boxes_fov(data: AnalysisData, out: Path) -> None:
+	c = data.control
+	t = _relative_time(c["_sim_time"], data.t0)
+	fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
 
-	The descent schedules the gain against the OPEN-LOOP prediction
-	h(t)=h0*exp(-D* t), NOT a live height estimate, so this is the single most
-	important descent-tuning diagnostic: if h_pred and the true height above the
-	deck diverge, the clock-scheduled gain is being evaluated at the wrong
-	height and the schedule needs a more pessimistic descent assumption (or a
-	live estimator).
+	axes[0].plot(t, _num(c, "target_detection_width_px"), label="Detection width")
+	axes[0].plot(t, _num(c, "target_detection_height_px"), label="Detection height")
+	axes[0].set_ylabel("Bounding box [px]")
+	axes[0].set_title("Target bounding box and field-of-view saturation")
+	_legend(axes[0], ncol=2)
 
-	IMPORTANT dimensional note: h_pred is height above the PLATFORM (h0 is seeded
-	as takeoff_altitude - platform_height). The only correct ground-truth to
-	compare against is therefore relative_z_m (vehicle-to-platform gap). |vehicle_z|
-	is height above the GROUND and differs from h_pred by the platform height, so
-	it is shown only as dashed context and the error panel is suppressed for it --
-	comparing the two directly would report a spurious constant bias.
-	"""
-	if "mission_h_pred_m" not in df.columns:
-		print("Skipping height prediction plot. No mission_h_pred_m (old log?).")
-		return
+	axes[1].plot(t, 100.0 * _num(c, "target_area_fraction"), label="Detected image area")
+	axes[1].set_ylabel("Area [% of image]")
+	_legend(axes[1])
 
-	h_pred = numeric_column(df, "mission_h_pred_m")
-	if np.count_nonzero(np.isfinite(h_pred)) < 3:
-		print("Skipping height prediction plot. No descent rows with h_pred.")
-		return
+	axes[2].plot(t, _num(c, "target_confidence"), label="Detection confidence")
+	sat = _bool(c, "target_fov_saturated").to_numpy()
+	if sat.any():
+		axes[2].fill_between(t, 0.0, 1.0, where=sat, step="mid", alpha=0.16, label="FOV saturated")
+	axes[2].set_ylim(-0.03, 1.05)
+	axes[2].set_ylabel("Confidence / flag")
+	axes[2].set_xlabel("Time since common log start [s SIM]")
+	_legend(axes[2], ncol=2)
 
-	# Correct ground truth is relative_z (height above the platform). Only then
-	# is h_pred - truth a meaningful prediction error.
-	truth = None
-	truth_label = None
-	truth_is_comparable = False
-	if "relative_z_m" in df.columns and np.any(np.isfinite(numeric_column(df, "relative_z_m"))):
-		truth = np.abs(numeric_column(df, "relative_z_m"))
-		truth_label = "|relative_z| (above platform, ground truth)"
-		truth_is_comparable = True
-	elif "vehicle_z_m" in df.columns:
-		# Dimensionally NOT comparable to h_pred (ground- vs platform-referenced).
-		truth = np.abs(numeric_column(df, "vehicle_z_m"))
-		truth_label = "|vehicle_z| (above GROUND -- offset by platform height)"
-		truth_is_comparable = False
-
-	# Median h_crit (the schedule floor) and the time h_pred first reaches it.
-	h_crit_val = None
-	if "mission_h_crit_m" in df.columns:
-		hc = numeric_column(df, "mission_h_crit_m")
-		finite = hc[np.isfinite(hc)]
-		if len(finite):
-			h_crit_val = float(np.nanmedian(finite))
-	t_floor = None
-	if h_crit_val is not None and h_crit_val > 0:
-		below = np.isfinite(h_pred) & (h_pred <= h_crit_val)
-		if np.any(below):
-			t_floor = float(t[np.argmax(below)])  # first True
-
-	fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
-	fig.suptitle("Open-loop height prediction vs measured (descent diagnostic)")
-
-	# --- Top: h_pred vs truth, with the h_crit floor and its crossing. ---
-	ax = axes[0]
-	shade_mission_phases(ax, df, t)
-	ax.plot(t, h_pred, color="tab:blue", linewidth=1.9, label="h_pred = h0*exp(-D* t)")
-	if truth is not None:
-		style = "-" if truth_is_comparable else "--"
-		ax.plot(t, truth, color="tab:orange", alpha=0.85, linestyle=style, label=truth_label)
-	if h_crit_val is not None:
-		ax.axhline(h_crit_val, color="tab:red", linestyle=":", linewidth=1.4,
-		           label=f"h_crit = {h_crit_val:.2f} m (schedule floor)")
-	if t_floor is not None:
-		ax.axvline(t_floor, color="tab:red", linestyle="--", linewidth=1.1, alpha=0.7)
-		ax.annotate(f"h_pred=h_crit\n@ t={t_floor:.1f}s", xy=(t_floor, h_crit_val),
-		            xytext=(6, 10), textcoords="offset points", fontsize=8, color="tab:red")
-	ax.set_ylabel("height above platform [m]")
-	ax.grid(True, alpha=0.4)
-	ax.legend(loc="best", fontsize=8)
-
-	# --- Bottom: prediction error, ONLY when the comparison is dimensionally valid. ---
-	ax = axes[1]
-	shade_mission_phases(ax, df, t)
-	if truth is not None and truth_is_comparable:
-		err = h_pred - truth
-		ax.plot(t, err, color="tab:red", linewidth=1.5, label="h_pred - truth")
-		ax.axhline(0.0, linestyle="--", linewidth=1, color="0.4")
-		finite = err[np.isfinite(err)]
-		if len(finite):
-			med = float(np.nanmedian(finite))
-			rms = float(np.sqrt(np.nanmean(finite ** 2)))
-			ax.set_title(f"prediction error over descent: median={med:+.3f} m, RMS={rms:.3f} m  "
-			             f"(positive = clock thinks it is higher than it is -> gain decays late)",
-			             fontsize=9)
-	elif truth is not None:
-		ax.text(0.5, 0.5, "error suppressed: only a GROUND-referenced height is logged\n"
-		                  "(not comparable to platform-referenced h_pred)",
-		        ha="center", va="center", transform=ax.transAxes, fontsize=9, color="0.35")
-	else:
-		ax.text(0.5, 0.5, "no ground-truth height column to compare against",
-		        ha="center", va="center", transform=ax.transAxes, fontsize=9, color="0.35")
-	ax.set_ylabel("error [m]")
-	ax.set_xlabel("time [s]")
-	ax.grid(True, alpha=0.4)
-	ax.legend(loc="best", fontsize=8)
-
-	save_current_figure(output_dir, "height_prediction.png")
+	_finish_figure(fig, axes, data, out / "detections_boxes_fov.png")
 
 
-def plot_multi_column(df: pd.DataFrame, t: np.ndarray, output_dir: str | Path, columns: Sequence[Tuple[str, str]], title: str, filename: str):
-	available = [(name, label) for name, label in columns if name in df.columns]
-	if not available:
-		print(f"Skipping {filename}. No required columns found.")
-		return
-
-	fig, axes = plt.subplots(len(available), 1, figsize=(11, 2.5 * len(available)), sharex=True)
-	if len(available) == 1:
-		axes = [axes]
-	fig.suptitle(title)
-
-	for ax, (name, label) in zip(axes, available):
-		y = numeric_column(df, name)
-		ax.plot(t, y, label=label)
-		ax.axhline(0.0, linestyle="--", linewidth=1)
-		ax.set_ylabel(label)
-		ax.grid(True)
-		ax.legend(loc="best")
-	axes[-1].set_xlabel("time [s]")
-	save_current_figure(output_dir, filename)
-
-
-def plot_flow_derotation(df: pd.DataFrame, t: np.ndarray, output_dir: str | Path):
-	"""Raw vs de-rotated optical flow -- the acceptance plot for ego-rotation
-	removal (derotation.py / optical_flow.py).
-
-	Reading it: over a segment with strong body RATE but little translation (a
-	hover wobble), the de-rotated traces should collapse toward zero while the
-	raw traces track the rotation, and the dotted "rotational component removed"
-	should overlay the raw trace. The wrong-sign failure is loud here -- a
-	de-rotated trace with LARGER amplitude than raw means that axis's rotation is
-	being added instead of subtracted; flip that column of R_body_to_optical (see
-	derotation.py's validation banner) and re-run.
-	"""
-	if "flow_mean_x_raw_px_s" not in df.columns and "flow_mean_y_raw_px_s" not in df.columns:
-		print("Skipping flow de-rotation plot. No pre-de-rotation columns "
-		      "(de-rotation logging off, or an older log).")
-		return
-
-	valid = bool_column(df, "flow_valid", default=True)
-
-	def masked(col: str) -> np.ndarray:
-		y = numeric_column(df, col)
-		return np.where(valid, y, np.nan)
-
-	raw_x, der_x = masked("flow_mean_x_raw_px_s"), masked("flow_mean_x_px_s")
-	raw_y, der_y = masked("flow_mean_y_raw_px_s"), masked("flow_mean_y_px_s")
-
-	have_div = "flow_divergence_prederotation_1_s" in df.columns
-	n_rows = 3 if have_div else 2
-	fig, axes = plt.subplots(n_rows, 1, figsize=(11, 8 if have_div else 6), sharex=True)
-	fig.suptitle("Optical-flow de-rotation: raw vs corrected")
-
-	# Flag logs where de-rotation never actually engaged (raw == corrected), so
-	# an overlapping plot isn't misread as "correction had no effect".
-	frac_derot = float(np.mean(bool_column(df, "flow_derotated", default=False)))
-	if frac_derot < 0.01:
-		axes[0].set_title(
-			"de-rotation inactive in this log (raw == corrected) -- no body "
-			"rates buffered, or derotator disabled",
-			fontsize=9,
-		)
-
-	axes[0].plot(t, raw_x, label="mean flow x -- raw", color="tab:blue", alpha=0.65)
-	axes[0].plot(t, der_x, label="mean flow x -- de-rotated", color="tab:blue", linewidth=1.8)
-	axes[0].plot(t, raw_x - der_x, label="rotational component removed",
-	             color="tab:orange", linestyle=":", alpha=0.85)
-	shade_mission_phases(axes[0], df, t)
-	axes[0].axhline(0.0, linestyle="--", linewidth=1)
-	axes[0].set_ylabel("flow x [px/s]")
-	axes[0].grid(True)
-	axes[0].legend(loc="best")
-
-	axes[1].plot(t, raw_y, label="mean flow y -- raw", color="tab:green", alpha=0.65)
-	axes[1].plot(t, der_y, label="mean flow y -- de-rotated", color="tab:green", linewidth=1.8)
-	axes[1].plot(t, raw_y - der_y, label="rotational component removed",
-	             color="tab:orange", linestyle=":", alpha=0.85)
-	shade_mission_phases(axes[1], df, t)
-	axes[1].axhline(0.0, linestyle="--", linewidth=1)
-	axes[1].set_ylabel("flow y [px/s]")
-	axes[1].grid(True)
-	axes[1].legend(loc="best")
-
-	if have_div:
-		pre = masked("flow_divergence_prederotation_1_s")
-		# Compare against the (unfiltered) de-rotated divergence so both traces
-		# are the same estimator, differing only by de-rotation.
-		post_col = "flow_raw_divergence_1_s" if "flow_raw_divergence_1_s" in df.columns else "flow_divergence_1_s"
-		post = masked(post_col)
-		axes[2].plot(t, pre, label="divergence -- pre-de-rotation", color="tab:red", alpha=0.65)
-		axes[2].plot(t, post, label="divergence -- de-rotated (unfiltered)", color="tab:red", linewidth=1.8)
-		shade_mission_phases(axes[2], df, t)
-		axes[2].axhline(0.0, linestyle="--", linewidth=1)
-		axes[2].set_ylabel("divergence [1/s]")
-		axes[2].grid(True)
-		axes[2].legend(loc="best")
-
-	axes[-1].set_xlabel("time [s]")
-	save_current_figure(output_dir, "flow_derotation.png")
-
-
-def make_default_plots(df: pd.DataFrame, t: np.ndarray, output_dir: str | Path, args):
-	"""The core loop: did we SEE the target, did the PROBE measure the platform,
-	did the GATE pick a sane gain window, and did the DESCENT do what was asked.
-
-	Everything that answers a narrower or more diagnostic question -- lateral
-	control, de-rotation, height prediction, cross-checks against ground truth,
-	platform/vehicle kinematics -- now lives behind --full. Those plots are not
-	less useful, they are just not what you look at on every run, and having a
-	dozen figures open by default made the four that matter harder to find.
-	"""
-	plot_target_detection_summary(df, t, output_dir)
-	plot_detection_boxes_fov(df, t, args.image_width, args.image_height, output_dir, args.max_boxes)
-	plot_probe_acceleration(df, t, output_dir)
-	plot_gain_schedule(df, t, output_dir)
-	# vertical_control.png was one 4-panel stack mixing the loop's error signal with
-	# its physical outcome. Split into the two questions it was really answering.
-	plot_vertical_divergence(df, t, output_dir, divergence_setpoint=None)
-	plot_vertical_descent(df, t, output_dir)
-	plot_closing_rate_spectrum(df, t, output_dir, expected_frequency_hz=args.platform_frequency_hz)
-	plot_drone_platform_position_xyz(df, t, output_dir)
-
-
-def make_full_plots(df: pd.DataFrame, t: np.ndarray, output_dir: str | Path, args):
-	# --- Moved out of the default set (see make_default_plots' docstring). ---
-	plot_lateral_control(df, t, output_dir)
-	plot_flow_derotation(df, t, output_dir)
-	plot_divergence_consistency(df, t, output_dir)
-	plot_height_prediction(df, t, output_dir)
-	plot_platform_motion_frequency(df, t, output_dir, expected_frequency_hz=args.platform_frequency_hz)
-	plot_drone_platform_position_xyz(df, t, output_dir)
-
-	plot_multi_column(
-		df,
-		t,
-		output_dir,
-		[("vehicle_x_m", "vehicle x [m]"), ("vehicle_y_m", "vehicle y [m]"), ("vehicle_z_m", "vehicle z [m]")],
-		"Vehicle position",
-		"vehicle_position_xyz.png",
-	)
-	plot_multi_column(
-		df,
-		t,
-		output_dir,
-		[("platform_x_m", "platform x [m]"), ("platform_y_m", "platform y [m]"), ("platform_z_m", "platform z [m]")],
-		"Platform position",
-		"platform_position_xyz.png",
-	)
-	plot_multi_column(
-		df,
-		t,
-		output_dir,
-		[("platform_vx_m_s", "platform vx [m/s]"), ("platform_vy_m_s", "platform vy [m/s]"), ("platform_vz_m_s", "platform vz [m/s]")],
-		"Platform velocity",
-		"platform_velocity_xyz.png",
-	)
-	plot_multi_column(
-		df,
-		t,
-		output_dir,
-		[
-			("relative_x_m", "relative x [m]"),
-			("relative_y_m", "relative y [m]"),
-			("relative_z_m", "relative z [m]"),
-			("relative_vx_m_s", "relative vx [m/s]"),
-			("relative_vy_m_s", "relative vy [m/s]"),
-			("relative_vz_m_s", "relative vz [m/s]"),
-		],
-		"Relative motion",
-		"relative_motion_xyz.png",
-	)
-
-
-# ---------------------------------------------------------------------------
-# CLI and path handling
-# ---------------------------------------------------------------------------
-
-
-def _looks_like_csv_path(path_like: str) -> bool:
-	return Path(path_like).suffix.lower() == ".csv"
-
-
-def _path_contains_csv(path_like: str) -> bool:
-	path = Path(path_like)
-	return path.is_dir() and any(child.suffix.lower() == ".csv" for child in path.iterdir())
-
-
-def _split_inputs_and_output_dir(raw_paths, output_dir_arg: str, default_output_dir: str):
-	paths = [str(path) for path in raw_paths]
-	output_dir = output_dir_arg
-
-	if output_dir_arg == default_output_dir and len(paths) >= 2:
-		last = paths[-1]
-		last_is_input = _looks_like_csv_path(last) or _path_contains_csv(last)
-		if not last_is_input:
-			output_dir = last
-			paths = paths[:-1]
-
-	if not paths:
-		raise ValueError("No CSV file or log folder was provided.")
-	return paths, output_dir
-
-
-def collect_csv_paths(inputs: Iterable[str]) -> list[Path]:
-	csv_paths = []
-	for item in inputs:
-		path = Path(item)
-		if path.is_dir():
-			csv_paths.extend(sorted(path.glob("*.csv")))
-		elif path.is_file() and path.suffix.lower() == ".csv":
-			csv_paths.append(path)
+def plot_drone_platform_position(data: AnalysisData, out: Path) -> None:
+	tr = data.truth
+	t = _relative_time(tr["_sim_time"], data.t0)
+	fig, axes = plt.subplots(4, 1, figsize=(13, 11), sharex=True)
+	for ax, axis in zip(axes[:3], "xyz"):
+		ax.plot(t, _num(tr, f"truth_drone_position_{axis}_m"), label=f"Drone {axis}")
+		if axis == "z":
+			platform_col = "truth_deck_point_z_m"
+			platform_label = "Deck top z"
 		else:
-			raise FileNotFoundError(f"Input is neither a CSV file nor a folder containing CSV logs: {item}")
-	if not csv_paths:
-		raise FileNotFoundError("No CSV files found in the provided input(s).")
-	return csv_paths
+			platform_col = f"truth_platform_position_{axis}_m"
+			platform_label = f"Platform {axis}"
+		ax.plot(t, _num(tr, platform_col), label=platform_label)
+		ax.set_ylabel(f"{axis.upper()} [m]")
+		_legend(ax, ncol=2)
+	axes[0].set_title("Gazebo truth: drone and platform world position")
+
+	axes[3].plot(t, _num(tr, "truth_min_pad_signed_distance_m"), label="Minimum skid-to-deck distance")
+	axes[3].axhline(0.0, linestyle="--", linewidth=1.0, label="Deck contact plane")
+	axes[3].set_ylabel("Clearance [m]")
+	axes[3].set_xlabel("Time since common log start [s SIM]")
+	_legend(axes[3], ncol=2)
+	_finish_figure(fig, axes, data, out / "drone_platform_position.png")
 
 
-def output_dir_for_csv(csv_path: Path, output_root: Path, total_csv_count: int, index: int, explicit_positional_output: bool):
-	if total_csv_count == 1 and explicit_positional_output:
-		return output_root
-	if total_csv_count == 1 and output_root.name.lower().startswith("test"):
-		return output_root
-	return output_root / f"test{index}"
+def plot_gain_schedule(data: AnalysisData, out: Path) -> None:
+	c = data.control
+	t = _relative_time(c["_sim_time"], data.t0)
+	truth_h = _interp_truth(data, "truth_min_pad_signed_distance_m", c["_sim_time"].to_numpy(float))
+	fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
+
+	axes[0].plot(t, _num(c, "mission_thrust_gain_k"), label="Applied vertical gain K")
+	for col, label, style in [
+		("mission_k_min", "Estimated disturbance floor", "--"),
+		("mission_k_explore", "Exploration gain", ":"),
+		("mission_k_floor", "Scheduled floor", "-."),
+	]:
+		y = _num(c, col)
+		if np.isfinite(y).any():
+			axes[0].plot(t, y, linestyle=style, label=label)
+	axes[0].set_ylabel("Gain K")
+	axes[0].set_title("Mission gain schedule")
+	_legend(axes[0], ncol=2)
+
+	axes[1].plot(t, _num(c, "mission_lateral_p_scale"), label="Lateral P scale")
+	axes[1].plot(t, _num(c, "mission_lateral_d_scale"), label="Lateral D scale")
+	axes[1].set_ylabel("Scale")
+	_legend(axes[1], ncol=2)
+
+	axes[2].plot(t, truth_h, label="True minimum skid clearance")
+	pred = _num(c, "mission_h_pred_m")
+	if np.isfinite(pred).any():
+		axes[2].plot(t, pred, label="Mission open-loop height prediction")
+	axes[2].axhline(0.0, linestyle="--", linewidth=1.0, label="Contact plane")
+	axes[2].set_ylabel("Height [m]")
+	axes[2].set_xlabel("Time since common log start [s SIM]")
+	_legend(axes[2], ncol=2)
+	_finish_figure(fig, axes, data, out / "gain_schedule.png")
 
 
-def parse_args():
-	parser = argparse.ArgumentParser(description="Analyse BEE_LAND diagnostics CSV with coherent timestamps.")
-	parser.add_argument(
-		"paths",
-		nargs="+",
-		help=(
-			"CSV file(s), folder(s) containing CSV logs, and optionally an output folder "
-			"as the final positional argument. Examples: analyse_log.py logs/file.csv results/test9 ; analyse_log.py logs"
-		),
+def plot_lateral_control(data: AnalysisData, out: Path) -> None:
+	c = data.control
+	t = _relative_time(c["_sim_time"], data.t0)
+	tc = c["_sim_time"].to_numpy(float)
+	rel_x = _interp_truth(data, "truth_drone_position_x_m", tc) - _interp_truth(data, "truth_platform_position_x_m", tc)
+	rel_y = _interp_truth(data, "truth_drone_position_y_m", tc) - _interp_truth(data, "truth_platform_position_y_m", tc)
+
+	fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
+	axes[0].plot(t, _num(c, "target_offset_x"), label="Image offset x")
+	axes[0].plot(t, _num(c, "target_offset_y"), label="Image offset y")
+	axes[0].axhline(0.0, linewidth=1.0, linestyle="--")
+	axes[0].set_ylabel("Normalized offset")
+	axes[0].set_title("Lateral visual control versus Gazebo truth")
+	_legend(axes[0], ncol=2)
+
+	axes[1].plot(t, rel_x, label="True drone-platform Δx")
+	axes[1].plot(t, rel_y, label="True drone-platform Δy")
+	axes[1].axhline(0.0, linewidth=1.0, linestyle="--")
+	axes[1].set_ylabel("Relative position [m]")
+	_legend(axes[1], ncol=2)
+
+	axes[2].plot(t, np.degrees(_num(c, "command_roll_rad")), label="Roll command")
+	axes[2].plot(t, np.degrees(_num(c, "command_pitch_rad")), label="Pitch command")
+	axes[2].set_ylabel("Command [deg]")
+	axes[2].set_xlabel("Time since common log start [s SIM]")
+	_legend(axes[2], ncol=2)
+	_finish_figure(fig, axes, data, out / "lateral_control.png")
+
+
+def plot_probe_acceleration(data: AnalysisData, out: Path) -> None:
+	c = data.control
+	t = _relative_time(c["_sim_time"], data.t0)
+	tc = c["_sim_time"].to_numpy(float)
+	drone_az = _interp_truth(data, "truth_drone_linear_acceleration_z_m_s2", tc)
+	platform_az = _interp_truth(data, "truth_platform_linear_acceleration_z_m_s2", tc)
+	relative_az = drone_az - platform_az
+
+	fig, axes = plt.subplots(2, 1, figsize=(13, 7), sharex=True)
+	axes[0].plot(t, _num(c, "mission_probe_accel_m_s2"), label="Command-derived probe acceleration")
+	if np.isfinite(relative_az).any():
+		axes[0].plot(t, relative_az, alpha=0.72, label="True vertical relative acceleration")
+	axes[0].set_ylabel("Acceleration [m/s²]")
+	axes[0].set_title("Probe disturbance estimate versus Gazebo truth")
+	_legend(axes[0], ncol=2)
+
+	for col, label, style in [
+		("mission_probe_mean_accel_m_s2", "Probe mean", "-"),
+		("mission_probe_residual_accel_m_s2", "Probe residual", "--"),
+		("mission_probe_percentile_accel_m_s2", "Probe percentile", ":"),
+		("mission_peak_accel_m_s2", "Peak used by gate", "-."),
+	]:
+		y = _num(c, col)
+		if np.isfinite(y).any():
+			axes[1].plot(t, y, linestyle=style, label=label)
+	axes[1].set_ylabel("Estimator terms [m/s²]")
+	axes[1].set_xlabel("Time since common log start [s SIM]")
+	_legend(axes[1], ncol=2)
+	_finish_figure(fig, axes, data, out / "probe_acceleration.png")
+
+
+def plot_vertical_descent(data: AnalysisData, out: Path) -> None:
+	c = data.control
+	t = _relative_time(c["_sim_time"], data.t0)
+	tc = c["_sim_time"].to_numpy(float)
+	h_pad = _interp_truth(data, "truth_min_pad_signed_distance_m", tc)
+	h_camera = _interp_truth(data, "truth_camera_normal_distance_m", tc)
+	closing = _interp_truth(data, "truth_contact_pad_closing_rate_m_s", tc)
+
+	fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
+	axes[0].plot(t, h_pad, label="True minimum skid clearance")
+	axes[0].plot(t, h_camera, label="True camera-to-deck distance", alpha=0.8)
+	pred = _num(c, "mission_h_pred_m")
+	if np.isfinite(pred).any():
+		axes[0].plot(t, pred, linestyle="--", label="Mission predicted height")
+	axes[0].axhline(0.0, linestyle=":", linewidth=1.0, label="Contact plane")
+	axes[0].set_ylabel("Distance [m]")
+	axes[0].set_title("Vertical descent against Gazebo truth")
+	_legend(axes[0], ncol=2)
+
+	axes[1].plot(t, closing, label="True pad closing rate (+ toward deck)")
+	axes[1].axhline(0.0, linestyle="--", linewidth=1.0)
+	contact_t = _first_rising_time(data.truth, "truth_any_contact")
+	if np.isfinite(contact_t) and data.t0 <= contact_t <= data.t1:
+		contact_rate = _precontact_mean(
+			data,
+			"truth_contact_pad_closing_rate_m_s",
+			contact_t,
+			CONTACT_RATE_AVERAGE_WINDOW_SEC,
+		)
+		if np.isfinite(contact_rate):
+			axes[1].scatter(
+				[contact_t - data.t0],
+				[contact_rate],
+				s=72,
+				marker="o",
+				edgecolors="black",
+				linewidths=0.8,
+				alpha=0.5,
+				zorder=12,
+				label=(
+					f"Contact mean ({CONTACT_RATE_AVERAGE_WINDOW_SEC:.1f} s): "
+					f"{contact_rate:+.3f} m/s"
+				),
+			)
+			axes[1].annotate(
+				(
+					f"{CONTACT_RATE_AVERAGE_WINDOW_SEC:.1f} s pre-contact mean\n"
+					f"{contact_rate:+.3f} m/s"
+				),
+				xy=(contact_t - data.t0, contact_rate),
+				xytext=(8, 10),
+				textcoords="offset points",
+				fontsize=9,
+				fontweight="bold",
+			)
+	axes[1].set_ylabel("Closing rate [m/s]")
+	_legend(axes[1])
+
+	axes[2].plot(t, _num(c, "command_thrust"), label="Commanded thrust")
+	integ = _num(c, "command_thrust_integral")
+	if np.isfinite(integ).any():
+		axes[2].plot(t, integ, label="Thrust integral contribution")
+	axes[2].set_ylabel("Normalized thrust")
+	axes[2].set_xlabel("Time since common log start [s SIM]")
+	_legend(axes[2], ncol=2)
+	_finish_figure(fig, axes, data, out / "vertical_descent.png")
+
+
+def plot_vertical_divergence(data: AnalysisData, out: Path) -> None:
+	c = data.control
+	t = _relative_time(c["_sim_time"], data.t0)
+	tc = c["_sim_time"].to_numpy(float)
+	truth_d = _interp_truth(data, "truth_normal_expansion_rate_1_s", tc)
+	truth_valid = _interp_truth(data, "truth_expansion_truth_valid", tc) > 0.5
+	truth_d[~truth_valid] = np.nan
+	measured = _num(c, "flow_divergence_1_s").to_numpy(float)
+	raw = _num(c, "flow_raw_divergence_1_s").to_numpy(float)
+	setpoint = _num(c, "mission_divergence_setpoint_1_s").to_numpy(float)
+
+	fig, axes = plt.subplots(2, 1, figsize=(13, 8), sharex=True)
+	axes[0].plot(t, measured, label="Measured divergence (filtered)")
+	axes[0].plot(t, raw, alpha=0.42, label="Measured divergence (raw)")
+	axes[0].plot(t, truth_d, linewidth=1.8, label="Gazebo truth c/h")
+	axes[0].plot(t, setpoint, linestyle="--", label="Mission setpoint D*")
+	axes[0].set_ylabel("Divergence [1/s]")
+	axes[0].set_title("Vertical divergence tracking and truth comparison")
+	_legend(axes[0], ncol=2)
+
+	error = measured - truth_d
+	axes[1].plot(t, error, label="Measurement error: D measured − D truth")
+	axes[1].axhline(0.0, linestyle="--", linewidth=1.0)
+	axes[1].set_ylabel("Error [1/s]")
+	axes[1].set_xlabel("Time since common log start [s SIM]")
+	_legend(axes[1])
+	_finish_figure(fig, axes, data, out / "vertical_divergence.png")
+
+
+def plot_platform_motion(data: AnalysisData, out: Path) -> None:
+	tr = data.truth
+	t = _relative_time(tr["_sim_time"], data.t0)
+	fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
+	for axis in "xyz":
+		axes[0].plot(t, _num(tr, f"truth_platform_position_{axis}_m"), label=f"{axis.upper()} position")
+		axes[1].plot(t, _num(tr, f"truth_platform_linear_velocity_{axis}_m_s"), label=f"{axis.upper()} velocity")
+		axes[2].plot(t, _num(tr, f"truth_platform_linear_acceleration_{axis}_m_s2"), label=f"{axis.upper()} acceleration")
+	axes[0].set_title("Gazebo truth: platform motion")
+	axes[0].set_ylabel("Position [m]")
+	axes[1].set_ylabel("Velocity [m/s]")
+	axes[2].set_ylabel("Acceleration [m/s²]")
+	axes[2].set_xlabel("Time since common log start [s SIM]")
+	for ax in axes:
+		_legend(ax, ncol=3)
+	_finish_figure(fig, axes, data, out / "platform_motion.png")
+
+
+def plot_relative_motion(data: AnalysisData, out: Path) -> None:
+	tr = data.truth
+	t = _relative_time(tr["_sim_time"], data.t0)
+	fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
+	for axis in "xyz":
+		rel = _num(tr, f"truth_drone_position_{axis}_m") - _num(tr, f"truth_platform_position_{axis}_m")
+		axes[0].plot(t, rel, label=f"Δ{axis}")
+		rel_v = _num(tr, f"truth_drone_linear_velocity_{axis}_m_s") - _num(tr, f"truth_platform_linear_velocity_{axis}_m_s")
+		axes[1].plot(t, rel_v, label=f"Δv{axis}")
+	axes[2].plot(t, _num(tr, "truth_left_pad_signed_distance_m"), label="Left skid clearance")
+	axes[2].plot(t, _num(tr, "truth_right_pad_signed_distance_m"), label="Right skid clearance")
+	axes[2].plot(t, _num(tr, "truth_contact_pad_closing_rate_m_s"), label="Lowest-pad closing rate")
+	axes[0].set_title("Gazebo truth: drone-platform relative motion")
+	axes[0].set_ylabel("Relative position [m]")
+	axes[1].set_ylabel("Relative velocity [m/s]")
+	axes[2].set_ylabel("Clearance / rate")
+	axes[2].set_xlabel("Time since common log start [s SIM]")
+	_legend(axes[0], ncol=3)
+	_legend(axes[1], ncol=3)
+	_legend(axes[2], ncol=3)
+	_finish_figure(fig, axes, data, out / "relative_motion.png")
+
+
+def plot_target_detection(data: AnalysisData, out: Path) -> None:
+	c = data.control
+	t = _relative_time(c["_sim_time"], data.t0)
+	fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
+	axes[0].plot(t, _num(c, "target_offset_x"), label="Offset x")
+	axes[0].plot(t, _num(c, "target_offset_y"), label="Offset y")
+	axes[0].axhline(0.0, linestyle="--", linewidth=1.0)
+	axes[0].set_ylabel("Normalized offset")
+	axes[0].set_title("Target-detection quality")
+	_legend(axes[0], ncol=2)
+
+	axes[1].plot(t, _num(c, "target_confidence"), label="Confidence")
+	axes[1].plot(t, _bool(c, "target_found").astype(float), label="Target found")
+	axes[1].set_ylabel("Score / flag")
+	_legend(axes[1], ncol=2)
+
+	axes[2].plot(t, _num(c, "flow_fit_quality"), label="Affine-flow fit quality")
+	axes[2].plot(t, _bool(c, "flow_valid").astype(float), label="Flow valid")
+	axes[2].set_ylabel("Quality / flag")
+	axes[2].set_xlabel("Time since common log start [s SIM]")
+	_legend(axes[2], ncol=2)
+	_finish_figure(fig, axes, data, out / "target_detection.png")
+
+
+def _first_rising_time(df: pd.DataFrame, column: str) -> float:
+	if column not in df.columns:
+		return np.nan
+	mask = _bool(df, column).to_numpy()
+	t = df["_sim_time"].to_numpy(float)
+	idx = np.flatnonzero(mask & np.isfinite(t))
+	return float(t[idx[0]]) if idx.size else np.nan
+
+
+CONTACT_RATE_AVERAGE_WINDOW_SEC = 0.10
+
+
+def _precontact_mean(
+	data: AnalysisData,
+	column: str,
+	contact_time: float,
+	window_sec: float = CONTACT_RATE_AVERAGE_WINDOW_SEC,
+) -> float:
+	"""Mean a dense truth quantity over the interval immediately before contact."""
+	if not np.isfinite(contact_time) or column not in data.truth.columns:
+		return np.nan
+
+	times = data.truth["_sim_time"].to_numpy(float)
+	values = _num(data.truth, column).to_numpy(float)
+	mask = (
+		np.isfinite(times)
+		& np.isfinite(values)
+		& (times >= contact_time - float(window_sec))
+		& (times < contact_time)
 	)
-	parser.add_argument("--image-width", type=int, default=640, help="Camera image width in pixels. Default: 640.")
-	parser.add_argument("--image-height", type=int, default=480, help="Camera image height in pixels. Default: 480.")
-	parser.add_argument("--max-boxes", type=int, default=120, help="Maximum detection boxes drawn in detection_boxes_fov.png.")
-	parser.add_argument("--output-dir", default="results", help="Directory where plots will be saved. Default: results.")
-	parser.add_argument(
-		"--time-base",
-		choices=["auto", "flow", "target", "command", "vehicle_px4", "vehicle", "wall", "t_sec"],
-		default="auto",
-		help="X-axis time base. Default: auto, preferring visual/flow timestamps.",
+	return float(np.mean(values[mask])) if np.any(mask) else np.nan
+
+
+def _finite_stats(values) -> tuple[int, float, float, float, float]:
+	arr = np.asarray(values, dtype=float)
+	arr = arr[np.isfinite(arr)]
+	if arr.size == 0:
+		return 0, np.nan, np.nan, np.nan, np.nan
+	return (
+		int(arr.size),
+		float(np.mean(arr)),
+		float(np.median(arr)),
+		float(np.percentile(arr, 95)),
+		float(np.max(arr)),
 	)
-	parser.add_argument(
-		"--platform-frequency-hz",
-		type=float,
-		default=0.2,
-		help="Expected platform frequency for reference/fitting. Default: 0.2 Hz. Pass 0 to disable reference fit.",
+
+
+def _append_vision_delay_table(data: AnalysisData, lines: list[str]) -> None:
+	"""Append a compact worker-delay decomposition to the text summary.
+
+	Total vision delay is frame arrival at the worker boundary through result
+	availability in the parent process.  Transport combines IPC-in and IPC-out.
+	Older v4.4 logs are supported by deriving transport as total-target-flow.
+	"""
+	c = data.control
+	if c.empty:
+		return
+
+	total = _num(c, "timing_frame_to_result_ms").to_numpy(float)
+	target = _num(c, "timing_vision_worker_target_acquisition_ms").to_numpy(float)
+	flow = _num(c, "timing_vision_worker_optical_flow_ms").to_numpy(float)
+
+	transport = _num(c, "timing_vision_worker_transport_ms").to_numpy(float)
+	if not np.isfinite(transport).any():
+		ipc_in = _num(c, "timing_vision_worker_ipc_in_ms").to_numpy(float)
+		ipc_out = _num(c, "timing_vision_worker_ipc_out_ms").to_numpy(float)
+		if np.isfinite(ipc_in).any() or np.isfinite(ipc_out).any():
+			transport = np.nan_to_num(ipc_in, nan=0.0) + np.nan_to_num(ipc_out, nan=0.0)
+		else:
+			transport = total - target - flow
+			transport[~np.isfinite(total)] = np.nan
+
+	rows = [
+		("TOTAL: frame -> processed result", total),
+		("target_acquisition.update()", target),
+		("optical_flow.update()", flow),
+		("transport (IPC in + IPC out)", transport),
+	]
+	formatted = []
+	max_n = 0
+	for label, values in rows:
+		n, mean, median, p95, vmax = _finite_stats(values)
+		if n == 0:
+			continue
+		max_n = max(max_n, n)
+		formatted.append(
+			f"{label:38s}{mean:9.2f}{median:9.2f}{p95:9.2f}{vmax:9.2f}"
+		)
+	if not formatted:
+		return
+
+	phases = _clean_string(c.get("mission_substate", pd.Series("", index=c.index)))
+	descend_n = int((phases == "descend").sum())
+	lines += [
+		"",
+		"Vision worker delay decomposition [ms]",
+		"--------------------------------------",
+		f"Computed over: {max_n} fresh controller/vision rows in analysed interval"
+		+ (f" ({descend_n} DESCENT rows)" if descend_n else ""),
+		f"{'stage':38s}{'mean':>9}{'median':>9}{'p95':>9}{'max':>9}",
+	]
+	lines.extend(formatted)
+
+	dropped = _num(c, "timing_vision_dropped_frames").to_numpy(float)
+	finite_dropped = dropped[np.isfinite(dropped)]
+	if finite_dropped.size:
+		lines.append(
+			f"Frames dropped at input queue (cumulative): {int(np.nanmax(finite_dropped))}"
+		)
+
+
+def write_summary(data: AnalysisData, out: Path, controller_path: Path, truth_path: Path) -> None:
+	c = data.control
+	tr = data.truth
+	lines = [
+		"BEE_LAND paired-log analysis",
+		"================================",
+		f"Controller file: {controller_path}",
+		f"Truth file:      {truth_path}",
+		f"Analysed SIM span: {data.t1 - data.t0:.3f} s ({data.t0:.6f} to {data.t1:.6f})",
+		f"Plot-time range: 0.000 to {data.t1 - data.t0:.3f} s SIM",
+		f"Unique controller samples: {len(c)}",
+		f"Truth samples: {len(tr)}",
+	]
+
+	truth_sim = tr["_sim_time"].to_numpy(float)
+	truth_sim = truth_sim[np.isfinite(truth_sim)]
+	truth_dt = np.diff(truth_sim)
+	truth_dt = truth_dt[np.isfinite(truth_dt) & (truth_dt > 0.0)]
+	receipt_wall = _num(tr, "truth_receipt_wall_timestamp_sec").to_numpy(float)
+	receipt_wall = receipt_wall[np.isfinite(receipt_wall)]
+	wall_dt = np.diff(receipt_wall)
+	wall_dt = wall_dt[np.isfinite(wall_dt) & (wall_dt > 0.0)]
+	if truth_dt.size:
+		lines.append(f"Mean truth SIM period: {np.mean(truth_dt):.6f} s")
+		lines.append(f"Median truth SIM period: {np.median(truth_dt):.6f} s")
+		lines.append(f"Effective truth rate in SIM time: {1.0/np.mean(truth_dt):.2f} Hz")
+	if wall_dt.size:
+		lines.append(f"Mean truth receipt wall period: {np.mean(wall_dt):.6f} s")
+		lines.append(f"Effective truth receipt rate in wall time: {1.0/np.mean(wall_dt):.2f} Hz")
+	if truth_dt.size and wall_dt.size:
+		n = min(truth_dt.size, wall_dt.size)
+		valid = (truth_dt[:n] > 0.0) & (wall_dt[:n] > 0.0)
+		if valid.any():
+			rtf = np.sum(truth_dt[:n][valid]) / np.sum(wall_dt[:n][valid])
+			lines.append(f"Effective Gazebo real-time factor (SIM/wall): {rtf:.3f}")
+
+	phases = _clean_string(c.get("mission_substate", pd.Series("", index=c.index)))
+	if len(phases):
+		lines.append("Mission samples by phase:")
+		for phase, count in phases[phases != ""].value_counts(sort=False).items():
+			lines.append(f"  {phase}: {count}")
+
+	contact_t = _first_rising_time(tr, "truth_any_contact")
+	confirmed_t = _first_rising_time(tr, "truth_contact_confirmed")
+	if np.isfinite(contact_t):
+		lines.append(f"First Gazebo contact: {contact_t:.6f} s SIM ({contact_t-data.t0:.3f} s plot time)")
+		contact_closing = _precontact_mean(
+			data,
+			"truth_contact_pad_closing_rate_m_s",
+			contact_t,
+			CONTACT_RATE_AVERAGE_WINDOW_SEC,
+		)
+		contact_clearance = _interp_truth(
+			data, "truth_min_pad_signed_distance_m", np.array([contact_t])
+		)[0]
+		lines.append(
+			"True pre-contact closing-rate mean "
+			f"({CONTACT_RATE_AVERAGE_WINDOW_SEC:.2f} s window): "
+			f"{contact_closing:+.4f} m/s"
+		)
+		lines.append(f"True minimum pad clearance at first contact: {contact_clearance:+.5f} m")
+	if np.isfinite(confirmed_t):
+		lines.append(f"Confirmed contact: {confirmed_t:.6f} s SIM ({confirmed_t-data.t0:.3f} s plot time)")
+		confirmed_closing = _interp_truth(
+			data, "truth_contact_pad_closing_rate_m_s", np.array([confirmed_t])
+		)[0]
+		lines.append(f"True closing rate at confirmed contact: {confirmed_closing:+.4f} m/s")
+
+	tc = c["_sim_time"].to_numpy(float)
+	measured = _num(c, "flow_divergence_1_s").to_numpy(float)
+	truth_d = _interp_truth(data, "truth_normal_expansion_rate_1_s", tc)
+	valid = _interp_truth(data, "truth_expansion_truth_valid", tc) > 0.5
+	good = np.isfinite(measured) & np.isfinite(truth_d) & valid
+	if good.any():
+		err = measured[good] - truth_d[good]
+		lines.append(f"Divergence truth comparison samples: {good.sum()}")
+		lines.append(f"Divergence bias (measured-truth): {np.mean(err):+.5f} 1/s")
+		lines.append(f"Divergence RMSE: {math.sqrt(np.mean(err**2)):.5f} 1/s")
+		if good.sum() >= 3:
+			lines.append(f"Divergence correlation: {np.corrcoef(measured[good], truth_d[good])[0,1]:.4f}")
+
+	_append_vision_delay_table(data, lines)
+
+	lines += [
+		"",
+		"Interpretation note:",
+		"  Gazebo truth is used directly in SIM time. No PX4/platform clock",
+		"  reconstruction and no differentiated cross-stream positions are used.",
+	]
+	(out / "summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
+	parser = argparse.ArgumentParser(
+		description="Compare a BEE_LAND controller log with its Gazebo truth log."
 	)
-	parser.add_argument(
-		"--max-duration-sec",
-		type=float,
-		default=None,
-		help=(
-			"Hard cutoff on wall-clock run duration: rows with t_sec beyond this are "
-			"dropped before any analysis/plotting (e.g. after accidentally leaving the "
-			"sim running). Uses t_sec specifically (the one WALL-clock column every log "
-			"has), regardless of --time-base. Default: no limit."
-		),
-	)
+	parser.add_argument("csv_a", type=Path, help="Controller or truth CSV")
+	parser.add_argument("csv_b", type=Path, help="The paired truth or controller CSV")
+	parser.add_argument("output_dir", type=Path, help="Directory for generated plots")
 	parser.add_argument(
 		"--full",
 		action="store_true",
-		help="Generate optional detailed/legacy plots in addition to the concise default set.",
+		help="Also generate platform_motion, relative_motion, and target_detection.",
 	)
-	return parser.parse_args()
-
-
-def main():
-	args = parse_args()
-	default_output_dir = "results"
-	positional_output_requested = (
-		args.output_dir == default_output_dir
-		and len(args.paths) >= 2
-		and not _looks_like_csv_path(args.paths[-1])
-		and not _path_contains_csv(args.paths[-1])
+	parser.add_argument(
+		"--max-time",
+		type=float,
+		default=None,
+		metavar="SECONDS",
+		help=(
+			"Stop all plots and summary calculations at this many simulated "
+			"seconds after the common plot start. Example: --max-time 55."
+		),
 	)
+	return parser.parse_args(argv)
 
-	input_paths, output_dir = _split_inputs_and_output_dir(args.paths, args.output_dir, default_output_dir)
-	csv_paths = collect_csv_paths(input_paths)
-	output_root = Path(output_dir)
-	ensure_output_dir(output_root)
 
-	expected_freq = args.platform_frequency_hz if args.platform_frequency_hz and args.platform_frequency_hz > 0.0 else None
+def main(argv: Optional[list[str]] = None) -> int:
+	args = parse_args(argv)
+	controller, truth = _load_pair(args.csv_a, args.csv_b)
+	data = _prepare(controller, truth)
+	data = _clip_max_time(data, args.max_time)
+	args.output_dir.mkdir(parents=True, exist_ok=True)
 
-	for index, csv_path in enumerate(csv_paths, start=1):
-		df = read_log(csv_path)
-		df = truncate_to_duration(df, args.max_duration_sec, csv_path)
-		t, time_column, time_description = choose_time_base(df, requested=args.time_base)
-		output_complete = output_dir_for_csv(csv_path, output_root, len(csv_paths), index, positional_output_requested)
-		ensure_output_dir(output_complete)
+	main_plots = [
+		plot_detections_boxes_fov,
+		plot_drone_platform_position,
+		plot_gain_schedule,
+		plot_lateral_control,
+		plot_probe_acceleration,
+		plot_vertical_descent,
+		plot_vertical_divergence,
+	]
+	for fn in main_plots:
+		fn(data, args.output_dir)
+		print(f"saved {args.output_dir / (fn.__name__.replace('plot_', '') + '.png')}")
 
-		print(f"Loaded: {csv_path}")
-		print(f"Output directory: {output_complete}")
+	if args.full:
+		for fn in [plot_platform_motion, plot_relative_motion, plot_target_detection]:
+			fn(data, args.output_dir)
+			print(f"saved {args.output_dir / (fn.__name__.replace('plot_', '') + '.png')}")
 
-		summary = compute_summary(df, t, time_column, time_description, expected_freq)
-		write_summary(output_complete, summary)
-
-		make_default_plots(df, t, output_complete, args)
-		if args.full:
-			make_full_plots(df, t, output_complete, args)
-
-		print("Done.")
+	controller_path = args.csv_a if _classify_file(controller) == "controller" else args.csv_b
+	# The dataframes are already ordered by role; determine source paths safely.
+	if _classify_file(_read_csv(args.csv_a).head(2)) == "controller":
+		controller_path, truth_path = args.csv_a, args.csv_b
+	else:
+		controller_path, truth_path = args.csv_b, args.csv_a
+	write_summary(data, args.output_dir, controller_path, truth_path)
+	print(f"saved {args.output_dir / 'summary.txt'}")
+	return 0
 
 
 if __name__ == "__main__":
-	main()
+	try:
+		raise SystemExit(main())
+	except (ValueError, RuntimeError) as exc:
+		print(f"ERROR: {exc}", file=sys.stderr)
+		raise SystemExit(2)
