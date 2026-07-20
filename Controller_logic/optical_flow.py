@@ -52,6 +52,8 @@ the visual debug test. The dense flow field is still not part of FlowResult.
 
 from typing import Optional, Tuple
 
+import time
+
 import cv2
 import numpy as np
 
@@ -149,9 +151,10 @@ class OpticalFlowEstimator:
 		require_target_roi: bool = True,
 		roi_margin_fraction: float = 0.05,
 		min_roi_size_px: int = 32,
-		divergence_smoothing: float = 0.7,
+		divergence_smoothing: float = 0.3,
 		min_points_for_affine_fit: int = 30,
 		affine_inlier_quantile: float = 0.85,
+		affine_fit_stride: int = 2,
 		store_debug: bool = False,
 		# Optional ego-rotation removal. Pass a derotation.Derotator to enable
 		# it; leave None for the legacy (no de-rotation) behavior. When set,
@@ -194,9 +197,15 @@ class OpticalFlowEstimator:
 		# specular) flow vectors can't dominate the global fit.
 		self._min_points_for_affine_fit = int(min_points_for_affine_fit)
 		self._affine_inlier_quantile = float(affine_inlier_quantile)
+		# Uniform spatial decimation for the affine fit only. Farneback and
+		# mean-flow calculations still use the complete working field. A stride
+		# of 2 samples one vector from each 2x2 block, retaining full-ROI
+		# coverage while reducing the robust fit workload by about 4x.
+		self._affine_fit_stride = max(1, int(affine_fit_stride))
 
 		self._store_debug = bool(store_debug)
 		self._last_debug = {}
+		self._last_timing = {}
 
 		# Ego-rotation removal (see derotation.py). None -> disabled.
 		self._derotator = derotator
@@ -212,57 +221,99 @@ class OpticalFlowEstimator:
 		# to the constructor; None (or no derotator) => no de-rotation.
 		body_rates=None,
 	) -> FlowResult:
-		if frame_bgr is None:
+		wall_start = time.perf_counter()
+		cpu_start = time.process_time()
+		timing = {
+			"farneback_pyr_scale": float(self._pyr_scale),
+			"farneback_levels": int(self._levels),
+			"farneback_winsize": int(self._winsize),
+			"farneback_iterations": int(self._iterations),
+			"farneback_poly_n": int(self._poly_n),
+			"farneback_poly_sigma": float(self._poly_sigma),
+			"divergence_smoothing_alpha": float(self._divergence_smoothing),
+		}
+
+		def finish_timing():
+			timing["total_wall_ms"] = 1000.0 * (time.perf_counter() - wall_start)
+			timing["total_cpu_ms"] = 1000.0 * (time.process_time() - cpu_start)
+			self._last_timing = dict(timing)
+
+		def invalid_result(message: str, *, previous_frame=None, current_frame=None, roi=None):
+			stage_start = time.perf_counter()
 			result = FlowResult(timestamp=timestamp, valid=False)
-			self._save_debug(result=result, current_frame=None)
+			self._save_debug(
+				result=result,
+				previous_frame=previous_frame,
+				current_frame=current_frame,
+				roi=roi,
+				message=message,
+			)
+			timing["result_and_state_ms"] = 1000.0 * (time.perf_counter() - stage_start)
+			timing["valid"] = 0
+			finish_timing()
 			return result
 
+		if frame_bgr is None:
+			return invalid_result("No frame", current_frame=None)
+
+		stage_start = time.perf_counter()
 		gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
 		image_height, image_width = gray.shape[:2]
+		timing["grayscale_ms"] = 1000.0 * (time.perf_counter() - stage_start)
+		timing["image_width_px"] = int(image_width)
+		timing["image_height_px"] = int(image_height)
 
 		if self._prev_gray is None or self._prev_timestamp is None:
+			stage_start = time.perf_counter()
 			self._prev_gray = gray
 			self._prev_bgr = frame_bgr.copy()
 			self._prev_timestamp = timestamp
-
+			timing["result_and_state_ms"] = 1000.0 * (time.perf_counter() - stage_start)
+			timing["valid"] = 0
 			result = FlowResult(timestamp=timestamp, valid=False)
 			self._save_debug(
 				result=result,
 				current_frame=frame_bgr,
 				message="Waiting for previous frame",
 			)
-
+			finish_timing()
 			return result
 
 		dt = float(timestamp - self._prev_timestamp)
+		timing["dt_sec"] = dt
 
 		if dt <= 1e-6:
+			stage_start = time.perf_counter()
 			self._prev_gray = gray
 			self._prev_bgr = frame_bgr.copy()
 			self._prev_timestamp = timestamp
-
+			timing["result_and_state_ms"] = 1000.0 * (time.perf_counter() - stage_start)
+			timing["valid"] = 0
 			result = FlowResult(timestamp=timestamp, valid=False)
 			self._save_debug(
 				result=result,
 				current_frame=frame_bgr,
 				message="Invalid dt",
 			)
-
+			finish_timing()
 			return result
 
+		stage_start = time.perf_counter()
 		previous_frame = self._prev_bgr.copy() if self._prev_bgr is not None else None
-
 		roi = self._target_roi_from_estimate(
 			target=target,
 			image_width=image_width,
 			image_height=image_height,
 		)
+		timing["roi_setup_ms"] = 1000.0 * (time.perf_counter() - stage_start)
 
 		if roi is None and self._require_target_roi:
+			stage_start = time.perf_counter()
 			self._prev_gray = gray
 			self._prev_bgr = frame_bgr.copy()
 			self._prev_timestamp = timestamp
-
+			timing["result_and_state_ms"] = 1000.0 * (time.perf_counter() - stage_start)
+			timing["valid"] = 0
 			result = FlowResult(timestamp=timestamp, valid=False)
 			self._save_debug(
 				result=result,
@@ -271,22 +322,26 @@ class OpticalFlowEstimator:
 				roi=None,
 				message="No valid target ROI",
 			)
-
+			finish_timing()
 			return result
 
 		if roi is None:
 			roi = (0, 0, image_width, image_height)
 
 		x0, y0, x1, y1 = roi
-
 		prev_roi = self._prev_gray[y0:y1, x0:x1]
 		gray_roi = gray[y0:y1, x0:x1]
+		roi_height, roi_width = prev_roi.shape[:2]
+		timing["roi_width_px"] = int(roi_width)
+		timing["roi_height_px"] = int(roi_height)
 
-		if prev_roi.shape[1] < 3 or prev_roi.shape[0] < 3:
+		if roi_width < 3 or roi_height < 3:
+			stage_start = time.perf_counter()
 			self._prev_gray = gray
 			self._prev_bgr = frame_bgr.copy()
 			self._prev_timestamp = timestamp
-
+			timing["result_and_state_ms"] = 1000.0 * (time.perf_counter() - stage_start)
+			timing["valid"] = 0
 			result = FlowResult(timestamp=timestamp, valid=False)
 			self._save_debug(
 				result=result,
@@ -295,22 +350,31 @@ class OpticalFlowEstimator:
 				roi=roi,
 				message="ROI too small",
 			)
-
+			finish_timing()
 			return result
 
-		# ROI-adaptive downsampling (see constructor docstring): shrink the
-		# search problem for a big ROI instead of growing the search window.
-		scale = self._downsample_scale_for_roi(prev_roi.shape[1], prev_roi.shape[0])
-
+		# ROI-adaptive downsampling: time resizing separately from Farneback.
+		stage_start = time.perf_counter()
+		scale = self._downsample_scale_for_roi(roi_width, roi_height)
 		if scale < 1.0:
-			small_w = max(3, int(round(prev_roi.shape[1] * scale)))
-			small_h = max(3, int(round(prev_roi.shape[0] * scale)))
-			prev_small = cv2.resize(prev_roi, (small_w, small_h), interpolation=cv2.INTER_AREA)
-			gray_small = cv2.resize(gray_roi, (small_w, small_h), interpolation=cv2.INTER_AREA)
+			small_w = max(3, int(round(roi_width * scale)))
+			small_h = max(3, int(round(roi_height * scale)))
+			prev_small = cv2.resize(
+				prev_roi, (small_w, small_h), interpolation=cv2.INTER_AREA
+			)
+			gray_small = cv2.resize(
+				gray_roi, (small_w, small_h), interpolation=cv2.INTER_AREA
+			)
 		else:
 			prev_small = prev_roi
 			gray_small = gray_roi
+		timing["downsample_resize_ms"] = 1000.0 * (time.perf_counter() - stage_start)
+		timing["downsample_scale"] = float(scale)
+		timing["working_width_px"] = int(prev_small.shape[1])
+		timing["working_height_px"] = int(prev_small.shape[0])
+		timing["working_flow_vectors"] = int(prev_small.shape[0] * prev_small.shape[1])
 
+		stage_start = time.perf_counter()
 		flow_small_per_frame = cv2.calcOpticalFlowFarneback(
 			prev_small,
 			gray_small,
@@ -323,31 +387,17 @@ class OpticalFlowEstimator:
 			self._poly_sigma,
 			0,
 		)
+		timing["farneback_ms"] = 1000.0 * (time.perf_counter() - stage_start)
 
-		# A downsampled-pixel of apparent motion is 1/scale ORIGINAL pixels of
-		# real motion -- correct the amplitude regardless of what happens next.
-		flow_small_per_frame = flow_small_per_frame / scale if scale < 1.0 else flow_small_per_frame
+		stage_start = time.perf_counter()
+		if scale < 1.0:
+			flow_small_per_frame = flow_small_per_frame / scale
 
-		# derotation needs to be decided BEFORE choosing whether to upsample:
-		# Derotator.rotational_flow samples the rotational model at full-image
-		# pixel coordinates (using x0, y0 -- this ROI's offset within the full
-		# frame), so it needs a full-resolution field to subtract against.
-		# Without derotation, there's no such requirement -- the affine fit
-		# doesn't care how densely its input is sampled, only that the
-		# coordinate SPACING it's told about matches what it's given (see
-		# _fit_divergence_affine's pixel_scale). Fitting directly on the
-		# downsampled field, instead of reconstructing it to full ROI
-		# resolution first, is what actually shrinks the fit's cost --
-		# downsampling Farneback alone left the fit solving over the same
-		# point count as before every time, which was most of what this
-		# function was actually spending on close-range descent (see
-		# bee_node.py's VISION_PROCESSING_LATENCY_BUDGET_SEC docstring).
 		derotation_active = self._derotator is not None and body_rates is not None
-
 		if derotation_active and scale < 1.0:
 			flow_px_per_frame = cv2.resize(
 				flow_small_per_frame,
-				(prev_roi.shape[1], prev_roi.shape[0]),
+				(roi_width, roi_height),
 				interpolation=cv2.INTER_LINEAR,
 			)
 			fit_pixel_scale = 1.0
@@ -356,62 +406,33 @@ class OpticalFlowEstimator:
 			flow_px_per_frame = flow_small_per_frame
 			fit_pixel_scale = scale
 			gradient_source = prev_small
-
 		flow_px_s = flow_px_per_frame / dt
+		timing["flow_scaling_upsample_ms"] = 1000.0 * (time.perf_counter() - stage_start)
+		timing["fit_pixel_scale"] = float(fit_pixel_scale)
+		timing["derotation_active"] = int(bool(derotation_active))
 
-		# --- Ego-rotation removal (see derotation.py) ----------------------
-		# Subtract the predicted rotational flow field (depth-independent, a
-		# pure function of body rate + camera geometry) BEFORE mean flow and the
-		# affine divergence fit, so both the [offset, flow_norm] state and the
-		# divergence see translation-only flow.
-		#
-		# raw_flow_px_s keeps a reference to the PRE-de-rotation field for the
-		# raw-vs-corrected diagnostics below; derotate() returns a NEW array, so
-		# the reference stays intact. When de-rotation is inactive the two names
-		# alias the same array and raw == corrected everywhere (no double work).
+		stage_start = time.perf_counter()
 		raw_flow_px_s = flow_px_s
 		if derotation_active:
 			flow_px_s = self._derotator.derotate(
 				flow_px_s, body_rates, roi=(x0, y0, x1, y1)
 			)
+		timing["derotation_ms"] = 1000.0 * (time.perf_counter() - stage_start)
 
+		stage_start = time.perf_counter()
 		raw_mean_flow_x = float(np.mean(raw_flow_px_s[:, :, 0]))
 		raw_mean_flow_y = float(np.mean(raw_flow_px_s[:, :, 1]))
-
 		mean_flow_x = float(np.mean(flow_px_s[:, :, 0]))
 		mean_flow_y = float(np.mean(flow_px_s[:, :, 1]))
-
-		# Same mean flow, but in the normalized image-coordinate system
-		# used by TargetEstimate.offset_x/offset_y. This is the preferred
-		# velocity-like state for roll/pitch control and identification.
 		mean_flow_x_norm = mean_flow_x / max(0.5 * image_width, 1.0)
 		mean_flow_y_norm = mean_flow_y / max(0.5 * image_height, 1.0)
+		timing["mean_flow_ms"] = 1000.0 * (time.perf_counter() - stage_start)
 
-		# Reference-frame gradient magnitude, used to weight the affine
-		# divergence fit toward pixels with real local structure (see
-		# _fit_divergence_affine / this module's docstring): a flat,
-		# texture-poor patch gives near-random Farneback output and should
-		# be trusted less than a high-gradient patch, not averaged in
-		# equally. Computed on gradient_source -- prev_roi (full ROI
-		# resolution) only when derotation forced an upsample above,
-		# otherwise prev_small, so the weight map always matches
-		# flow_px_s's actual shape without a separate resize step.
+		stage_start = time.perf_counter()
 		gradient_magnitude = self._gradient_magnitude(gradient_source)
+		timing["gradient_ms"] = 1000.0 * (time.perf_counter() - stage_start)
 
-		# Debug-only: a per-pixel finite-difference field, useful to *look at*
-		# (e.g. to see whether signal is rim-only vs whole-field). The
-		# production scalar below is fit independently and more robustly --
-		# see the module docstring. Gated behind store_debug: this was
-		# previously computed EVERY frame regardless (np.gradient over the
-		# full ROI -- the largest ROI of the whole descent, once
-		# fov_saturated pins it to the full frame) even though _save_debug
-		# only ever kept the result when store_debug was already True. That
-		# made it pure wasted wall-clock cost on every real flight, and real
-		# wall-clock cost here is exactly what feeds
-		# bee_node.py's VISION_PROCESSING_LATENCY_BUDGET_SEC / the de Croon
-		# gate's dt -- so a debug-only computation was silently eating into
-		# the safety margin on every production run, not just during
-		# debugging.
+		stage_start = time.perf_counter()
 		divergence_field = (
 			self._estimate_divergence_field(
 				flow_px_s=flow_px_s,
@@ -422,32 +443,31 @@ class OpticalFlowEstimator:
 			if self._store_debug
 			else None
 		)
+		timing["divergence_field_debug_ms"] = 1000.0 * (
+			time.perf_counter() - stage_start
+		)
 
+		affine_timing = {}
+		stage_start = time.perf_counter()
 		raw_divergence, n_inliers, fit_quality = self._fit_divergence_affine(
 			flow_px_s=flow_px_s,
 			image_width=image_width,
 			image_height=image_height,
 			gradient_magnitude=gradient_magnitude,
 			pixel_scale=fit_pixel_scale,
+			timing=affine_timing,
 		)
-		filtered_divergence = self._filter_divergence(raw_divergence)
+		timing["affine_fit_ms"] = 1000.0 * (time.perf_counter() - stage_start)
+		for key, value in affine_timing.items():
+			timing[f"affine_{key}"] = value
+		timing["affine_points_used"] = int(n_inliers)
+		timing["affine_fit_quality"] = float(fit_quality)
 
-		# Divergence on the PRE-de-rotation field, diagnostics-only: the gap
-		# between this and raw_divergence is how much ego-rotation was biasing
-		# the divergence estimate. Recomputed only when de-rotation actually ran
-		# (otherwise identical to raw_divergence). Same gradient weighting -- the
-		# weight map is image-derived and de-rotation-independent.
-		#
-		# robust=False here (see _fit_divergence_affine): this value is
-		# logged for offline analysis only (state.py's
-		# divergence_prederotation / diagnostics_writer.py), never read by
-		# control_law.py or mission_routine.py, so it does not need the
-		# second trim-and-refit pass that the CONTROL-facing raw_divergence
-		# above gets -- that pass roughly doubles this call's cost, and this
-		# is a second full affine solve happening on top of the one above,
-		# every frame, at whatever the current ROI size is (largest right
-		# when fov_saturated makes it the full frame -- exactly the regime
-		# this latency budget matters most in).
+		stage_start = time.perf_counter()
+		filtered_divergence = self._filter_divergence(raw_divergence)
+		timing["divergence_filter_ms"] = 1000.0 * (time.perf_counter() - stage_start)
+
+		stage_start = time.perf_counter()
 		if derotation_active:
 			divergence_prederotation, _, _ = self._fit_divergence_affine(
 				flow_px_s=raw_flow_px_s,
@@ -459,7 +479,9 @@ class OpticalFlowEstimator:
 			)
 		else:
 			divergence_prederotation = raw_divergence
+		timing["prederotation_fit_ms"] = 1000.0 * (time.perf_counter() - stage_start)
 
+		stage_start = time.perf_counter()
 		result = FlowResult(
 			timestamp=timestamp,
 			valid=True,
@@ -479,7 +501,6 @@ class OpticalFlowEstimator:
 			mean_flow_y_raw=float(raw_mean_flow_y),
 			divergence_prederotation=float(divergence_prederotation),
 		)
-
 		self._save_debug(
 			result=result,
 			previous_frame=previous_frame,
@@ -491,11 +512,12 @@ class OpticalFlowEstimator:
 			roi=roi,
 			message="",
 		)
-
 		self._prev_gray = gray
 		self._prev_bgr = frame_bgr.copy()
 		self._prev_timestamp = timestamp
-
+		timing["result_and_state_ms"] = 1000.0 * (time.perf_counter() - stage_start)
+		timing["valid"] = 1
+		finish_timing()
 		return result
 
 	def _fit_divergence_affine(
@@ -506,6 +528,7 @@ class OpticalFlowEstimator:
 		gradient_magnitude: Optional[np.ndarray] = None,
 		robust: bool = True,
 		pixel_scale: float = 1.0,
+		timing: Optional[dict] = None,
 	) -> Tuple[float, int, float]:
 		"""
 		Divergence via a global affine fit, not a per-pixel median.
@@ -578,57 +601,120 @@ class OpticalFlowEstimator:
 		added to catch (see this file's usage note: diagnosis-only for now,
 		not yet read by control_law.py or mission_routine.py).
 		"""
+		fit_wall_start = time.perf_counter()
+		if timing is None:
+			timing = {}
+
 		roi_height, roi_width = flow_px_s.shape[:2]
-		if roi_width < 3 or roi_height < 3:
+		timing["input_points"] = int(roi_height * roi_width)
+
+		# Fit-only spatial decimation. We deliberately do not resize or average
+		# the flow here: regular slicing preserves the measured vector values and
+		# samples the full ROI uniformly. Coordinate spacing is increased below by
+		# the same stride, so the fitted slopes and divergence remain in exactly
+		# the same normalized-image units per second.
+		fit_stride = max(1, int(self._affine_fit_stride))
+		if fit_stride > 1:
+			flow_fit = flow_px_s[::fit_stride, ::fit_stride]
+			if (
+				gradient_magnitude is not None
+				and gradient_magnitude.shape == (roi_height, roi_width)
+			):
+				gradient_fit = gradient_magnitude[::fit_stride, ::fit_stride]
+			else:
+				gradient_fit = None
+		else:
+			flow_fit = flow_px_s
+			gradient_fit = gradient_magnitude
+
+		fit_height, fit_width = flow_fit.shape[:2]
+		timing["fit_stride"] = fit_stride
+		timing["sampled_points"] = int(fit_height * fit_width)
+		if fit_width < 3 or fit_height < 3:
+			timing.update({
+				"setup_ms": 1000.0 * (time.perf_counter() - fit_wall_start),
+				"initial_solve_ms": 0.0,
+				"residual_quantile_ms": 0.0,
+				"refit_ms": 0.0,
+				"finite_points": 0,
+				"used_points": 0,
+			})
 			return 0.0, 0, 0.0
 
-		u = flow_px_s[:, :, 0] / max(0.5 * image_width, 1.0)
-		v = flow_px_s[:, :, 1] / max(0.5 * image_height, 1.0)
+		u = flow_fit[:, :, 0] / max(0.5 * image_width, 1.0)
+		v = flow_fit[:, :, 1] / max(0.5 * image_height, 1.0)
 
 		s = max(1e-6, float(pixel_scale))
-		dx_norm = (2.0 / max(image_width - 1, 1)) / s
-		dy_norm = (2.0 / max(image_height - 1, 1)) / s
+		dx_norm = fit_stride * (2.0 / max(image_width - 1, 1)) / s
+		dy_norm = fit_stride * (2.0 / max(image_height - 1, 1)) / s
 
-		rows, cols = np.mgrid[0:roi_height, 0:roi_width]
+		rows, cols = np.mgrid[0:fit_height, 0:fit_width]
 		x = (cols * dx_norm).ravel().astype(np.float64)
 		y = (rows * dy_norm).ravel().astype(np.float64)
 		u_flat = u.ravel().astype(np.float64)
 		v_flat = v.ravel().astype(np.float64)
 
-		if gradient_magnitude is not None and gradient_magnitude.shape == (roi_height, roi_width):
-			weight_flat = gradient_magnitude.ravel().astype(np.float64)
+		if gradient_fit is not None and gradient_fit.shape == (fit_height, fit_width):
+			weight_flat = gradient_fit.ravel().astype(np.float64)
 		else:
 			weight_flat = np.ones_like(u_flat)
 
 		finite = np.isfinite(u_flat) & np.isfinite(v_flat) & np.isfinite(weight_flat)
 		n_finite = int(np.count_nonzero(finite))
+		timing["finite_points"] = n_finite
 		if n_finite < self._min_points_for_affine_fit:
-			field = self._estimate_divergence_field(flow_px_s, image_width, image_height, pixel_scale=s)
+			field = self._estimate_divergence_field(
+				flow_px_s, image_width, image_height, pixel_scale=s
+			)
+			timing.update({
+				"setup_ms": 1000.0 * (time.perf_counter() - fit_wall_start),
+				"initial_solve_ms": 0.0,
+				"residual_quantile_ms": 0.0,
+				"refit_ms": 0.0,
+				"used_points": n_finite,
+			})
 			return self._scalar_from_divergence_field(field), n_finite, 0.0
 
 		x, y, u_flat, v_flat, weight_flat = (
 			x[finite], y[finite], u_flat[finite], v_flat[finite], weight_flat[finite]
 		)
 		design = np.column_stack([np.ones_like(x), x, y])
+		timing["setup_ms"] = 1000.0 * (time.perf_counter() - fit_wall_start)
 
+		stage_start = time.perf_counter()
 		coeffs, divergence, fit_quality = self._weighted_affine_least_squares(
 			design, u_flat, v_flat, weight_flat
 		)
+		timing["initial_solve_ms"] = 1000.0 * (time.perf_counter() - stage_start)
 
 		if not robust:
+			timing["residual_quantile_ms"] = 0.0
+			timing["refit_ms"] = 0.0
+			timing["used_points"] = n_finite
 			return float(divergence), n_finite, float(fit_quality)
 
-		residual = (u_flat - design @ coeffs[0]) ** 2 + (v_flat - design @ coeffs[1]) ** 2
+		stage_start = time.perf_counter()
+		residual = (
+			(u_flat - design @ coeffs[0]) ** 2
+			+ (v_flat - design @ coeffs[1]) ** 2
+		)
 		threshold = np.quantile(residual, self._affine_inlier_quantile)
 		inliers = residual <= threshold
+		timing["residual_quantile_ms"] = 1000.0 * (
+			time.perf_counter() - stage_start
+		)
 
-		if np.count_nonzero(inliers) >= self._min_points_for_affine_fit:
+		stage_start = time.perf_counter()
+		n_inliers = int(np.count_nonzero(inliers))
+		if n_inliers >= self._min_points_for_affine_fit:
 			_, divergence, fit_quality = self._weighted_affine_least_squares(
 				design[inliers], u_flat[inliers], v_flat[inliers], weight_flat[inliers]
 			)
-			n_used = int(np.count_nonzero(inliers))
+			n_used = n_inliers
 		else:
 			n_used = n_finite
+		timing["refit_ms"] = 1000.0 * (time.perf_counter() - stage_start)
+		timing["used_points"] = n_used
 
 		return float(divergence), n_used, float(fit_quality)
 
@@ -732,9 +818,14 @@ class OpticalFlowEstimator:
 		self._has_filtered_divergence = False
 
 		self._last_debug = {}
+		self._last_timing = {}
 
 	def last_debug_data(self) -> dict:
 		return dict(self._last_debug)
+
+	def last_timing_data(self) -> dict:
+		"""Return the immutable scalar timing snapshot from the latest update."""
+		return dict(self._last_timing)
 
 	def _target_roi_from_estimate(
 		self,

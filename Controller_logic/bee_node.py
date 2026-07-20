@@ -37,8 +37,8 @@ from .truth_layout import decode_truth_array
 from .vision_worker import run_vision_worker
 
 # Scheduling
-CONTROL_PERIOD_SEC = 0.01
-PX4_SETPOINT_PERIOD_SEC = 0.03
+CONTROL_PERIOD_SEC = 0.005
+PX4_SETPOINT_PERIOD_SEC = 0.01
 OFFBOARD_PRESTREAM_SEC = 2.0
 PX4_OFFBOARD_SWITCH_SETTLE_SEC = 0.5
 PX4_OFFBOARD_CONFIRM_TIMEOUT_SEC = 5.0
@@ -81,9 +81,13 @@ CEILING_SAFETY_FACTOR = 0.5
 DESCENT_CEILING_MARGIN = 0.8
 NEAR_FIELD_HEIGHT_M = 0.4
 
-CAMERA_FRAME_PERIOD_SEC = 1.0 / 30.0
-VISION_PROCESSING_LATENCY_BUDGET_SEC = 0.02
-STABILITY_DT_SEC = CAMERA_FRAME_PERIOD_SEC + VISION_PROCESSING_LATENCY_BUDGET_SEC + PX4_SETPOINT_PERIOD_SEC
+SMOOTHING_DELAYS = 0.01
+CAMERA_FRAME_PERIOD_SEC = 1.0 / 60.0
+VISION_PROCESSING_LATENCY_BUDGET_SEC = 0.02  # retained design target
+STABILITY_DT_SEC = (CAMERA_FRAME_PERIOD_SEC + 
+					VISION_PROCESSING_LATENCY_BUDGET_SEC + 
+					PX4_SETPOINT_PERIOD_SEC +
+                    SMOOTHING_DELAYS)
 
 LEG_CLEARANCE_M = 0.182
 HOVER_PROBE_ONLY = False
@@ -248,8 +252,9 @@ class BeeLandNode(Node):
         self._vision_thread.start()
 
     def on_camera(self, msg: Image):
-        start = time.perf_counter()
+        callback_start_perf = time.perf_counter()
         receipt = self.time.receipt_stamp()
+        frame_receipt_perf = time.perf_counter()
         stamp = self.time.image_stamp_sec(msg)
         if stamp <= 0.0:
             self.get_logger().warning("Dropping camera frame without a Gazebo SIM timestamp.")
@@ -263,11 +268,23 @@ class BeeLandNode(Node):
         if SHOW_CAMERA:
             cv2.imshow("BEE_LAND", frame)
             cv2.waitKey(1)
+
         self._latest_frame_receipt_wall = receipt.wall_sec
         self._latest_frame_receipt_mono = receipt.monotonic_sec
-        payload = (frame, stamp, None, receipt.wall_sec, time.perf_counter())
+
+        def make_payload():
+            ship_perf = time.perf_counter()
+            camera_callback_ms = 1000.0 * (ship_perf - callback_start_perf)
+            return (
+                frame, stamp, None, receipt.wall_sec, receipt.monotonic_sec,
+                frame_receipt_perf, ship_perf, camera_callback_ms,
+            )
+
+        payload = make_payload()
+        queued = False
         try:
             self._vision_in_q.put_nowait(payload)
+            queued = True
         except queue.Full:
             try:
                 self._vision_in_q.get_nowait()
@@ -275,10 +292,20 @@ class BeeLandNode(Node):
             except queue.Empty:
                 pass
             try:
+                # Re-stamp the actual successful send after queue cleanup so
+                # the inbound IPC duration starts at the correct put attempt.
+                payload = make_payload()
                 self._vision_in_q.put_nowait(payload)
+                queued = True
             except queue.Full:
                 self._vision_dropped_frames += 1
-        self._vision_metrics["camera_callback_ms"] = 1000.0 * (time.perf_counter() - start)
+
+        if queued:
+            self._vision_metrics["camera_callback_ms"] = payload[-1]
+        else:
+            self._vision_metrics["camera_callback_ms"] = 1000.0 * (
+                time.perf_counter() - callback_start_perf
+            )
         self._vision_metrics["camera_receipt_wall_timestamp_sec"] = receipt.wall_sec
         self._vision_metrics["camera_receipt_monotonic_timestamp_sec"] = receipt.monotonic_sec
 
@@ -292,15 +319,47 @@ class BeeLandNode(Node):
                 break
             available_perf = time.perf_counter()
             self._vision_sequence += 1
+
+            done_perf = float(getattr(result, "done_perf", available_perf))
+            receipt_perf = float(
+                getattr(result, "frame_receipt_perf", available_perf)
+            )
+            ship_perf = float(getattr(result, "ship_perf", receipt_perf))
+            ipc_in_ms = float(getattr(result, "ipc_in_ms", 0.0))
+            ipc_out_ms = 1000.0 * max(0.0, available_perf - done_perf)
+
             metrics = {
-                "vision_worker_target_acquisition_ms": getattr(result, "target_acquisition_ms", None),
-                "vision_worker_optical_flow_ms": getattr(result, "optical_flow_ms", None),
-                "frame_to_result_ms": 1000.0 * (available_perf - getattr(result, "done_perf", available_perf))
-                    + float(getattr(result, "ipc_in_ms", 0.0))
-                    + float(getattr(result, "target_acquisition_ms", 0.0))
-                    + float(getattr(result, "optical_flow_ms", 0.0)),
+                "camera_receipt_wall_timestamp_sec": getattr(
+                    result, "frame_wall", None
+                ),
+                "camera_receipt_monotonic_timestamp_sec": getattr(
+                    result, "frame_monotonic", None
+                ),
+                "camera_callback_ms": getattr(
+                    result, "camera_callback_ms", None
+                ),
+                "camera_prequeue_ms": 1000.0 * max(0.0, ship_perf - receipt_perf),
+                "vision_worker_target_acquisition_ms": getattr(
+                    result, "target_acquisition_ms", None
+                ),
+                "vision_worker_optical_flow_ms": getattr(
+                    result, "optical_flow_ms", None
+                ),
+                "vision_ipc_in_ms": ipc_in_ms,
+                "vision_ipc_out_ms": ipc_out_ms,
+                "vision_transport_total_ms": ipc_in_ms + ipc_out_ms,
+                # Parent-process receipt and availability stamps belong to the
+                # same source frame, so dropped/newer callbacks cannot bias it.
+                "frame_to_result_ms": 1000.0 * max(
+                    0.0, available_perf - receipt_perf
+                ),
+                "source_frame_receipt_perf_sec": receipt_perf,
                 "vision_dropped_frames": self._vision_dropped_frames,
             }
+            flow_internal = getattr(result, "optical_flow_timing", {}) or {}
+            for key, value in flow_internal.items():
+                metrics[f"optical_flow_{key}"] = value
+
             self._latest_vision_bundle = (result.target, result.flow, metrics)
             self._latest_target = result.target
             self._latest_flow = result.flow
@@ -515,9 +574,11 @@ class BeeLandNode(Node):
         self._vision_metrics.update(result_metrics)
         self._vision_metrics["control_compute_ms"] = elapsed_ms
         self._vision_metrics["control_dt_sim_sec"] = dt
-        if self._latest_frame_receipt_mono is not None:
-            self._vision_metrics["frame_to_command_ms"] = 1000.0 * (
-                self.time.monotonic_sec() - self._latest_frame_receipt_mono)
+        source_receipt_perf = result_metrics.get("source_frame_receipt_perf_sec")
+        if source_receipt_perf is not None:
+            self._vision_metrics["frame_to_command_ms"] = 1000.0 * max(
+                0.0, time.perf_counter() - float(source_receipt_perf)
+            )
         self._write_row(mc)
 
     def _control_dt(self, stamp):

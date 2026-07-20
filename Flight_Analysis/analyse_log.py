@@ -703,72 +703,228 @@ def _finite_stats(values) -> tuple[int, float, float, float, float]:
 
 
 def _append_vision_delay_table(data: AnalysisData, lines: list[str]) -> None:
-	"""Append a compact worker-delay decomposition to the text summary.
+	"""Append end-to-end and internal vision-delay decompositions.
 
-	Total vision delay is frame arrival at the worker boundary through result
-	availability in the parent process.  Transport combines IPC-in and IPC-out.
-	Older v4.4 logs are supported by deriving transport as total-target-flow.
+	New v4.5 logs expose the complete source-frame path and the internal
+	OpticalFlowEstimator stages. Older logs remain supported: transport is
+	reconstructed from its legs when possible, then from total-target-flow.
+
+	Wall-clock durations are the quantities relevant to the controller delay.
+	``optical_flow_total_cpu_ms`` is reported separately because process CPU
+	time can exceed wall time when OpenCV / BLAS use several native threads;
+	it is a compute-load indicator, not an additional serial delay.
 	"""
 	c = data.control
 	if c.empty:
 		return
 
-	total = _num(c, "timing_frame_to_result_ms").to_numpy(float)
-	target = _num(c, "timing_vision_worker_target_acquisition_ms").to_numpy(float)
-	flow = _num(c, "timing_vision_worker_optical_flow_ms").to_numpy(float)
+	def values(name: str) -> np.ndarray:
+		return _num(c, name).to_numpy(float)
 
-	transport = _num(c, "timing_vision_worker_transport_ms").to_numpy(float)
+	def append_table(
+		title: str,
+		rows: list[tuple[str, np.ndarray]],
+		*,
+		note: Optional[str] = None,
+	) -> None:
+		formatted = []
+		max_n = 0
+		for label, row_values in rows:
+			n, mean, median, p95, vmax = _finite_stats(row_values)
+			if n == 0:
+				continue
+			max_n = max(max_n, n)
+			formatted.append(
+				f"{label:42s}{mean:9.2f}{median:9.2f}{p95:9.2f}{vmax:9.2f}"
+			)
+		if not formatted:
+			return
+
+		lines.extend([
+			"",
+			title,
+			"-" * len(title),
+			f"Computed over: {max_n} fresh controller/vision rows in analysed interval",
+			f"{'stage':42s}{'mean':>9}{'median':>9}{'p95':>9}{'max':>9}",
+		])
+		lines.extend(formatted)
+		if note:
+			lines.append(note)
+
+	total = values("timing_frame_to_result_ms")
+	prequeue = values("timing_camera_prequeue_ms")
+	target = values("timing_vision_worker_target_acquisition_ms")
+	flow = values("timing_vision_worker_optical_flow_ms")
+
+	ipc_in = values("timing_vision_ipc_in_ms")
+	ipc_out = values("timing_vision_ipc_out_ms")
+	transport = values("timing_vision_transport_total_ms")
 	if not np.isfinite(transport).any():
-		ipc_in = _num(c, "timing_vision_worker_ipc_in_ms").to_numpy(float)
-		ipc_out = _num(c, "timing_vision_worker_ipc_out_ms").to_numpy(float)
 		if np.isfinite(ipc_in).any() or np.isfinite(ipc_out).any():
 			transport = np.nan_to_num(ipc_in, nan=0.0) + np.nan_to_num(ipc_out, nan=0.0)
 		else:
 			transport = total - target - flow
 			transport[~np.isfinite(total)] = np.nan
 
-	rows = [
-		("TOTAL: frame -> processed result", total),
-		("target_acquisition.update()", target),
-		("optical_flow.update()", flow),
-		("transport (IPC in + IPC out)", transport),
-	]
-	formatted = []
-	max_n = 0
-	for label, values in rows:
-		n, mean, median, p95, vmax = _finite_stats(values)
-		if n == 0:
-			continue
-		max_n = max(max_n, n)
-		formatted.append(
-			f"{label:38s}{mean:9.2f}{median:9.2f}{p95:9.2f}{vmax:9.2f}"
-		)
-	if not formatted:
-		return
+	frame_to_command = values("timing_frame_to_command_ms")
+	control_compute = values("timing_control_compute_ms")
 
 	phases = _clean_string(c.get("mission_substate", pd.Series("", index=c.index)))
 	descend_n = int((phases == "descend").sum())
-	lines += [
-		"",
-		"Vision worker delay decomposition [ms]",
-		"--------------------------------------",
-		f"Computed over: {max_n} fresh controller/vision rows in analysed interval"
-		+ (f" ({descend_n} DESCENT rows)" if descend_n else ""),
-		f"{'stage':38s}{'mean':>9}{'median':>9}{'p95':>9}{'max':>9}",
-	]
-	lines.extend(formatted)
 
-	dropped = _num(c, "timing_vision_dropped_frames").to_numpy(float)
+	append_table(
+		"Vision end-to-end delay decomposition [ms]",
+		[
+			("TOTAL: camera receipt -> processed result", total),
+			("camera callback before queue", prequeue),
+			("target_acquisition.update()", target),
+			("optical_flow.update()", flow),
+			("IPC inbound", ipc_in),
+			("IPC outbound", ipc_out),
+			("transport total (IPC in + IPC out)", transport),
+			("TOTAL: camera receipt -> command formed", frame_to_command),
+			("mission + control-law compute", control_compute),
+		],
+		note=(
+			f"Mission-phase subset: {descend_n} DESCENT rows."
+			if descend_n else None
+		),
+	)
+
+	# Internal optical-flow wall-clock decomposition. These rows are not
+	# expected to sum perfectly because instrumentation itself and tiny
+	# unlisted Python operations remain inside total_wall.
+	append_table(
+		"Optical-flow internal wall-time decomposition [ms]",
+		[
+			("TOTAL optical_flow.update()", values("timing_optical_flow_total_wall_ms")),
+			("grayscale conversion", values("timing_optical_flow_grayscale_ms")),
+			("ROI setup", values("timing_optical_flow_roi_setup_ms")),
+			("adaptive downsample resize", values("timing_optical_flow_downsample_resize_ms")),
+			("Farneback dense flow", values("timing_optical_flow_farneback_ms")),
+			("flow scaling / upsample", values("timing_optical_flow_flow_scaling_upsample_ms")),
+			("derotation", values("timing_optical_flow_derotation_ms")),
+			("mean-flow reductions", values("timing_optical_flow_mean_flow_ms")),
+			("gradient weights", values("timing_optical_flow_gradient_ms")),
+			("robust affine divergence fit", values("timing_optical_flow_affine_fit_ms")),
+			("pre-derotation diagnostic fit", values("timing_optical_flow_prederotation_fit_ms")),
+			("divergence filter", values("timing_optical_flow_divergence_filter_ms")),
+			("result + previous-frame state", values("timing_optical_flow_result_and_state_ms")),
+		],
+		note="Rows are measured wall-clock stages; small instrumentation gaps may remain.",
+	)
+
+	append_table(
+		"Robust affine-fit internal decomposition [ms]",
+		[
+			("TOTAL robust affine fit", values("timing_optical_flow_affine_fit_ms")),
+			("array/design setup", values("timing_optical_flow_affine_setup_ms")),
+			("initial weighted solve", values("timing_optical_flow_affine_initial_solve_ms")),
+			("residual + inlier quantile", values("timing_optical_flow_affine_residual_quantile_ms")),
+			("trimmed weighted refit", values("timing_optical_flow_affine_refit_ms")),
+		],
+	)
+
+	cpu = values("timing_optical_flow_total_cpu_ms")
+	if np.isfinite(cpu).any():
+		n, mean, median, p95, vmax = _finite_stats(cpu)
+		lines.extend([
+			"",
+			"Optical-flow aggregate process CPU time [ms]",
+			"--------------------------------------------",
+			f"n={n}, mean={mean:.2f}, median={median:.2f}, p95={p95:.2f}, max={vmax:.2f}",
+			"Note: this can exceed wall time when native OpenCV/BLAS threads run in parallel;",
+			"it indicates compute/thread load and must not be added to the delay chain.",
+		])
+
+	# Compact operating-point summary helps interpret why the stage costs vary.
+	operating_rows = [
+		("ROI width [px]", values("timing_optical_flow_roi_width_px")),
+		("ROI height [px]", values("timing_optical_flow_roi_height_px")),
+		("working width [px]", values("timing_optical_flow_working_width_px")),
+		("working height [px]", values("timing_optical_flow_working_height_px")),
+		("working flow vectors", values("timing_optical_flow_working_flow_vectors")),
+		("downsample scale [-]", values("timing_optical_flow_downsample_scale")),
+		("affine fit stride", values("timing_optical_flow_affine_fit_stride")),
+		("affine sampled points", values("timing_optical_flow_affine_sampled_points")),
+		("affine finite points", values("timing_optical_flow_affine_finite_points")),
+		("affine points used", values("timing_optical_flow_affine_points_used")),
+	]
+	formatted = []
+	for label, row_values in operating_rows:
+		n, mean, median, p95, vmax = _finite_stats(row_values)
+		if n:
+			formatted.append(
+				f"{label:28s}{mean:11.2f}{median:11.2f}{p95:11.2f}{vmax:11.2f}"
+			)
+	if formatted:
+		lines.extend([
+			"",
+			"Optical-flow operating point",
+			"----------------------------",
+			f"{'quantity':28s}{'mean':>11}{'median':>11}{'p95':>11}{'max':>11}",
+		])
+		lines.extend(formatted)
+
+	dropped = values("timing_vision_dropped_frames")
 	finite_dropped = dropped[np.isfinite(dropped)]
 	if finite_dropped.size:
-		lines.append(
-			f"Frames dropped at input queue (cumulative): {int(np.nanmax(finite_dropped))}"
+		lines.extend([
+			"",
+			f"Frames dropped at input queue (cumulative): {int(np.nanmax(finite_dropped))}",
+		])
+
+
+def _estimate_logged_rates(data: AnalysisData) -> tuple[float, float]:
+	"""Estimate effective processed-camera and PX4 publish rates from the log.
+
+	Camera rate uses unique fresh vision results in Gazebo SIM time, so it is the
+	effective processed-frame rate after any queue drops. PX4 rate uses changes
+	in publish sequence over parent-process monotonic time, which recovers the
+	actual publication cadence even though controller rows sample that stream
+	sparsely and may repeat the latest publish record.
+	"""
+	camera_fps = np.nan
+	if not data.control.empty:
+		vision = data.control.copy()
+		if "vision_sequence" in vision.columns:
+			vision = vision.drop_duplicates("vision_sequence", keep="last")
+		t = _num(vision, "flow_sim_timestamp_sec").to_numpy(float)
+		t = np.sort(t[np.isfinite(t)])
+		dt = np.diff(t)
+		dt = dt[np.isfinite(dt) & (dt > 0.0)]
+		if dt.size:
+			camera_fps = float(1.0 / np.mean(dt))
+
+	px4_hz = np.nan
+	seq = _num(data.controller, "px4_publish_sequence").to_numpy(float)
+	mono = _num(data.controller, "px4_publish_monotonic_timestamp_sec").to_numpy(float)
+	good = np.isfinite(seq) & np.isfinite(mono)
+	if np.count_nonzero(good) >= 2:
+		publish = pd.DataFrame({"seq": seq[good], "mono": mono[good]})
+		publish = (
+			publish.sort_values("mono")
+			.drop_duplicates("seq", keep="last")
 		)
+		if len(publish) >= 2:
+			dseq = float(publish["seq"].iloc[-1] - publish["seq"].iloc[0])
+			dtime = float(publish["mono"].iloc[-1] - publish["mono"].iloc[0])
+			if dseq > 0.0 and dtime > 0.0:
+				px4_hz = dseq / dtime
+
+	return camera_fps, px4_hz
 
 
 def write_summary(data: AnalysisData, out: Path, controller_path: Path, truth_path: Path) -> None:
 	c = data.control
 	tr = data.truth
+	camera_fps, px4_hz = _estimate_logged_rates(data)
+	rate_parts = []
+	if np.isfinite(camera_fps):
+		rate_parts.append(f"processed camera: {camera_fps:.2f} fps (SIM time)")
+	if np.isfinite(px4_hz):
+		rate_parts.append(f"PX4 publish: {px4_hz:.2f} Hz (monotonic wall time)")
+	rate_line = "Estimated logged rates: " + "; ".join(rate_parts) if rate_parts else "Estimated logged rates: unavailable"
 	lines = [
 		"BEE_LAND paired-log analysis",
 		"================================",
@@ -778,6 +934,7 @@ def write_summary(data: AnalysisData, out: Path, controller_path: Path, truth_pa
 		f"Plot-time range: 0.000 to {data.t1 - data.t0:.3f} s SIM",
 		f"Unique controller samples: {len(c)}",
 		f"Truth samples: {len(tr)}",
+		rate_line,
 	]
 
 	truth_sim = tr["_sim_time"].to_numpy(float)

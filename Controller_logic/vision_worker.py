@@ -1,5 +1,5 @@
 """
-vision_worker.py -- out-of-process vision pipeline for bee_node (v2.0).
+vision_worker.py -- out-of-process vision pipeline for bee_node (v2.1).
 
 WHY THIS EXISTS
 ---------------
@@ -36,13 +36,14 @@ PICKLING
 --------
 multiprocessing.Queue pickles everything crossing the boundary:
   in : (frame: np.ndarray, timestamp: float, body_rates: tuple|np.ndarray|None,
-        frame_wall: float, ship_perf: float)
+        frame_wall: float, frame_monotonic: float, frame_receipt_perf: float,
+        ship_perf: float, camera_callback_ms: float)
   out: VisionResult(timestamp, target: TargetEstimate, flow: FlowResult, ...)
 frame_wall is the parent's wall clock at frame arrival (echoed back untouched);
 ship_perf is the parent's perf_counter just before put() (used only to measure
 the inbound IPC leg -- see VisionResult below).
 frame is a small BGR uint8 array (~28 KB at 120x80) so per-frame IPC cost is
-negligible at 30 Hz. TargetEstimate and FlowResult must stay picklable (plain
+small, but still measured explicitly at 60 Hz. TargetEstimate and FlowResult must stay picklable (plain
 dataclasses / namedtuples of scalars + small arrays -- no open cv2 handles,
 file objects, or locks). If either ever gains a non-picklable field, that is
 the first thing to check when results stop arriving.
@@ -94,13 +95,18 @@ VisionResult = namedtuple(
 		"target_acquisition_ms",
 		"optical_flow_ms",
 		"frame_wall",
+		"frame_monotonic",
+		"frame_receipt_perf",
+		"ship_perf",
+		"camera_callback_ms",
 		"ipc_in_ms",
 		"done_perf",
+		"optical_flow_timing",
 	],
 )
 
 # Sentinel pushed onto the input queue by bee_node.shutdown_vision_worker() to
-# ask the loop to exit. A real payload is always a 4-tuple, never None.
+# ask the loop to exit. A real payload is always an 8-tuple, never None.
 STOP = None
 
 
@@ -141,7 +147,10 @@ def run_vision_worker(in_q, out_q):
 			break
 
 		try:
-			frame, timestamp, body_rates, frame_wall, ship_perf = item
+			(
+				frame, timestamp, body_rates, frame_wall, frame_monotonic,
+				frame_receipt_perf, ship_perf, camera_callback_ms,
+			) = item
 			ipc_in_ms = 1000.0 * (recv_perf - ship_perf)
 
 			t0 = time.perf_counter()
@@ -150,6 +159,7 @@ def run_vision_worker(in_q, out_q):
 			flow = optical_flow.update(
 				frame, timestamp, target=target, body_rates=body_rates
 			)
+			flow_timing = optical_flow.last_timing_data()
 			t2 = time.perf_counter()
 
 			out_q.put(VisionResult(
@@ -159,8 +169,13 @@ def run_vision_worker(in_q, out_q):
 				target_acquisition_ms=1000.0 * (t1 - t0),
 				optical_flow_ms=1000.0 * (t2 - t1),
 				frame_wall=frame_wall,
+				frame_monotonic=frame_monotonic,
+				frame_receipt_perf=frame_receipt_perf,
+				ship_perf=ship_perf,
+				camera_callback_ms=camera_callback_ms,
 				ipc_in_ms=ipc_in_ms,
 				done_perf=t2,
+				optical_flow_timing=flow_timing,
 			))
 		except Exception as exc:
 			# A single malformed frame must not kill the pipeline. Skip it and

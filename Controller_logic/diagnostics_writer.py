@@ -65,7 +65,7 @@ class _AsyncCsvSink:
 
 
 class DiagnosticsWriter:
-	CONTROLLER_SCHEMA_VERSION = "4.4-controller"
+	CONTROLLER_SCHEMA_VERSION = "4.6-controller"
 	TRUTH_LOG_SCHEMA_VERSION = "1.0-truth-log"
 
 	def __init__(self, output_dir="logs", filename=None, *,
@@ -259,10 +259,59 @@ class DiagnosticsWriter:
 			"probe_residual_accel_m_s2", "probe_percentile_accel_m_s2",
 		]
 		timing = [
-			"camera_receipt_wall_timestamp_sec", "camera_receipt_monotonic_timestamp_sec",
-			"camera_callback_ms", "vision_worker_target_acquisition_ms",
-			"vision_worker_optical_flow_ms", "frame_to_result_ms", "frame_to_command_ms",
-			"control_compute_ms", "control_dt_sim_sec", "vision_dropped_frames",
+			"camera_receipt_wall_timestamp_sec",
+			"camera_receipt_monotonic_timestamp_sec",
+			"camera_callback_ms", "camera_prequeue_ms",
+			"vision_worker_target_acquisition_ms",
+			"vision_worker_optical_flow_ms",
+			"vision_ipc_in_ms", "vision_ipc_out_ms",
+			"vision_transport_total_ms",
+			"frame_to_result_ms", "frame_to_command_ms",
+			"control_compute_ms", "control_dt_sim_sec",
+			"vision_dropped_frames",
+
+			# OpticalFlowEstimator.update() internal stage timings.
+			"optical_flow_total_wall_ms", "optical_flow_total_cpu_ms",
+			"optical_flow_grayscale_ms", "optical_flow_roi_setup_ms",
+			"optical_flow_downsample_resize_ms", "optical_flow_farneback_ms",
+			"optical_flow_flow_scaling_upsample_ms",
+			"optical_flow_derotation_ms", "optical_flow_mean_flow_ms",
+			"optical_flow_gradient_ms",
+			"optical_flow_divergence_field_debug_ms",
+			"optical_flow_affine_fit_ms",
+			"optical_flow_affine_setup_ms",
+			"optical_flow_affine_initial_solve_ms",
+			"optical_flow_affine_residual_quantile_ms",
+			"optical_flow_affine_refit_ms",
+			"optical_flow_prederotation_fit_ms",
+			"optical_flow_divergence_filter_ms",
+			"optical_flow_result_and_state_ms",
+
+			# Per-frame operating point and algorithm configuration.
+			"optical_flow_valid", "optical_flow_dt_sec",
+			"optical_flow_image_width_px", "optical_flow_image_height_px",
+			"optical_flow_roi_width_px", "optical_flow_roi_height_px",
+			"optical_flow_working_width_px",
+			"optical_flow_working_height_px",
+			"optical_flow_working_flow_vectors",
+			"optical_flow_downsample_scale",
+			"optical_flow_fit_pixel_scale",
+			"optical_flow_derotation_active",
+			"optical_flow_affine_input_points",
+			"optical_flow_affine_sampled_points",
+			"optical_flow_affine_fit_stride",
+			"optical_flow_affine_finite_points",
+			"optical_flow_affine_used_points",
+			"optical_flow_affine_points_used",
+			"optical_flow_affine_fit_quality",
+			"optical_flow_farneback_pyr_scale",
+			"optical_flow_farneback_levels",
+			"optical_flow_farneback_winsize",
+			"optical_flow_farneback_iterations",
+			"optical_flow_farneback_poly_n",
+			"optical_flow_farneback_poly_sigma",
+			"optical_flow_divergence_smoothing_alpha",
+
 			"motor_stop_request_to_pickup_ms", "motor_stop_total_ms",
 		]
 		return base + [f"mission_{x}" for x in mission] + [f"timing_{x}" for x in timing]
