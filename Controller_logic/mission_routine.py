@@ -1278,6 +1278,7 @@ class MissionRoutine:
 			substate=DESCEND,
 			info={
 				"just_entered": just_entered,
+				"event": "descent_start" if just_entered else "",
 				# DIAGNOSTIC ONLY -- h_pred/h0/t_crit are never read by any control
 				# path (scheduled_gain_at_time derives its decay from elapsed time
 				# and D* alone), which is what makes a loosely-seeded h0 harmless.

@@ -662,6 +662,116 @@ def plot_residual_divergence_over_platform_input(cfg: FrequencyConfig, responses
 
 	plt.tight_layout()
 
+def plot_drone_reaction_over_platform_input(
+	cfg: FrequencyConfig,
+	responses: list[dict],
+) -> None:
+	"""Plot how strongly the drone follows the platform.
+
+	The main transfer is:
+
+		T_platform = a_drone / a_platform
+		           = L / (1 + L)
+		           = 1 - S
+
+	In the ideal linear model, this is also equivalent to:
+
+		z_drone / z_platform
+		v_drone / v_platform
+
+	for sinusoidal perturbations and zero initial-condition effects.
+	"""
+	fig, axes = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
+
+	fig.suptitle(
+		"Synchronisation drone–plateforme\n"
+		r"$T_p = a_d/a_p = z_d/z_p = 1-S$"
+	)
+
+	for r in responses:
+		f = r["freq_hz"]
+		K = r["K"]
+
+		# Platform-to-drone complementary sensitivity.
+		T_platform = 1.0 - r["S"]
+
+		label = f"K={K:g}"
+
+		axes[0].semilogx(
+			f,
+			_mag_db(T_platform),
+			label=label,
+		)
+
+		axes[1].semilogx(
+			f,
+			_wrap_phase_deg(
+				np.rad2deg(np.angle(T_platform))
+			),
+			label=label,
+		)
+
+		# Mark the tested platform frequency.
+		f0 = cfg.platform_frequency_hz
+		T0 = complex_at_frequency(f, T_platform, f0)
+
+		mag0_db = _mag_db(np.array([T0]))[0]
+		phase0_deg = _wrap_phase_deg(
+			np.array([np.rad2deg(np.angle(T0))])
+		)[0]
+
+		axes[0].scatter([f0], [mag0_db], s=35)
+		axes[1].scatter([f0], [phase0_deg], s=35)
+
+		axes[0].annotate(
+			f"{abs(T0):.3f}",
+			xy=(f0, mag0_db),
+			xytext=(8, 8),
+			textcoords="offset points",
+			fontsize=8,
+		)
+
+		axes[1].annotate(
+			f"{phase0_deg:.1f}°",
+			xy=(f0, phase0_deg),
+			xytext=(8, 8),
+			textcoords="offset points",
+			fontsize=8,
+		)
+
+	for ax in axes:
+		_mark_platform_frequency(ax, cfg)
+		ax.grid(True, which="both")
+		ax.legend(loc="best")
+
+	# Ideal synchronization reference.
+	axes[0].axhline(
+		0.0,
+		linestyle="--",
+		linewidth=1,
+		label="suivi parfait",
+	)
+
+	axes[1].axhline(
+		0.0,
+		linestyle="--",
+		linewidth=1,
+	)
+
+	axes[0].set_ylabel(
+		r"$|a_d/a_p|$ [dB]"
+	)
+
+	axes[1].set_ylabel(
+		"phase [deg]"
+	)
+
+	axes[1].set_xlabel(
+		"fréquence [Hz]"
+	)
+
+	plt.tight_layout()
+
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
@@ -675,6 +785,7 @@ def run_analysis(cfg: FrequencyConfig) -> None:
 	# plot_open_loop_bode(cfg, responses)
 	# plot_closed_loop_tracking(cfg, responses)
 	plot_residual_divergence_over_platform_input(cfg, responses)
+	plot_drone_reaction_over_platform_input(cfg, responses)
 	# plot_sensitivity(cfg, responses)
 	# plot_platform_disturbance_response(cfg, responses)
 	# plot_nyquist(cfg, responses)
@@ -687,18 +798,18 @@ if __name__ == "__main__":
 	cfg = FrequencyConfig(
 		# Choose the frozen height you want to inspect.
 		# Repeat the analysis for several heights to see how the descent changes.
-		height_m=0.5,
+		height_m=0.18,
 
 		# Use 0.0 for hover/probe interpretation.
 		# Use your descent D* value, e.g. 0.30, for descent frozen-point analysis.
-		divergence_op_1_s=0.0,
+		divergence_op_1_s=2,
 
 		# Compare your last two tested gains.
 		gain_values=(1.5, 6.5, 20),
 
 		# Effective discrete time/dead-time.
 		# This should represent the visual-control sample/effective correction time.
-		sample_time_s=0.05,
+		sample_time_s=0.06,
 
 		# Add delay samples here to see how quickly margins degrade.
 		delay_samples=0,

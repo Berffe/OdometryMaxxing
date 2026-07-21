@@ -30,7 +30,7 @@ from .clock import TimeManager
 from .control_law import ControlLaw
 from .diagnostics_writer import DiagnosticsWriter
 from .mavsdk_worker import MavsdkWorker
-from .mission_routine import MissionRoutine, INFEASIBLE as MISSION_INFEASIBLE
+from .mission_routine import MissionRoutine
 from .px4_interface import PX4Interface
 from .state import AttitudeSetpoint, ContactState, TargetEstimate
 from .truth_layout import decode_truth_array
@@ -551,11 +551,20 @@ class BeeLandNode(Node):
         )
         self._announce_mission_substate(mc)
 
-        if mc.info.get("event") in ("center_done", "final_probe_start"):
+        if mc.info.get("event") in (
+            "center_done",
+            "final_probe_start",
+            "descent_start",
+        ):
+            # DESCEND intentionally starts with no inherited vertical bias.
+            # mission_routine also disables further integral accumulation in
+            # this phase, so the contribution remains exactly zero thereafter.
             self.control_law.reset_divergence_integral()
-        if mc.substate == MISSION_INFEASIBLE:
-            self._abort("mission feasibility gate rejected descent")
-            return
+        # An infeasible landing is not a controller abort. MissionRoutine
+        # latches an active visual hover with D*=0 and a near-field-admissible
+        # gain, so keep running the normal control path. This preserves vertical
+        # platform tracking and lateral centering instead of freezing the last
+        # command or dropping to the outer ABORTED neutral hold.
 
         kwargs = dict(
             divergence_setpoint=mc.divergence_setpoint,

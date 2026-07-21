@@ -2,5 +2,10 @@ Brainstorm.md
 results*
 logs*
 .vscode
+*.zip
+*.gif
+*.png
+*.mp4
+*.jpg
 
 __pycache__

@@ -487,6 +487,9 @@ def plot_probe_acceleration(data: AnalysisData, out: Path) -> None:
 		y = _num(c, col)
 		if np.isfinite(y).any():
 			axes[1].plot(t, y, linestyle=style, label=label)
+			
+	if np.isfinite(relative_az).any():
+		axes[1].plot(t, relative_az, alpha=0.52, label="True vertical relative acceleration")
 	axes[1].set_ylabel("Estimator terms [m/s²]")
 	axes[1].set_xlabel("Time since common log start [s SIM]")
 	_legend(axes[1], ncol=2)
