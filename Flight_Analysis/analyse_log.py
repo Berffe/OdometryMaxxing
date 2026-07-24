@@ -797,6 +797,14 @@ def _append_vision_delay_table(data: AnalysisData, lines: list[str]) -> None:
 	# Internal optical-flow wall-clock decomposition. These rows are not
 	# expected to sum perfectly because instrumentation itself and tiny
 	# unlisted Python operations remain inside total_wall.
+	#
+	# Keep a single derotation timing source:
+	# timing_optical_flow_derotation_ms. Older logs may not contain this column;
+	# in that case report a zero-cost disabled stage rather than omitting it.
+	derotation_ms = values("timing_optical_flow_derotation_ms")
+	if not np.isfinite(derotation_ms).any():
+		derotation_ms = np.zeros(len(c), dtype=float)
+
 	append_table(
 		"Optical-flow internal wall-time decomposition [ms]",
 		[
@@ -806,7 +814,7 @@ def _append_vision_delay_table(data: AnalysisData, lines: list[str]) -> None:
 			("adaptive downsample resize", values("timing_optical_flow_downsample_resize_ms")),
 			("Farneback dense flow", values("timing_optical_flow_farneback_ms")),
 			("flow scaling / upsample", values("timing_optical_flow_flow_scaling_upsample_ms")),
-			("derotation", values("timing_optical_flow_derotation_ms")),
+			("derotation", derotation_ms),
 			("mean-flow reductions", values("timing_optical_flow_mean_flow_ms")),
 			("gradient weights", values("timing_optical_flow_gradient_ms")),
 			("robust affine divergence fit", values("timing_optical_flow_affine_fit_ms")),

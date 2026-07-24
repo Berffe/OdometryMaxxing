@@ -24,7 +24,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy, QoSHistoryPolicy
 from sensor_msgs.msg import Image
 from ros_gz_interfaces.msg import Float32Array
-from px4_msgs.msg import VehicleStatus
+from px4_msgs.msg import VehicleStatus, VehicleAngularVelocity
 
 from .clock import TimeManager
 from .control_law import ControlLaw
@@ -35,6 +35,7 @@ from .px4_interface import PX4Interface
 from .state import AttitudeSetpoint, ContactState, TargetEstimate
 from .truth_layout import decode_truth_array
 from .vision_worker import run_vision_worker
+from .derotation import AngularRateBuffer
 
 # Scheduling
 CONTROL_PERIOD_SEC = 0.005
@@ -51,6 +52,13 @@ VEHICLE_STATUS_TOPICS = (
     "/fmu/out/vehicle_status",
 )
 VISION_INPUT_QUEUE_MAX = 2
+
+# One-line derotation toggle. Set False for the exact legacy vision path.
+ENABLE_DEROTATION = True
+ANGULAR_RATE_TOPICS = (
+    "/fmu/out/vehicle_angular_velocity_v1",
+    "/fmu/out/vehicle_angular_velocity",
+)
 LOST_TARGET_TIMEOUT_SEC = 2.0
 SHOW_CAMERA = False
 POST_LANDING_LOG_PERIOD_SEC = 0.10
@@ -61,10 +69,22 @@ APPROACH_DIVERGENCE_SETPOINT = 0.12
 D_STAR_RAMP_IN_SEC = 5.0
 FINAL_PROBE_ENTRY_RAMP_SEC = 1.5
 FOV_NEAR_AREA_FRACTION = 0.85
-CENTER_TO_PROBE_LATERAL_RAMP_SEC = 0.1
-CENTER_LATERAL_P_SCALE = 1.0
-CENTER_LATERAL_D_SCALE = 1.0
-PROBE_LATERAL_P_SCALE = 1.0
+CENTER_TO_PROBE_LATERAL_RAMP_SEC = 5.0
+
+# Mission-owned visual CENTER exit gate.
+ENABLE_CENTER_CONDITION_GATE = True
+CENTER_CONDITION_DWELL_SEC = 0.75
+CENTER_OFFSET_RADIUS_MAX = 0.12
+CENTER_FLOW_RADIUS_MAX_NORM_S = 0.25
+
+# Timeout remains diagnostic by default: never leave CENTER merely because the
+# clock expired while the target is still moving/off-centre.
+CENTER_TIMEOUT_SEC = 20.0
+CENTER_TIMEOUT_ALLOWS_HANDOFF = True
+
+CENTER_LATERAL_P_SCALE = 0.30
+CENTER_LATERAL_D_SCALE = 0.70
+PROBE_LATERAL_P_SCALE = 0.30
 PROBE_LATERAL_D_SCALE = 1.0
 
 PROBE_DESIGN_PERIOD_SEC = 6.7
@@ -91,7 +111,11 @@ STABILITY_DT_SEC = (CAMERA_FRAME_PERIOD_SEC +
 
 LEG_CLEARANCE_M = 0.182
 HOVER_PROBE_ONLY = False
-INITIAL_THRUST_GAIN = 6.5
+INITIAL_THRUST_GAIN = 6.50
+INITIAL_ROLL_KP = 0.70
+INITIAL_ROLL_KD = 0.40
+INITIAL_PITCH_KP = 0.70
+INITIAL_PITCH_KD = 0.40
 
 # MAVSDK/PX4
 TAKEOFF_ALTITUDE_M = 5.0
@@ -127,7 +151,12 @@ class BeeLandNode(Node):
         super().__init__("bee_land_node")
         self.time = TimeManager(self)
         self.bridge = CvBridge()
-        self.control_law = ControlLaw()
+        self.control_law = ControlLaw(
+            roll_kp=INITIAL_ROLL_KP,
+            roll_kd=INITIAL_ROLL_KD,
+            pitch_kp=INITIAL_PITCH_KP,
+            pitch_kd=INITIAL_PITCH_KD,
+		)
         self._latest_target = TargetEstimate()
         self._latest_flow = None
         self._latest_setpoint = AttitudeSetpoint(thrust=self.control_law.hover_thrust)
@@ -141,6 +170,8 @@ class BeeLandNode(Node):
         self._vision_dropped_frames = 0
         self._latest_frame_receipt_wall = None
         self._latest_frame_receipt_mono = None
+        self._previous_camera_stamp = None
+        self._angular_rates = AngularRateBuffer(maxlen=256)
         self._vision_metrics = {}
         # One atomic bundle prevents a control tick from combining a new target
         # with an old flow result while the drain thread is publishing updates.
@@ -178,6 +209,12 @@ class BeeLandNode(Node):
         self.px4 = PX4Interface(self, px4_qos, time_manager=self.time)
         self.create_subscription(Image, CAMERA_TOPIC, self.on_camera, sensor_qos)
         self.create_subscription(Float32Array, TRUTH_TOPIC, self.on_truth, sensor_qos)
+        self._angular_rate_subscriptions = [
+            self.create_subscription(
+                VehicleAngularVelocity, topic, self.on_angular_velocity, px4_qos
+            )
+            for topic in ANGULAR_RATE_TOPICS
+        ]
         self._vehicle_status_subscriptions = [
             self.create_subscription(VehicleStatus, topic, self.on_vehicle_status, px4_qos)
             for topic in VEHICLE_STATUS_TOPICS
@@ -229,6 +266,12 @@ class BeeLandNode(Node):
             initial_thrust_gain=INITIAL_THRUST_GAIN,
             d_star_ramp_in_sec=D_STAR_RAMP_IN_SEC,
             center_to_probe_lateral_ramp_sec=CENTER_TO_PROBE_LATERAL_RAMP_SEC,
+            enable_center_condition_gate=ENABLE_CENTER_CONDITION_GATE,
+            center_condition_dwell_sec=CENTER_CONDITION_DWELL_SEC,
+            center_offset_radius_max=CENTER_OFFSET_RADIUS_MAX,
+            center_flow_radius_max_norm_s=CENTER_FLOW_RADIUS_MAX_NORM_S,
+            center_timeout_sec=CENTER_TIMEOUT_SEC,
+            center_timeout_allows_handoff=CENTER_TIMEOUT_ALLOWS_HANDOFF,
             center_lateral_p_scale=CENTER_LATERAL_P_SCALE,
             center_lateral_d_scale=CENTER_LATERAL_D_SCALE,
             probe_lateral_p_scale=PROBE_LATERAL_P_SCALE,
@@ -243,7 +286,8 @@ class BeeLandNode(Node):
         self._vision_in_q = ctx.Queue(maxsize=VISION_INPUT_QUEUE_MAX)
         self._vision_out_q = ctx.Queue()
         self._vision_worker = ctx.Process(
-            target=run_vision_worker, args=(self._vision_in_q, self._vision_out_q),
+            target=run_vision_worker,
+            args=(self._vision_in_q, self._vision_out_q, ENABLE_DEROTATION),
             name="bee_vision_worker", daemon=True)
         self._vision_worker.start()
         self._vision_stop = threading.Event()
@@ -272,11 +316,23 @@ class BeeLandNode(Node):
         self._latest_frame_receipt_wall = receipt.wall_sec
         self._latest_frame_receipt_mono = receipt.monotonic_sec
 
+        frame_dt = (
+            stamp - self._previous_camera_stamp
+            if self._previous_camera_stamp is not None
+            else CAMERA_FRAME_PERIOD_SEC
+        )
+        self._previous_camera_stamp = stamp
+        body_rates = None
+        if ENABLE_DEROTATION:
+            mean_rates, _n_rates, rates_valid = self._angular_rates.mean_recent(frame_dt)
+            if rates_valid:
+                body_rates = tuple(float(x) for x in mean_rates)
+
         def make_payload():
             ship_perf = time.perf_counter()
             camera_callback_ms = 1000.0 * (ship_perf - callback_start_perf)
             return (
-                frame, stamp, None, receipt.wall_sec, receipt.monotonic_sec,
+                frame, stamp, body_rates, receipt.wall_sec, receipt.monotonic_sec,
                 frame_receipt_perf, ship_perf, camera_callback_ms,
             )
 
@@ -359,6 +415,8 @@ class BeeLandNode(Node):
             flow_internal = getattr(result, "optical_flow_timing", {}) or {}
             for key, value in flow_internal.items():
                 metrics[f"optical_flow_{key}"] = value
+            # Explicit end-user delay term, equal to the timed normalized-grid
+            # rotational-field construction and subtraction stage.
 
             self._latest_vision_bundle = (result.target, result.flow, metrics)
             self._latest_target = result.target
@@ -389,6 +447,14 @@ class BeeLandNode(Node):
         )
         if self._contact.confirmed and self._phase not in (LANDED, ABORTED):
             self._enter_landed("Gazebo truth contact confirmed")
+
+
+    def on_angular_velocity(self, msg: VehicleAngularVelocity):
+        """Buffer PX4 body FRD rates using the message's own PX4 timestamp."""
+        stamp_sec = float(getattr(msg, "timestamp", 0)) * 1e-6
+        xyz = getattr(msg, "xyz", None)
+        if xyz is not None and len(xyz) >= 3:
+            self._angular_rates.add(stamp_sec, xyz)
 
     def on_vehicle_status(self, msg: VehicleStatus):
         previous = (
@@ -545,8 +611,13 @@ class BeeLandNode(Node):
         tgt = target
         mc = self.mission.update(
             flow_stamp, dt, previous_thrust,
-            offset_x=float(tgt.offset_x), offset_y=float(tgt.offset_y),
-            target_found=bool(tgt.found), area_fraction=float(tgt.area_fraction),
+            offset_x=float(tgt.offset_x),
+            offset_y=float(tgt.offset_y),
+            target_found=bool(tgt.found),
+            flow_x_norm_s=float(getattr(flow, "mean_flow_x_norm", 0.0)),
+            flow_y_norm_s=float(getattr(flow, "mean_flow_y_norm", 0.0)),
+            flow_valid=bool(getattr(flow, "valid", False)),
+            area_fraction=float(tgt.area_fraction),
             fov_saturated=bool(tgt.fov_saturated),
         )
         self._announce_mission_substate(mc)

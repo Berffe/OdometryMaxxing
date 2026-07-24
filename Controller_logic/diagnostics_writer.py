@@ -65,7 +65,7 @@ class _AsyncCsvSink:
 
 
 class DiagnosticsWriter:
-	CONTROLLER_SCHEMA_VERSION = "4.6-controller"
+	CONTROLLER_SCHEMA_VERSION = "4.7-controller"
 	TRUTH_LOG_SCHEMA_VERSION = "1.0-truth-log"
 
 	def __init__(self, output_dir="logs", filename=None, *,

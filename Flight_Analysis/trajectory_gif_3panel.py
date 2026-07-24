@@ -137,7 +137,7 @@ def phase_at_time(phase_df, t_rel):
     return PHASE_LABELS.get(phase, phase.upper())
 
 
-def draw_fading_2d(ax, x, y, trail_frames):
+def draw_fading_2d(ax, x, y, trail_frames, color):
     n = len(x)
     if n < 2:
         return
@@ -145,10 +145,10 @@ def draw_fading_2d(ax, x, y, trail_frames):
     seg_count = n - 1 - start
     for j, i in enumerate(range(start, n - 1)):
         alpha = (j + 1) / max(1, seg_count)
-        ax.plot(x[i:i+2], y[i:i+2], alpha=alpha, linewidth=2.0)
+        ax.plot(x[i:i+2], y[i:i+2], alpha=alpha, linewidth=2.0, color=color)
 
 
-def draw_fading_3d(ax, x, y, z, trail_frames):
+def draw_fading_3d(ax, x, y, z, trail_frames, color):
     n = len(x)
     if n < 2:
         return
@@ -156,7 +156,7 @@ def draw_fading_3d(ax, x, y, z, trail_frames):
     seg_count = n - 1 - start
     for j, i in enumerate(range(start, n - 1)):
         alpha = (j + 1) / max(1, seg_count)
-        ax.plot(x[i:i+2], y[i:i+2], z[i:i+2], alpha=alpha, linewidth=2.0)
+        ax.plot(x[i:i+2], y[i:i+2], z[i:i+2], alpha=alpha, linewidth=2.0, color=color)
 
 
 def create_mp4(
@@ -222,15 +222,15 @@ def create_mp4(
 
             xd = anim["x_d"].iloc[:k+1].to_numpy()
             yd = anim["y_d"].iloc[:k+1].to_numpy()
-            zd = anim["z_d"].iloc[:k+1].to_numpy()
+            zd = anim["z_d"].iloc[:k+1].to_numpy() - 0.182
             xp = anim["x_p"].iloc[:k+1].to_numpy()
             yp = anim["y_p"].iloc[:k+1].to_numpy()
             zp = anim["z_p"].iloc[:k+1].to_numpy()
 
-            draw_fading_3d(ax3d, xd, yd, zd, trail_frames)
-            ax3d.plot(xp, yp, zp, linestyle="--", linewidth=1.2, alpha=0.9)
-            ax3d.plot(row["x_p"] + cx, row["y_p"] + cy, np.full_like(cx, row["z_p"]), linewidth=2.0)
-            ax3d.scatter([row["x_d"]], [row["y_d"]], [row["z_d"]], s=45)
+            draw_fading_3d(ax3d, xd, yd, zd, trail_frames, 'b')
+            draw_fading_3d(ax3d, xp, yp, zp, trail_frames, 'r')
+            ax3d.plot(row["x_p"] + cx, row["y_p"] + cy, np.full_like(cx, row["z_p"]), linewidth=2.0, color='k')
+            ax3d.scatter([row["x_d"]], [row["y_d"]], [row["z_d"]-0.182], s=45)
             ax3d.scatter([row["x_p"]], [row["y_p"]], [row["z_p"]], s=25)
             ax3d.set_xlim(x_mid - half_range, x_mid + half_range)
             ax3d.set_ylim(y_mid - half_range, y_mid + half_range)
@@ -242,10 +242,10 @@ def create_mp4(
             ax3d.view_init(elev=elev, azim=azim)
             ax3d.grid(True)
 
-            draw_fading_2d(ax_side, xd, zd, trail_frames)
-            ax_side.plot(xp, zp, linestyle="--", linewidth=1.2, alpha=0.9)
-            ax_side.plot([row["x_p"] - platform_radius, row["x_p"] + platform_radius], [row["z_p"], row["z_p"]], linewidth=3.0)
-            ax_side.scatter([row["x_d"]], [row["z_d"]], s=45)
+            draw_fading_2d(ax_side, xd, zd, trail_frames, 'b')
+            draw_fading_2d(ax_side, xp, zp, trail_frames, 'r')
+            ax_side.plot([row["x_p"] - platform_radius, row["x_p"] + platform_radius], [row["z_p"], row["z_p"]], linewidth=3.0, color='k')
+            ax_side.scatter([row["x_d"]], [row["z_d"]-0.182], s=45)
             ax_side.scatter([row["x_p"]], [row["z_p"]], s=25)
             ax_side.set_xlim(x_mid - half_range, x_mid + half_range)
             ax_side.set_ylim(max(0.0, z_mid - half_range), z_mid + half_range)
@@ -254,9 +254,9 @@ def create_mp4(
             ax_side.set_title("Vue de côté (x-z)")
             ax_side.grid(True)
 
-            draw_fading_2d(ax_top, xd, yd, trail_frames)
-            ax_top.plot(xp, yp, linestyle="--", linewidth=1.2, alpha=0.9)
-            circle = plt.Circle((row["x_p"], row["y_p"]), platform_radius, fill=False, linewidth=2.0)
+            draw_fading_2d(ax_top, xd, yd, trail_frames, 'b')
+            draw_fading_2d(ax_top, xp, yp, trail_frames, 'r')
+            circle = plt.Circle((row["x_p"], row["y_p"]), platform_radius, fill=False, linewidth=2.0, color='k')
             ax_top.add_patch(circle)
             ax_top.scatter([row["x_d"]], [row["y_d"]], s=45)
             ax_top.scatter([row["x_p"]], [row["y_p"]], s=25)
@@ -295,7 +295,7 @@ if __name__ == "__main__":
     parser.add_argument("--truth-csv", type=str, default="/mnt/data/bee_truth_20260720_135806.csv")
     parser.add_argument("--controller-csv", type=str, default="/mnt/data/bee_controller_20260720_135806.csv")
     parser.add_argument("--output-mp4", type=str, default="/mnt/data/drone_platform_trajectory.mp4")
-    parser.add_argument("--platform-radius", type=float, default=1.0)
+    parser.add_argument("--platform-radius", type=float, default=0.5)
     parser.add_argument("--speed", type=float, default=1.0, help="Playback speed multiplier: 0.25, 0.5, 1.5, etc.")
     parser.add_argument("--trail-seconds", type=float, default=6.0)
     parser.add_argument("--video-fps", type=float, default=15.0, help="Intended output MP4 fps.")

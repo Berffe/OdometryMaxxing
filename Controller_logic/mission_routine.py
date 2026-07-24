@@ -670,6 +670,13 @@ class MissionRoutine:
 		center_dwell_sec: float = 2.0,
 		center_timeout_sec: float = 20.0,
 		enable_center: bool = True,
+
+		# Enhanced visual-only CENTER exit gate.
+		enable_center_condition_gate: bool = True,
+		center_condition_dwell_sec: float = 0.75,
+		center_offset_radius_max: float = 0.12,
+		center_flow_radius_max_norm_s: float = 0.25,
+		center_timeout_allows_handoff: bool = False,
 		d_star_ramp_in_sec: float = 3.0,
 		center_to_probe_lateral_ramp_sec: float = 2.0,
 		center_lateral_p_scale: float = 1.0,
@@ -702,6 +709,12 @@ class MissionRoutine:
 		self._center_offset_thr = max(0.0, float(center_offset_threshold))
 		self._center_dwell = max(0.0, float(center_dwell_sec))
 		self._center_timeout = max(0.0, float(center_timeout_sec))
+
+		self._enable_center_condition_gate = bool(enable_center_condition_gate)
+		self._center_condition_dwell = max(0.0, float(center_condition_dwell_sec))
+		self._center_offset_radius_max = max(0.0, float(center_offset_radius_max))
+		self._center_flow_radius_max = max(0.0, float(center_flow_radius_max_norm_s))
+		self._center_timeout_allows_handoff = bool(center_timeout_allows_handoff)
 
 		self._d_star_ramp_in = max(0.0, float(d_star_ramp_in_sec))
 		self._lateral_ramp = max(0.0, float(center_to_probe_lateral_ramp_sec))
@@ -897,6 +910,9 @@ class MissionRoutine:
 		offset_x: float = 0.0,
 		offset_y: float = 0.0,
 		target_found: bool = False,
+		flow_x_norm_s: float = 0.0,
+		flow_y_norm_s: float = 0.0,
+		flow_valid: bool = False,
 		area_fraction: float = 0.0,
 		fov_saturated: bool = False,
 	) -> MissionControl:
@@ -915,7 +931,10 @@ class MissionRoutine:
 			return self._do_landed(t)
 
 		if self._substate == CENTER:
-			return self._do_center(t, offset_x, offset_y, target_found)
+			return self._do_center(
+				t, offset_x, offset_y, target_found,
+				flow_x_norm_s, flow_y_norm_s, flow_valid,
+			)
 
 		if self._substate == APPROACH_PROBE:
 			return self._do_approach_probe(
@@ -940,13 +959,43 @@ class MissionRoutine:
 
 		return self._do_descend(t)
 
+
 	def _do_center(
-		self, t: float, offset_x: float, offset_y: float, target_found: bool
+		self,
+		t: float,
+		offset_x: float,
+		offset_y: float,
+		target_found: bool,
+		flow_x_norm_s: float,
+		flow_y_norm_s: float,
+		flow_valid: bool,
 	) -> MissionControl:
+		"""Hold visual hover until the target is centred AND laterally settled.
+
+		This is mission-phase logic, not command formation. ControlLaw continues
+		receiving the real target/flow throughout CENTER; this method only decides
+		when the mission is allowed to enter APPROACH_PROBE.
+		"""
 		if self._center_start_t is None:
 			self._center_start_t = t
 
-		centered = self._is_centered(offset_x, offset_y, target_found)
+		offset_radius = math.hypot(float(offset_x), float(offset_y))
+		flow_radius = (
+			math.hypot(float(flow_x_norm_s), float(flow_y_norm_s))
+			if flow_valid else float("inf")
+		)
+
+		if self._enable_center_condition_gate:
+			centered = (
+				bool(target_found)
+				and bool(flow_valid)
+				and offset_radius <= self._center_offset_radius_max
+				and flow_radius <= self._center_flow_radius_max
+			)
+			required_dwell = self._center_condition_dwell
+		else:
+			centered = self._is_centered(offset_x, offset_y, target_found)
+			required_dwell = self._center_dwell
 
 		if centered:
 			if self._centered_since is None:
@@ -957,14 +1006,16 @@ class MissionRoutine:
 			dwell = 0.0
 
 		elapsed = t - self._center_start_t
-		settled = centered and dwell >= self._center_dwell
-		timed_out = elapsed >= self._center_timeout
+		settled = centered and dwell >= required_dwell
+		timed_out = (
+			self._center_timeout > 0.0
+			and elapsed >= self._center_timeout
+		)
+		timeout_handoff = (
+			timed_out and self._center_timeout_allows_handoff
+		)
 
-		if settled or timed_out:
-			# Cold start: APPROACH_PROBE entry is where the probe's (long, far-field)
-			# memory begins. This is the ONLY reset in the mission -- from here the
-			# same probe runs continuously through FINAL_PROBE, retuned but never
-			# cleared.
+		if settled or timeout_handoff:
 			self._probe.reset()
 			self._probe.retune(
 				highpass_tau_sec=self._far_probe_highpass_tau,
@@ -987,7 +1038,11 @@ class MissionRoutine:
 					"event": "center_done",
 					"centered_ok": bool(settled),
 					"center_timed_out": bool(timed_out),
+					"center_timeout_handoff": bool(timeout_handoff),
 					"center_elapsed_sec": elapsed,
+					"center_dwell_sec": dwell,
+					"center_offset_radius": offset_radius,
+					"center_flow_radius_norm_s": flow_radius,
 				},
 			)
 
@@ -1002,9 +1057,19 @@ class MissionRoutine:
 				"offset_x": offset_x,
 				"offset_y": offset_y,
 				"target_found": target_found,
+				"flow_valid": flow_valid,
 				"centered": centered,
 				"center_dwell_sec": dwell,
+				"center_required_dwell_sec": required_dwell,
 				"center_elapsed_sec": elapsed,
+				"center_timed_out": bool(timed_out),
+				"center_timeout_allows_handoff": bool(
+					self._center_timeout_allows_handoff
+				),
+				"center_offset_radius": offset_radius,
+				"center_flow_radius_norm_s": flow_radius,
+				"center_offset_radius_max": self._center_offset_radius_max,
+				"center_flow_radius_max_norm_s": self._center_flow_radius_max,
 			},
 		)
 

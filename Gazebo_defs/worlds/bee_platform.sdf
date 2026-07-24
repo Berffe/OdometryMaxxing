@@ -88,7 +88,7 @@
 	<visual name="visual_body">
 		<geometry>
 		<cylinder>
-			<radius>1.0</radius>
+			<radius>0.5</radius>
 			<length>0.2</length>
 		</cylinder>
 		</geometry>
@@ -132,7 +132,7 @@
 	<collision name="collision">
 		<geometry>
 		<cylinder>
-			<radius>1.0</radius>
+			<radius>0.5</radius>
 			<length>0.2</length>
 		</cylinder>
 		</geometry>
@@ -166,41 +166,33 @@
 	</sensor>
 	</link>
 
-	<!-- Ground truth for diagnostics (NOT analytically reconstructed, see
-	     platform_motion.py) is published directly by this plugin itself, on
-	     its own dedicated /platform/pose topic (see
-	     MovingPlatformController.cpp's publishPose), not via gz-sim's
-	     generic pose broadcasting, which two earlier approaches both
-	     confirmed unreliable for this entity: a PosePublisher SDF plugin
-	     only emitted a one-shot static snapshot for the earlier <static>true
-	     </static> version of this model, and SceneBroadcaster's /world/.../pose/info (a
-	     Pose_V of every entity) bridges into ROS as tf2_msgs/msg/TFMessage
-	     with every entity's name left empty (confirmed directly via the
-	     consuming ROS node logging every child_frame_id it received), so
-	     there was no way to pick this entity back out on the ROS side.
+	<!-- ---------------------------------------------------------------------------
+		B. Deterministic multi-frequency composition.
 
-	     Bridge with ros_gz_bridge:
-	       ros2 run ros_gz_bridge parameter_bridge \
-	           /platform/pose@geometry_msgs/msg/Pose@gz.msgs.Pose
-
-	     Requires the plugin rebuilt/reinstalled after this change before the
-	     new topic exists; confirm with `gz topic -l | grep platform`
-	     after relaunching. Optional <pose_topic>some/other/topic</pose_topic>
-	     tag below overrides the default /platform/pose if needed. -->
+			Hand-written components, no RNG involved. Useful as the intermediate
+			step between a single sinusoid and a stochastic family: the disturbance
+			is richer but every line of it is stated explicitly in the paper.
+		--------------------------------------------------------------------------- -->
 	<plugin filename="libOscillatingPlatformController.so" name="custom::OscillatingPlatformController">
 		<link_name>platform_link</link_name>
 
-		<x_amplitude>0.0</x_amplitude>
-		<x_frequency>0.0</x_frequency>
-		<x_phase>0.0</x_phase>
+		<axis_x>
+			<component><amplitude>0.20</amplitude><frequency>0.100</frequency><phase>1.5</phase></component>
+			<component><amplitude>0.05</amplitude><frequency>0.270</frequency><phase>0.0</phase></component>
+		</axis_x>
+		<axis_y>
+			<component><amplitude>0.30</amplitude><frequency>0.190</frequency><phase>0.0</phase></component>
+			<component><amplitude>0.2</amplitude><frequency>0.110</frequency><phase>2.1</phase></component>
+		</axis_y>
+		<axis_z>
+			<component><amplitude>0.15</amplitude><frequency>0.150</frequency><phase>1.3</phase></component>
+			<component><amplitude>0.29</amplitude><frequency>0.270</frequency><phase>0.7</phase></component>
+			<component><amplitude>0.09</amplitude><frequency>0.310</frequency><phase>4.0</phase></component>
+		</axis_z>
 
-		<y_amplitude>0.0</y_amplitude>
-		<y_frequency>0.0</y_frequency>
-		<y_phase>0.0</y_phase>
-
-		<z_amplitude>0.0</z_amplitude>
-		<z_frequency>0.0</z_frequency>
-		<z_phase>0.0</z_phase>
+		<position_gain>20.0</position_gain>
+		<max_linear_velocity>5.0</max_linear_velocity>
+		<angular_enabled>false</angular_enabled>
 	</plugin>
 
 	<!-- Publishes /bee_platform/touched as gz.msgs.Boolean once the platform

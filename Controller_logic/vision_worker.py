@@ -56,6 +56,7 @@ from collections import namedtuple
 
 from .optical_flow import OpticalFlowEstimator
 from .target_acquisition import TargetAcquisition
+from .derotation import CameraGeometry, Derotator
 
 
 # What the worker hands back for each processed frame. timestamp echoes the
@@ -110,7 +111,7 @@ VisionResult = namedtuple(
 STOP = None
 
 
-def run_vision_worker(in_q, out_q):
+def run_vision_worker(in_q, out_q, enable_derotation=False):
 	"""Long-lived vision loop. Entry point for the multiprocessing.Process.
 
 	Owns one TargetAcquisition and one OpticalFlowEstimator -- constructed
@@ -136,7 +137,9 @@ def run_vision_worker(in_q, out_q):
 	signal.signal(signal.SIGINT, signal.SIG_IGN)
 
 	target_acquisition = TargetAcquisition()
-	optical_flow = OpticalFlowEstimator(derotator=None)
+	optical_flow = None
+	# Must match model.sdf. 80 deg is the current BEE camera horizontal FOV.
+	camera_horizontal_fov_rad = 1.3962634015954636
 
 	while True:
 		item = in_q.get()  # blocks; costs nothing while idle
@@ -152,6 +155,16 @@ def run_vision_worker(in_q, out_q):
 				frame_receipt_perf, ship_perf, camera_callback_ms,
 			) = item
 			ipc_in_ms = 1000.0 * (recv_perf - ship_perf)
+
+			if optical_flow is None:
+				h, w = frame.shape[:2]
+				derotator = None
+				if enable_derotation:
+					geometry = CameraGeometry.from_horizontal_fov(
+						camera_horizontal_fov_rad, width=w, height=h
+					)
+					derotator = Derotator(geometry)
+				optical_flow = OpticalFlowEstimator(derotator=derotator)
 
 			t0 = time.perf_counter()
 			target = target_acquisition.update(frame, timestamp=timestamp)

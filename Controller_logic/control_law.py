@@ -166,6 +166,7 @@ class ControlLaw:
 		thrust_max: float = 0.90,
 		roll_output_sign: float = 1.0,
 		pitch_output_sign: float = 1.0,
+		
 		roll_slew_rate_rad_s: float = 0.35,
 		pitch_slew_rate_rad_s: float = 0.20,
 		thrust_slew_rate_per_s: float = 0.40,

@@ -394,18 +394,12 @@ class OpticalFlowEstimator:
 			flow_small_per_frame = flow_small_per_frame / scale
 
 		derotation_active = self._derotator is not None and body_rates is not None
-		if derotation_active and scale < 1.0:
-			flow_px_per_frame = cv2.resize(
-				flow_small_per_frame,
-				(roi_width, roi_height),
-				interpolation=cv2.INTER_LINEAR,
-			)
-			fit_pixel_scale = 1.0
-			gradient_source = prev_roi
-		else:
-			flow_px_per_frame = flow_small_per_frame
-			fit_pixel_scale = scale
-			gradient_source = prev_small
+		# Keep the compact working grid even when derotation is enabled. The
+		# rotational model is sampled at the corresponding normalized full-image
+		# coordinates instead of upsampling the measured flow.
+		flow_px_per_frame = flow_small_per_frame
+		fit_pixel_scale = scale
+		gradient_source = prev_small
 		flow_px_s = flow_px_per_frame / dt
 		timing["flow_scaling_upsample_ms"] = 1000.0 * (time.perf_counter() - stage_start)
 		timing["fit_pixel_scale"] = float(fit_pixel_scale)
@@ -414,8 +408,9 @@ class OpticalFlowEstimator:
 		stage_start = time.perf_counter()
 		raw_flow_px_s = flow_px_s
 		if derotation_active:
-			flow_px_s = self._derotator.derotate(
-				flow_px_s, body_rates, roi=(x0, y0, x1, y1)
+			flow_px_s = self._derotator.derotate_working_grid(
+				flow_px_s, body_rates, roi=(x0, y0, x1, y1),
+				pixel_scale=fit_pixel_scale,
 			)
 		timing["derotation_ms"] = 1000.0 * (time.perf_counter() - stage_start)
 

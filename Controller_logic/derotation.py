@@ -203,6 +203,49 @@ class Derotator:
 		v_rot = wx * (f + yg * yg / f) - (wy * xg * yg) / f - wz * xg
 		return u_rot, v_rot
 
+	def rotational_flow_normalized_grid(
+		self, omega_body, roi, grid_width, grid_height, pixel_scale=1.0
+	):
+		"""Rotational flow sampled directly on the working flow grid.
+
+		Coordinates are first converted to normalized pinhole coordinates
+		X=(u-cx)/f, Y=(v-cy)/f.  This avoids reconstructing a full-resolution
+		flow field when Farneback ran on a downsampled ROI.  ``pixel_scale`` is
+		the working/full resolution ratio used by OpticalFlowEstimator.
+		The returned components remain in full-image px/s, matching the measured
+		flow after its amplitude correction.
+		"""
+		wx, wy, wz = self.optical_rates(omega_body)
+		f = self.geo.focal_px
+		x0, y0, _x1, _y1 = roi
+		s = max(1e-9, float(pixel_scale))
+
+		# Map working-grid pixel centres back to full-image pixel coordinates.
+		cols = (np.arange(grid_width, dtype=np.float64) + 0.5) / s - 0.5
+		rows = (np.arange(grid_height, dtype=np.float64) + 0.5) / s - 0.5
+		xn = ((x0 + cols) - self.geo.cx) / f
+		yn = ((y0 + rows) - self.geo.cy) / f
+		xg, yg = np.meshgrid(xn, yn)
+
+		# Normalized-coordinate rotational motion field [1/s].
+		u_norm = wx * xg * yg - wy * (1.0 + xg * xg) + wz * yg
+		v_norm = wx * (1.0 + yg * yg) - wy * xg * yg - wz * xg
+		return f * u_norm, f * v_norm
+
+	def derotate_working_grid(self, flow_px_s, omega_body, roi, pixel_scale=1.0):
+		"""Subtract rotation directly on the current (possibly small) flow grid."""
+		if flow_px_s is None or omega_body is None:
+			return flow_px_s
+		h, w = flow_px_s.shape[:2]
+		u_rot, v_rot = self.rotational_flow_normalized_grid(
+			omega_body, roi, w, h, pixel_scale=pixel_scale
+		)
+		self._last_rotational_mean = (float(np.mean(u_rot)), float(np.mean(v_rot)))
+		out = flow_px_s.copy()
+		out[:, :, 0] -= u_rot
+		out[:, :, 1] -= v_rot
+		return out
+
 	def derotate(self, flow_px_s, omega_body, roi):
 		"""Subtract the predicted rotational field from a measured px/s flow
 		field over `roi` = (x0, y0, x1, y1). Returns a NEW array; the input is

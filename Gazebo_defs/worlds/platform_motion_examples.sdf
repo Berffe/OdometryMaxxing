@@ -1,0 +1,233 @@
+<!-- ==========================================================================
+     Replacement <plugin> blocks for the bee_platform model in bee_platform.sdf.
+     Pick ONE and paste it in place of the existing OscillatingPlatformController
+     block. All four produce the same internal object -- a list of
+     (amplitude, omega, phase) triples per axis -- so position and velocity stay
+     analytic and the velocity feedforward is unaffected in every case.
+     ========================================================================== -->
+
+
+<!-- ---------------------------------------------------------------------------
+     A. Reproduction of the run logged as 20260722_164510, with the x/z phase
+        lock broken.
+
+        The logged run had z = 2.000 + 2.000 * x exactly (correlation 1.0000):
+        x and z shared a frequency and a phase, so the lateral and vertical
+        disturbances were the same signal up to scale and their contributions
+        could not be separated. Making the three frequencies mutually
+        non-commensurate fixes that, and additionally lets per-axis response be
+        recovered by spectral projection at 0.1 / 0.2 / 0.27 Hz.
+     --------------------------------------------------------------------------- -->
+<plugin filename="libOscillatingPlatformController.so" name="custom::OscillatingPlatformController">
+	<link_name>platform_link</link_name>
+
+	<axis_x>
+		<component><amplitude>0.20</amplitude><frequency>0.200</frequency><phase>1.5</phase></component>
+	</axis_x>
+	<axis_y>
+		<component><amplitude>0.30</amplitude><frequency>0.100</frequency><phase>0.0</phase></component>
+	</axis_y>
+	<axis_z>
+		<component><amplitude>0.40</amplitude><frequency>0.270</frequency><phase>0.7</phase></component>
+	</axis_z>
+
+	<position_gain>8.0</position_gain>
+	<max_linear_velocity>5.0</max_linear_velocity>
+	<angular_enabled>false</angular_enabled>
+</plugin>
+
+
+<!-- ---------------------------------------------------------------------------
+     B. Deterministic multi-frequency composition.
+
+        Hand-written components, no RNG involved. Useful as the intermediate
+        step between a single sinusoid and a stochastic family: the disturbance
+        is richer but every line of it is stated explicitly in the paper.
+     --------------------------------------------------------------------------- -->
+<plugin filename="libOscillatingPlatformController.so" name="custom::OscillatingPlatformController">
+	<link_name>platform_link</link_name>
+
+	<axis_x>
+		<component><amplitude>0.20</amplitude><frequency>0.200</frequency><phase>1.5</phase></component>
+		<component><amplitude>0.05</amplitude><frequency>0.470</frequency><phase>0.0</phase></component>
+	</axis_x>
+	<axis_y>
+		<component><amplitude>0.30</amplitude><frequency>0.100</frequency><phase>0.0</phase></component>
+		<component><amplitude>0.06</amplitude><frequency>0.310</frequency><phase>2.1</phase></component>
+	</axis_y>
+	<axis_z>
+		<component><amplitude>0.40</amplitude><frequency>0.270</frequency><phase>0.7</phase></component>
+		<component><amplitude>0.08</amplitude><frequency>0.610</frequency><phase>4.0</phase></component>
+	</axis_z>
+
+	<position_gain>20.0</position_gain>
+	<max_linear_velocity>5.0</max_linear_velocity>
+	<angular_enabled>false</angular_enabled>
+</plugin>
+
+
+<!-- ---------------------------------------------------------------------------
+     C. Herisse et al. (2012), Fig. 8 -- bounded random family.
+
+        n = 7 components, a_i ~ U[0, 0.1] m, omega_i ~ U[1, 6] rad/s,
+        phi_i ~ U[0, 2*pi]. Amplitude, frequency AND phase are all randomised;
+        the bounds are what make the worst-case acceleration computable
+        (sum a_i omega_i^2, printed at startup), which is the quantity a gain
+        floor condition needs. This is a robustness test over a bounded family,
+        not an imitation of a real sea.
+
+        Typical draws from this spec give rms acceleration 1.4-2.2 m/s^2 and
+        peaks of 3-5 m/s^2 per axis, i.e. roughly 5x the rms and 10x the peak of
+        the run logged as 20260722_164510. Note also that the upper bound
+        omega = 6 rad/s sits at about 0.65 of the lateral loop's delay-imposed
+        bandwidth ceiling, so this is a demanding case rather than a token one.
+
+        Change <seed> alone to obtain an independent draw with everything else
+        held fixed; the realised component list is logged at startup and
+        republished on /platform/motion_spec every 2 s.
+     --------------------------------------------------------------------------- -->
+<plugin filename="libOscillatingPlatformController.so" name="custom::OscillatingPlatformController">
+	<link_name>platform_link</link_name>
+
+	<seed>20260723</seed>
+
+	<axis_x>
+		<synthesis>
+			<mode>uniform</mode>
+			<count>7</count>
+			<amplitude_min>0.0</amplitude_min>
+			<amplitude_max>0.10</amplitude_max>
+			<omega_min>1.0</omega_min>
+			<omega_max>6.0</omega_max>
+		</synthesis>
+	</axis_x>
+	<axis_y>
+		<synthesis>
+			<mode>uniform</mode>
+			<count>7</count>
+			<amplitude_min>0.0</amplitude_min>
+			<amplitude_max>0.10</amplitude_max>
+			<omega_min>1.0</omega_min>
+			<omega_max>6.0</omega_max>
+		</synthesis>
+	</axis_y>
+	<axis_z>
+		<synthesis>
+			<mode>uniform</mode>
+			<count>7</count>
+			<amplitude_min>0.0</amplitude_min>
+			<amplitude_max>0.10</amplitude_max>
+			<omega_min>1.0</omega_min>
+			<omega_max>6.0</omega_max>
+		</synthesis>
+	</axis_z>
+
+	<!-- Raised from 8.0: the servo's error-correction corner sits at
+	     position_gain rad/s, so at the 6 rad/s upper edge of the band a gain of
+	     8 attenuates by 0.80 with 37 deg of lag. The velocity feedforward
+	     carries most of the load, but the realised motion should still be
+	     checked against the logged pose rather than assumed. -->
+	<position_gain>30.0</position_gain>
+
+	<!-- Worst case for this spec is sum a_i omega_i = 4.2 m/s per axis; the
+	     plugin warns at startup if the bound exceeds this clamp. -->
+	<max_linear_velocity>8.0</max_linear_velocity>
+
+	<angular_enabled>false</angular_enabled>
+</plugin>
+
+
+<!-- ---------------------------------------------------------------------------
+     D. Random-phase spectral realisation (Pierson-Moskowitz).
+
+        Amplitudes and frequencies are fixed by the spectrum; only the phases
+        are random. This answers a different question from C: "does it work
+        against this sea state" rather than "does it work against anything
+        within these bounds". Both are worth reporting.
+
+        significant_height is the Hs of the spectrum, peak_frequency its fp.
+        The band defaults to [0.5 fp, 3 fp] and is swept with <count> bins.
+     --------------------------------------------------------------------------- -->
+<plugin filename="libOscillatingPlatformController.so" name="custom::OscillatingPlatformController">
+	<link_name>platform_link</link_name>
+
+	<seed>20260723</seed>
+
+	<axis_x>
+		<synthesis>
+			<mode>pierson_moskowitz</mode>
+			<count>24</count>
+			<significant_height>0.30</significant_height>
+			<peak_frequency>0.20</peak_frequency>
+		</synthesis>
+	</axis_x>
+	<axis_y>
+		<synthesis>
+			<mode>pierson_moskowitz</mode>
+			<count>24</count>
+			<significant_height>0.30</significant_height>
+			<peak_frequency>0.13</peak_frequency>
+		</synthesis>
+	</axis_y>
+	<axis_z>
+		<synthesis>
+			<mode>pierson_moskowitz</mode>
+			<count>24</count>
+			<significant_height>0.50</significant_height>
+			<peak_frequency>0.27</peak_frequency>
+		</synthesis>
+	</axis_z>
+
+	<position_gain>30.0</position_gain>
+	<max_linear_velocity>8.0</max_linear_velocity>
+	<angular_enabled>false</angular_enabled>
+</plugin>
+
+
+<!-- ---------------------------------------------------------------------------
+     E. Deck roll and pitch -- PLUMBED IN, OFF BY DEFAULT.
+
+        Add <axis_roll> / <axis_pitch> exactly as for the translational axes
+        (amplitudes in radians) and set <angular_enabled>true</angular_enabled>
+        to activate. With angular_enabled false the link is held level, so this
+        block behaves identically to the current plugin and the components below
+        are parsed, reported at startup as DEFINED BUT DISABLED, and ignored.
+
+        Before switching it on, note that a tilting deck changes three things at
+        once: the apparent shape of the visual target (and hence the centroid
+        estimate), the deck normal against which minimum_view_alignment is
+        tested, and the geometry of skid contact at touchdown. It is the case
+        Herisse et al. name in their concluding remarks as open -- the situation
+        where the platform orientation is time varying and its normal is not
+        assumed known -- so it is worth introducing on its own rather than
+        folded into a stochastic-translation run.
+     --------------------------------------------------------------------------- -->
+<plugin filename="libOscillatingPlatformController.so" name="custom::OscillatingPlatformController">
+	<link_name>platform_link</link_name>
+
+	<axis_x>
+		<component><amplitude>0.20</amplitude><frequency>0.200</frequency><phase>1.5</phase></component>
+	</axis_x>
+	<axis_y>
+		<component><amplitude>0.30</amplitude><frequency>0.100</frequency><phase>0.0</phase></component>
+	</axis_y>
+	<axis_z>
+		<component><amplitude>0.40</amplitude><frequency>0.270</frequency><phase>0.7</phase></component>
+	</axis_z>
+
+	<!-- 0.087 rad = 5 deg. Deck roll and pitch usually sit near the heave
+	     frequency, phase-shifted; here roll leads z by pi/2. -->
+	<axis_roll>
+		<component><amplitude>0.087</amplitude><frequency>0.270</frequency><phase>2.27</phase></component>
+	</axis_roll>
+	<axis_pitch>
+		<component><amplitude>0.052</amplitude><frequency>0.200</frequency><phase>0.0</phase></component>
+	</axis_pitch>
+
+	<angular_enabled>false</angular_enabled>
+	<angular_gain>8.0</angular_gain>
+	<max_angular_velocity>2.0</max_angular_velocity>
+
+	<position_gain>20.0</position_gain>
+	<max_linear_velocity>5.0</max_linear_velocity>
+</plugin>
