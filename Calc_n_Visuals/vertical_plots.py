@@ -4,7 +4,7 @@ The continuous relative dynamics are exactly discretized with a zero-order
 hold. The script produces only:
 	1. divergence-residual frequency response;
 	2. drone/platform synchronization a_d / a_p;
-	3. continuous and discrete closed-loop root loci.
+	3. discrete closed-loop root locus.
 """
 
 from __future__ import annotations
@@ -77,17 +77,6 @@ def discrete_response(
 		response[i] = (C @ np.linalg.solve(z * identity - F, G))[0, 0]
 
 	return response
-
-
-def continuous_transfer_poles(cfg: FrequencyConfig, gain_k: float) -> np.ndarray:
-	"""Poles of T_p(s)=K P_D(s)/(1+K P_D(s))."""
-	h, D0, K = cfg.height_m, cfg.divergence_op_1_s, float(gain_k)
-
-	# At D0=0, T_p(s)=K/(h*s+K) after exact cancellation.
-	if abs(D0) < 1e-12:
-		return np.array([-K / h], dtype=complex)
-
-	return np.roots([h, K, K * D0]).astype(complex)
 
 
 def discrete_transfer_poles(cfg: FrequencyConfig, gain_k: float) -> np.ndarray:
@@ -304,7 +293,7 @@ def plot_platform_synchronization(
 
 
 # --------------------------------------------------------------------------- #
-# 3. Continuous and discrete root loci
+# 3. Discrete root locus
 # --------------------------------------------------------------------------- #
 
 
@@ -315,72 +304,56 @@ def root_locus_data(cfg: FrequencyConfig):
 		gain_max = 1.15 * max(max(cfg.gain_values), critical_gain)
 
 	gains = np.linspace(0.0, gain_max, cfg.root_locus_points)
-	continuous = [continuous_transfer_poles(cfg, K) for K in gains]
-	discrete = [discrete_transfer_poles(cfg, K) for K in gains]
-	return gains, np.asarray(continuous), np.asarray(discrete), critical_gain
+	poles = [discrete_transfer_poles(cfg, K) for K in gains]
+	return gains, np.asarray(poles), critical_gain
 
 
 def plot_root_locus(cfg: FrequencyConfig) -> None:
-	_, poles_c, poles_d, critical_gain = root_locus_data(cfg)
-	fig, (ax_c, ax_d) = plt.subplots(1, 2, figsize=(13, 6))
+	_, poles, critical_gain = root_locus_data(cfg)
+	fig, ax = plt.subplots(figsize=(7.5, 7.0))
 	fig.suptitle(
-		"Lieu des pôles en boucle fermée de "
+		"Lieu discret des pôles en boucle fermée de "
 		r"$T_p=a_d/a_p$ lorsque $K$ varie"
 	)
 
 	# A point cloud avoids numerical branch-switching artifacts.
-	ax_c.plot(np.real(poles_c).ravel(), np.imag(poles_c).ravel(), ".", ms=2)
-	ax_d.plot(np.real(poles_d).ravel(), np.imag(poles_d).ravel(), ".", ms=2)
+	ax.plot(np.real(poles).ravel(), np.imag(poles).ravel(), ".", ms=2)
 
-	poles_c_0 = continuous_transfer_poles(cfg, 0.0)
-	poles_d_0 = discrete_transfer_poles(cfg, 0.0)
-	ax_c.scatter(
-		np.real(poles_c_0), np.imag(poles_c_0), marker="x", s=80,
-		label="pôles pour K=0",
-	)
-	ax_d.scatter(
-		np.real(poles_d_0), np.imag(poles_d_0), marker="x", s=80,
+	poles_0 = discrete_transfer_poles(cfg, 0.0)
+	ax.scatter(
+		np.real(poles_0), np.imag(poles_0), marker="x", s=80,
 		label="pôles pour K=0",
 	)
 
 	for K in cfg.gain_values:
-		poles_c_K = continuous_transfer_poles(cfg, K)
-		poles_d_K = discrete_transfer_poles(cfg, K)
-		ax_c.scatter(
-			np.real(poles_c_K), np.imag(poles_c_K), s=35, label=f"K={K:g}",
+		poles_K = discrete_transfer_poles(cfg, K)
+		state = "" if np.all(np.abs(poles_K) < 1.0 - 1e-10) else " (instable)"
+		ax.scatter(
+			np.real(poles_K), np.imag(poles_K), s=38,
+			label=f"K={K:g}{state}",
 		)
-		ax_d.scatter(
-			np.real(poles_d_K), np.imag(poles_d_K), s=35, label=f"K={K:g}",
-		)
-
-	ax_c.axvline(0.0, linestyle="--", linewidth=1, label="limite de stabilité")
 
 	theta = np.linspace(0.0, 2.0 * math.pi, 600)
-	ax_d.plot(
+	ax.plot(
 		np.cos(theta), np.sin(theta), linestyle="--", linewidth=1,
 		label="cercle unité",
 	)
-	ax_d.scatter(
+	ax.scatter(
 		[-1.0], [0.0], marker="x", s=90, label=r"$K_{crit}=2h/T$",
 	)
-	ax_d.annotate(
+	ax.annotate(
 		f"Kcrit={critical_gain:.3g}", xy=(-1.0, 0.0), xytext=(8, 8),
 		textcoords="offset points", fontsize=8,
 	)
 
-	ax_c.set_title("Modèle continu de référence")
-	ax_c.set_xlabel(r"Re$(s)$ [s$^{-1}$]")
-	ax_c.set_ylabel(r"Im$(s)$ [s$^{-1}$]")
-
-	ax_d.set_title("Modèle discret ZOH utilisé pour la commande")
-	ax_d.set_xlabel(r"Re$(z)$")
-	ax_d.set_ylabel(r"Im$(z)$")
-	ax_d.set_aspect("equal", adjustable="datalim")
-
-	for ax in (ax_c, ax_d):
-		ax.grid(True)
-		ax.legend(loc="best")
-
+	ax.axhline(0.0, linewidth=0.8)
+	ax.axvline(0.0, linewidth=0.8)
+	ax.set_title("Modèle discret ZOH utilisé pour la commande")
+	ax.set_xlabel(r"Re$(z)$")
+	ax.set_ylabel(r"Im$(z)$")
+	ax.set_aspect("equal", adjustable="datalim")
+	ax.grid(True)
+	ax.legend(loc="best")
 	fig.tight_layout()
 
 
