@@ -216,6 +216,8 @@ class PlatformProbe:
 		percentile_window_sec: float = 2.0,
 		peak_decay_tau_sec: float = 3.0,
 		peak_percentile: float = 0.95,
+		accel_margin: float = 0.05,
+		probe_attenuation_comp: float = 1.2,
 	):
 		self._tm = thrust_model
 		self._tau = max(1e-3, float(highpass_tau_sec))
@@ -229,6 +231,8 @@ class PlatformProbe:
 
 		self._percentile_window_sec = max(1e-3, float(percentile_window_sec))
 		self._peak_percentile = clamp(peak_percentile, 0.0, 1.0)
+		self._accel_margin = max(0.0, float(accel_margin))
+		self._probe_attenuation_comp = max(1.0, float(probe_attenuation_comp))
 		self._peak_decay_tau = max(1e-3, float(peak_decay_tau_sec))
 		self._residual_window: Deque[tuple[float, float]] = deque()
 
@@ -332,9 +336,7 @@ class PlatformProbe:
 	def peak_decay_tau_sec(self) -> float:
 		return float(self._peak_decay_tau)
 
-	def update(self, thrust_cmd: float, dt: float, safe_accel: float = 0.1) -> None:
-		_ = safe_accel  # legacy argument; kept for old call compatibility
-
+	def update(self, thrust_cmd: float, dt: float) -> None:
 		dt = max(1e-3, float(dt))
 		a = self._tm.accel_from_thrust(thrust_cmd)
 
@@ -377,13 +379,18 @@ class PlatformProbe:
 				w = idx - lo
 				target_peak = (1.0 - w) * values[lo] + w * values[hi]
 
-		# Leaky max: fresh samples raise the peak immediately; an old peak (in
-		# particular one carried across retune() from the far field) decays away at
-		# peak_decay_tau as better data arrives.
+		# Raw percentile stays the diagnostic ("what the probe actually saw").
 		self._last_percentile = float(target_peak)
 
+		# Two margins, two shapes: factor inverts the dB attenuation (scales with the
+		# value); additive covers unmodeled/ground-effect terms AND guarantees a
+		# nonzero floor when the percentile is small, where a bare factor collapses.
+		protected_peak = target_peak * self._probe_attenuation_comp + self._accel_margin
+
+		# Leaky max, unchanged. Note the additive term now also acts as a hard lower
+		# bound: _peak can never leak below accel_margin.
 		decay = math.exp(-dt / max(1e-3, self._peak_decay_tau))
-		self._peak = max(target_peak, decay * self._peak)
+		self._peak = max(protected_peak, decay * self._peak)
 
 	def result(
 		self,
@@ -404,7 +411,6 @@ class PlatformProbe:
 				and self._total_elapsed >= float(min_total_duration_sec)
 			),
 		)
-
 
 @dataclass
 class GateResult:
@@ -639,6 +645,8 @@ class MissionRoutine:
 		# ALREADY-safety-derated ceiling (see module docstring: this is the second
 		# of two multiplicative margins, not the only one).
 		ceiling_margin: float = 0.8,
+		probe_accel_margin_m_s2: float = 0.05,
+		probe_attenuation_comp: float = 1.2,
 		# Height at which the near-field trigger (FOV saturation / area_fraction)
 		# actually fires. This is the ANCHOR for the whole gain schedule -- see
 		# _compute_probe_gain(). It is a CAMERA-GEOMETRY constant (target diameter
@@ -736,6 +744,8 @@ class MissionRoutine:
 			highpass_tau_sec=float(far_probe_highpass_tau_sec),
 			percentile_window_sec=float(far_probe_window_sec),
 			peak_decay_tau_sec=float(far_probe_decay_tau_sec),
+			accel_margin=float(probe_accel_margin_m_s2),
+			probe_attenuation_comp=float(probe_attenuation_comp),
 		)
 		self._far_probe_window = float(far_probe_window_sec)
 		self._far_probe_decay_tau = float(far_probe_decay_tau_sec)
@@ -1136,7 +1146,7 @@ class MissionRoutine:
 		# alternative, dropping the gain before probing starts, would fly the whole
 		# approach far below the ceiling and throw away the bandwidth this design is
 		# built to exploit.
-		self._probe.update(last_thrust_cmd, dt, safe_accel=0.2)
+		self._probe.update(last_thrust_cmd, dt)
 		self.probe_result = self._probe.result(
 			min_duration_sec=0.0, min_total_duration_sec=self._probe_min
 		)
@@ -1241,7 +1251,7 @@ class MissionRoutine:
 				peak_decay_tau_sec=self._near_probe_decay_tau,
 			)
 
-		self._probe.update(last_thrust_cmd, dt, safe_accel=0.2)
+		self._probe.update(last_thrust_cmd, dt)
 		# ready requires BOTH: a full near-field hold, AND enough TOTAL probing
 		# across both phases (~ one platform period) -- the hold alone is far too
 		# short to supply the latter, so this is what keeps a fast FOV saturation

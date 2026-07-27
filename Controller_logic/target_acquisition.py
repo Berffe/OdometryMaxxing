@@ -3,8 +3,8 @@ Lightweight, NN-free target acquisition, decoupled from ROS.
 
 	update(frame_bgr, timestamp) -> TargetEstimate
 
-Pipeline: blur -> HSV saliency mask | Canny edges -> morphological cleanup ->
-contour selection -> centroid -> normalized offsets + bounding box. The box is
+Pipeline: blur -> HSV colorfulness mask -> morphological cleanup -> contour
+selection -> centroid -> normalized offsets + bounding box. The box is
 returned so optical_flow can restrict divergence to the target ROI;
 area_fraction (box area / frame area) is the controller's scheduling variable.
 
@@ -44,12 +44,12 @@ class TargetAcquisition:
 	def __init__(
 		self,
 		hsv_ranges: Optional[Sequence[HSVRange]] = None,
-		min_area_px: float = 80.0,
+		min_area_px: float = 30.0,
 		max_area_fraction: float = 0.60,
 		absolute_max_area_fraction: float = 0.95,
 		min_large_area_penalty: float = 0.5,
-		blur_kernel_size: int = 5,
-		morph_kernel_size: int = 5,
+		blur_kernel_size: int = 3,
+		morph_kernel_size: int = 3,
 		min_saturation: int = 60,
 		min_value: int = 45,
 		canny_low: int = 60,
@@ -247,16 +247,14 @@ class TargetAcquisition:
 				np.array((179, 255, 255), dtype=np.uint8),
 			)
 
-		gray = cv2.cvtColor(blurred, cv2.COLOR_BGR2GRAY)
-
-		edges = cv2.Canny(gray, self._canny_low, self._canny_high)
-		edges = cv2.dilate(
-			edges,
-			np.ones((3, 3), dtype=np.uint8),
-			iterations=1,
-		)
-
-		combined_mask = cv2.bitwise_or(hsv_mask, edges)
+		# Target identity is based on colorfulness rather than generic image
+		# structure.  The broad HSV mask accepts any hue, but requires enough
+		# saturation and brightness to reject gray shadows, landing-gear edges,
+		# and most background texture.  Canny is intentionally not part of the
+		# production candidate mask: otherwise any strong edge can become a
+		# competing contour even when it has no flower-like colorfulness.
+		edges = np.zeros(hsv.shape[:2], dtype=np.uint8)
+		combined_mask = hsv_mask.copy()
 
 		kernel = np.ones(
 			(self._morph_kernel_size, self._morph_kernel_size),

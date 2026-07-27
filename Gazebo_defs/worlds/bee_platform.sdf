@@ -106,7 +106,7 @@
 		<geometry>
 		<mesh>
 			<uri>materials/meshes/flower_disc.obj</uri>
-			<scale>1.0 1.0 1.0</scale>
+			<scale>0.5 0.5 1.0</scale>
 		</mesh>
 		</geometry>
 		<material>
@@ -166,6 +166,8 @@
 	</sensor>
 	</link>
 
+
+
 	<!-- ---------------------------------------------------------------------------
 		B. Deterministic multi-frequency composition.
 
@@ -195,6 +197,8 @@
 		<angular_enabled>false</angular_enabled>
 	</plugin>
 
+
+
 	<!-- Publishes /bee_platform/touched as gz.msgs.Boolean once the platform
 	     contact sensor has touched the bee_x500 model continuously for 0.15 s.
 	     The target string is intentionally broad: it should match bee_x500,
@@ -206,8 +210,6 @@
 		<time>0.01</time>
 		<enabled>true</enabled>
 	</plugin>
-
-
 
 	</model>
 

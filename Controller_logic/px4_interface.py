@@ -17,6 +17,13 @@ class PublishReceipt:
 
 
 class PX4Interface:
+	# Fixed heading held throughout the vision-controlled descent, in PX4/NED.
+    # q_d rotates body FRD -> NED, and yaw_NED = pi/2 - yaw_ENU. The vehicle
+    # spawns facing ENU-East (truth q = identity), so the launch heading is
+    # +pi/2. Commanding q_d yaw = 0 was slewing it to ENU +90 deg at handoff
+    # (see truth log). Recompute if the model's spawn yaw ever changes.
+    _FIXED_YAW_RAD = math.pi / 2.0
+    
     OFFBOARD_CONTROL_MODE_TOPIC = "/fmu/in/offboard_control_mode"
     VEHICLE_ATTITUDE_SETPOINT_TOPIC = "/fmu/in/vehicle_attitude_setpoint_v1"
     VEHICLE_COMMAND_TOPIC = "/fmu/in/vehicle_command"
@@ -59,7 +66,10 @@ class PX4Interface:
     def publish_attitude_setpoint(self, roll, pitch, yaw, thrust, timestamp_us=None):
         msg = VehicleAttitudeSetpoint()
         msg.timestamp = self._resolve_timestamp_us(timestamp_us)
-        msg.q_d = self._euler_to_quaternion(roll, pitch, yaw)
+        
+        # yaw arg intentionally ignored: heading is a fixed reference
+        msg.q_d = self._euler_to_quaternion(roll, pitch, self._FIXED_YAW_RAD)
+        
         msg.thrust_body = [0.0, 0.0, -float(thrust)]
         self.attitude_setpoint_pub.publish(msg)
 
