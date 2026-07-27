@@ -345,6 +345,13 @@ def plot_root_locus(cfg: FrequencyConfig) -> None:
 		f"Kcrit={critical_gain:.3g}", xy=(-1.0, 0.0), xytext=(8, 8),
 		textcoords="offset points", fontsize=8,
 	)
+	ax.scatter(
+		[0.0], [0.0], marker="x", s=90, label=r"$K_{crit, osc}=h/T$",
+	)
+	ax.annotate(
+		f"Kcrit_osc={critical_gain/2:.3g}", xy=(0.0, 0.0), xytext=(8, 8),
+		textcoords="offset points", fontsize=8,
+	)
 
 	ax.axhline(0.0, linewidth=0.8)
 	ax.axvline(0.0, linewidth=0.8)
@@ -397,14 +404,26 @@ def run_analysis(cfg: FrequencyConfig) -> None:
 	plot_root_locus(cfg)
 	plt.show()
 
-
+## NICE VISUALIZATION FOR ACCEL PROBING
 if __name__ == "__main__":
 	configuration = FrequencyConfig(
-		height_m=0.5,
+		height_m=0.4,
 		divergence_op_1_s=0.0,
-		gain_values=(1.5, 6.5, 20.0),
-		sample_time_s=0.06,
+		gain_values=(1.5, 6.5, 12.0),
+		sample_time_s=0.077,
 		platform_frequency_hz=0.4,
 		platform_amplitude_m=0.10,
 	)
 	run_analysis(configuration)
+
+## NICE VISUALIZATION FOR LANDING STABILITY
+# if __name__ == "__main__":
+# 	configuration = FrequencyConfig(
+# 		height_m=0.18,
+# 		divergence_op_1_s=0.5,
+# 		gain_values=(1.5, 2.5, 6.0),
+# 		sample_time_s=0.077,
+# 		platform_frequency_hz=0.4,
+# 		platform_amplitude_m=0.10,
+# 	)
+# 	run_analysis(configuration)
