@@ -405,25 +405,25 @@ def run_analysis(cfg: FrequencyConfig) -> None:
 	plt.show()
 
 ## NICE VISUALIZATION FOR ACCEL PROBING
-if __name__ == "__main__":
-	configuration = FrequencyConfig(
-		height_m=0.4,
-		divergence_op_1_s=0.0,
-		gain_values=(1.5, 6.5, 12.0),
-		sample_time_s=0.077,
-		platform_frequency_hz=0.4,
-		platform_amplitude_m=0.10,
-	)
-	run_analysis(configuration)
-
-## NICE VISUALIZATION FOR LANDING STABILITY
 # if __name__ == "__main__":
 # 	configuration = FrequencyConfig(
-# 		height_m=0.18,
-# 		divergence_op_1_s=0.5,
-# 		gain_values=(1.5, 2.5, 6.0),
+# 		height_m=0.4,
+# 		divergence_op_1_s=0.0,
+# 		gain_values=(1.5, 6.5, 12.0),
 # 		sample_time_s=0.077,
 # 		platform_frequency_hz=0.4,
 # 		platform_amplitude_m=0.10,
 # 	)
 # 	run_analysis(configuration)
+
+## NICE VISUALIZATION FOR LANDING STABILITY
+if __name__ == "__main__":
+	configuration = FrequencyConfig(
+		height_m=0.18,
+		divergence_op_1_s=0.5,
+		gain_values=(1.5, 2.5, 6.0),
+		sample_time_s=0.077,
+		platform_frequency_hz=0.4,
+		platform_amplitude_m=0.10,
+	)
+	run_analysis(configuration)

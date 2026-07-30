@@ -452,7 +452,7 @@ if __name__ == "__main__":
     configuration = LateralConfig(
         height_m=0.18,
         roll_kd_values=(0.10, 0.30, 0.80),
-        sample_time_s=0.06,
+        sample_time_s=0.077,
         platform_frequency_hz=0.4,
         platform_amplitude_m=0.10,
     )

@@ -1,42 +1,40 @@
 """
-Closed-loop visual controller: constant-gain PD lateral + probe-driven thrust.
+Closed-loop visual controller with unified acceleration-domain allocation.
 
 VISUAL-ONLY by design: once active, commands use ONLY visual data (target
 offset, normalized optical flow, divergence). No PX4 state feeds the control
 law after handoff.
 
-This is the committed, simplified controller. The earlier LQR + per-
-area_fraction gain-scheduling machinery (ScheduledLQR/ScalarSchedule, the
-identified (A,B) state models, the phase-lead branches, and the fov-saturation
-area_fraction latch) has been removed now that the constant-gain architecture
-is validated in flight. What remains:
+The public constructor and compute() callouts are intentionally unchanged. The
+main internal change is that all three translation channels are now assembled
+as desired accelerations before being converted back to the roll, pitch, and
+collective-thrust setpoints expected by PX4:
 
-  LATERAL (roll, pitch): one fixed PD gain set per axis,
-        u = -(k_p * lateral_p_scale * offset + k_d * lateral_d_scale * optical_flow)
-  scaled per-tick by INDEPENDENT P and D scales (the mission routine ramps
-  these on the same de Croon 2016 App. B height schedule as the thrust gain
-  during DESCEND; during CENTER they instead hold fixed at mission-phase-
-  specific values -- see mission_routine.py's CENTER docstrings). Split
-  because kp and kd have been scaled by different historical factors, so a
-  single shared scale cannot reproduce an earlier validated (kp, kd) pair.
+  LATERAL (roll/pitch channels):
+        a_roll  = -(k_p * p_scale * offset_x + k_d * d_scale * flow_x)
+        a_pitch = -(k_p * p_scale * offset_y + k_d * d_scale * flow_y)
 
-  THRUST: a direct Herisse (2012, eq. 32) / de Croon accel-domain law,
-        a_cmd        = thrust_gain_override * (D - D*)      [m/s^2]
-        thrust_delta = hover_thrust * a_cmd / G_ACCEL       [normalized]
-  where thrust_gain_override ("k") is supplied per-tick by the mission routine
-  (a hand-tuned exploration value, decayed through descent). The sign is
-  POSITIVE on (D - D*) because the identified plant has B<0 (more thrust
-  REDUCES divergence), so arresting an approach requires MORE thrust. An
-  optional constant integral term (thrust_integral_gain_const) may add a slow
-  bias correction on top; it is 0 by default.
+  VERTICAL:
+        a_z_cmd = thrust_gain_override * (D - D*)
 
-Both the lateral command and the thrust command are passed through a first-
-order low-pass + optional slew-rate limiter + clamp (_shape_commands) before output.
+The lateral gains therefore have acceleration-domain units. The allocator uses
+the known vertical thrust component to compute the required tilt, rather than
+assuming a_roll ~= g*roll and a_pitch ~= g*pitch at every instant. Near hover,
+the new implementation reduces to the former one because atan(a_lat/g) ~=
+a_lat/g. To preserve a previously validated angle-domain gain numerically, use
 
-The divergence used for control is a fixed blend of the filtered and raw
-divergence (raw_divergence_weight); the mission's divergence_setpoint D* is
-supplied per-tick (0 for the hover/probe hold, a small positive value to
-descend).
+        k_accel = G_ACCEL * k_angle.
+
+The desired vertical thrust component is preserved while tilt compensation
+increases collective thrust by 1/(cos(roll) cos(pitch)). Roll/pitch limits and
+the total collective-thrust limit are now the explicit authority constraints.
+When they conflict, vertical authority is prioritized and the tilt vector is
+scaled toward zero.
+
+The existing first-order command filter, optional slew-rate limits, and output
+clamps remain. Filtering is applied to roll, pitch, and the desired VERTICAL
+thrust component; total thrust is then allocated from the shaped quantities so
+that tilt compensation is not lost by independent output filtering.
 """
 
 import math
@@ -109,10 +107,13 @@ class ControlLaw:
 		# the theory here: do not raise kd further as the next lever. See the
 		# comment block above for what WAS validated (the kp/kd(sqrt2) step
 		# and the gain blend, both measured as improvements).
-		roll_kp: float = 0.22,
-		roll_kd: float = 0.1,
-		pitch_kp: float = 0.15,
-		pitch_kd: float = 0.075,
+		# Acceleration-domain gains [m/s^2 per normalized visual error].
+		# Defaults preserve the former 0.22/0.10 and 0.15/0.075 angle-domain
+		# behavior around hover through k_accel = g*k_angle.
+		roll_kp: float = 0.22 * G_ACCEL,
+		roll_kd: float = 0.10 * G_ACCEL,
+		pitch_kp: float = 0.15 * G_ACCEL,
+		pitch_kd: float = 0.075 * G_ACCEL,
 
 		# --- Error-magnitude gain blend (large-offset transient damping) ---
 		# roll_kp/kd/pitch_kp/kd above are the FULL gains, used once |offset|
@@ -210,6 +211,7 @@ class ControlLaw:
 		self._divergence_integral = 0.0
 		self._previous_roll_cmd = 0.0
 		self._previous_pitch_cmd = 0.0
+		self._previous_vertical_thrust_component = self._hover_thrust
 		self._previous_thrust_cmd = self._hover_thrust
 		self._has_previous_command = False
 
@@ -237,6 +239,7 @@ class ControlLaw:
 		self._divergence_integral = 0.0
 		self._previous_roll_cmd = 0.0
 		self._previous_pitch_cmd = 0.0
+		self._previous_vertical_thrust_component = self._hover_thrust
 		self._previous_thrust_cmd = self._hover_thrust
 		self._has_previous_command = False
 
@@ -265,67 +268,54 @@ class ControlLaw:
 	) -> AttitudeSetpoint:
 		"""Desired roll/pitch/yaw/thrust from visual data only.
 
+		The external call signature is unchanged. Internally, roll_kp/roll_kd
+		and pitch_kp/pitch_kd now produce lateral acceleration requests in
+		m/s^2. These requests are allocated together with the vertical thrust
+		component into the final attitude and collective-thrust commands.
+
 		divergence_setpoint: per-call override of D* (constructor value left
 		    untouched). 0 for the probe/hover hold, small positive to descend.
-		thrust_gain_override: "k" in a_cmd = k*(D - D*). Supplied per-tick by
+		thrust_gain_override: "k" in a_z_cmd = k*(D-D*). Supplied per tick by
 		    the mission (hand-tuned exploration gain, decayed through descent).
-		lateral_p_scale / lateral_d_scale: INDEPENDENT multipliers on the
-		    offset (P) and optical-flow (D) terms respectively. Split into two
-		    knobs rather than one because kp and kd have, over this project's
-		    tuning history, been scaled by DIFFERENT factors relative to
-		    earlier validated baselines (e.g. kp x2, kd x sqrt(2) when tuned
-		    for platform-oscillation tracking) -- a single shared scale cannot
-		    reverse two different historical factors at once, so it can only
-		    ever land on the RIGHT kp or the right kd, not both (verified
-		    directly: scale=0.5 landed kp exactly on an earlier baseline but
-		    left kd under-damped relative to that same baseline). Both apply
-		    on top of _offset_magnitude_gain_scale (which still scales P and D
-		    together, since that mechanism is about compound-signal saturation,
-		    not P/D balance -- see that method's docstring).
-		enable_integral: when False, the integral neither accumulates nor
-		    contributes to thrust this tick (frozen at its current value, not
-		    reset -- see reset_divergence_integral for an explicit clear). Use
-		    this during DESCEND: the scheduled gain k(t) deliberately decays
-		    toward k_min as height decreases, trading tracking authority for
-		    stability margin, so divergence necessarily undershoots D* by a
-		    structural (not noise, not a fixable bias) amount for most of the
-		    descent. An always-on integral has no way to tell that gap is
-		    intentional and keeps accumulating against it for the whole
-		    descent, dragging a persistent thrust bias into the final approach
-		    when precision matters most. Integral action is for correcting a
-		    fixable bias around a stable operating point (e.g. hover during
-		    CENTER/PROBE/PROBE_HOLD, where it's left enabled by default) --
-		    not for chasing a gap the gain schedule has deliberately decided
-		    not to close.
+		lateral_p_scale / lateral_d_scale: independent multipliers on the
+		    offset (P) and optical-flow (D) acceleration terms. Existing mission
+		    callouts therefore remain valid.
+		enable_integral: when False, the divergence integral neither accumulates
+		    nor contributes to the vertical thrust component this tick.
 		"""
 		dt = max(1e-3, float(dt))
 
-		roll_cmd = 0.0
-		pitch_cmd = 0.0
+		roll_accel_cmd = 0.0
+		pitch_accel_cmd = 0.0
 		visual_thrust_delta = 0.0
 
 		flow_valid = flow is not None and bool(getattr(flow, "valid", False))
 		target_found = target is not None and bool(getattr(target, "found", False))
 
-		# --- Lateral axes: constant PD (offset P + optical-flow D). ---
+		# --- Lateral axes: PD visual errors -> desired accelerations [m/s^2]. ---
 		if target_found:
 			flow_x = float(getattr(flow, "mean_flow_x_norm", 0.0)) if flow_valid else 0.0
 			flow_y = float(getattr(flow, "mean_flow_y_norm", 0.0)) if flow_valid else 0.0
 			offset_x = float(target.offset_x)
 			offset_y = float(target.offset_y)
 
-			# Error-magnitude blend still scales P and D TOGETHER (compound-
-			# signal saturation protection, not a P/D balance concern).
+			# Error-magnitude blend still scales P and D together: it protects
+			# the compound request against authority saturation and does not
+			# alter the independently scheduled P/D balance.
 			err_scale = self._offset_magnitude_gain_scale(offset_x, offset_y)
 			p_scale = max(0.0, float(lateral_p_scale)) * err_scale
 			d_scale = max(0.0, float(lateral_d_scale)) * err_scale
-			roll_u = -(self._roll_kp * p_scale * offset_x + self._roll_kd * d_scale * flow_x)
-			pitch_u = -(self._pitch_kp * p_scale * offset_y + self._pitch_kd * d_scale * flow_y)
 
-			roll_cmd = self._soft_limit(self._roll_output_sign * roll_u, self._roll_limit)
-			pitch_cmd = self._soft_limit(self._pitch_output_sign * pitch_u, self._pitch_limit)
+			roll_accel_cmd = self._roll_output_sign * -(
+				self._roll_kp * p_scale * offset_x
+				+ self._roll_kd * d_scale * flow_x
+			)
+			pitch_accel_cmd = self._pitch_output_sign * -(
+				self._pitch_kp * p_scale * offset_y
+				+ self._pitch_kd * d_scale * flow_y
+			)
 
-		# --- Thrust axis: accel-domain law on divergence error + integral. ---
+		# --- Vertical axis: accel-domain divergence law -> vertical thrust component. ---
 		can_use_divergence = self._enable_divergence_control and flow_valid
 		if self._require_target_for_descent:
 			can_use_divergence = can_use_divergence and target_found
@@ -344,13 +334,9 @@ class ControlLaw:
 					-self._divergence_integral_limit,
 					self._divergence_integral_limit,
 				)
-			# else: frozen at its current value -- neither accumulates nor
-			# contributes below (integral_delta is forced to 0.0).
 
 			if thrust_gain_override is not None:
-				# Herisse eq. 32 / de Croon accel-domain law: a_cmd = +k*(D-D*).
-				# POSITIVE sign because the plant has B<0 (more thrust reduces
-				# divergence): arresting a sink (D>D*) needs MORE thrust.
+				# Positive sign: more thrust reduces divergence in the identified plant.
 				accel_cmd = float(thrust_gain_override) * error
 				proportional_delta = self._hover_thrust * accel_cmd / G_ACCEL
 			else:
@@ -364,15 +350,23 @@ class ControlLaw:
 				proportional_delta + integral_delta, self._max_visual_thrust_delta
 			)
 		else:
-			# No visual measurement: decay the integral (don't hard-reset) so
-			# one dropped frame is not a discontinuity.
+			# No visual measurement: decay the integral without a hard reset.
 			self._divergence_integral *= 0.90
 
-		thrust_cmd = self._clamp(
-			self._hover_thrust + visual_thrust_delta, self._thrust_min, self._thrust_max
+		# This is the requested WORLD-VERTICAL component of normalized thrust,
+		# i.e. the same command the former controller sent when level.
+		vertical_thrust_component = self._clamp(
+			self._hover_thrust + visual_thrust_delta,
+			self._thrust_min,
+			self._thrust_max,
 		)
 
-		roll_cmd, pitch_cmd, thrust_cmd = self._shape_commands(roll_cmd, pitch_cmd, thrust_cmd, dt)
+		roll_cmd, pitch_cmd, thrust_cmd = self._shape_commands(
+			roll_accel_cmd,
+			pitch_accel_cmd,
+			vertical_thrust_component,
+			dt,
+		)
 
 		return AttitudeSetpoint(
 			timestamp=getattr(target, "timestamp", 0.0),
@@ -382,41 +376,139 @@ class ControlLaw:
 			thrust=thrust_cmd,
 		)
 
-	def _shape_commands(self, roll: float, pitch: float, thrust: float, dt: float):
-		"""
-		filter:  c_f = (1-a) c_prev + a c       (first-order low-pass)
-		slew:    c_s = c_prev + clip(c_f - c_prev, +-rate*dt)
-		         bypassed entirely when enable_slew_rate_limits=False
-		clamp:   to the axis limits.
+	def _shape_commands(
+		self,
+		roll_accel: float,
+		pitch_accel: float,
+		vertical_thrust_component: float,
+		dt: float,
+	):
+		"""Shape and allocate acceleration requests into attitude + thrust.
+
+		1. Convert the requested lateral accelerations and the known vertical
+		   thrust component into exact roll/pitch targets for the reduced
+		   yaw-aligned thrust-vector geometry.
+		2. Apply the existing smooth angle limits.
+		3. Filter/slew roll, pitch, and the VERTICAL thrust component.
+		4. Increase collective thrust by 1/(cos roll cos pitch), then reduce
+		   tilt if necessary so total thrust remains below thrust_max.
+
+		Near hover and for small angles this reduces to roll ~= a_roll/g and
+		pitch ~= a_pitch/g, preserving the former behavior after multiplying
+		the legacy angle-domain gains by G_ACCEL.
 		"""
 		if not self._has_previous_command:
 			self._previous_roll_cmd = 0.0
 			self._previous_pitch_cmd = 0.0
+			self._previous_vertical_thrust_component = self._hover_thrust
 			self._previous_thrust_cmd = self._hover_thrust
 			self._has_previous_command = True
 
+		vertical_component = self._clamp(
+			vertical_thrust_component, self._thrust_min, self._thrust_max
+		)
+		vertical_specific_thrust = max(
+			1e-6, G_ACCEL * vertical_component / max(self._hover_thrust, 1e-6)
+		)
+
+		# Preserve vertical authority first. If the raw acceleration vector
+		# already requires more collective than available, scale both lateral
+		# components together before computing the desired angles.
+		max_specific_thrust = G_ACCEL * self._thrust_max / max(self._hover_thrust, 1e-6)
+		lateral_norm = math.hypot(float(roll_accel), float(pitch_accel))
+		max_lateral = math.sqrt(max(0.0, max_specific_thrust**2 - vertical_specific_thrust**2))
+		if lateral_norm > max_lateral and lateral_norm > 1e-12:
+			scale = max_lateral / lateral_norm
+			roll_accel *= scale
+			pitch_accel *= scale
+
+		# Exact inverse of the yaw-aligned thrust-vector geometry, with the
+		# existing roll/pitch channel signs already embedded in the accelerations.
+		desired_roll = math.atan2(
+			float(roll_accel), math.hypot(vertical_specific_thrust, float(pitch_accel))
+		)
+		desired_pitch = math.atan2(float(pitch_accel), vertical_specific_thrust)
+
+		desired_roll = self._soft_limit(desired_roll, self._roll_limit)
+		desired_pitch = self._soft_limit(desired_pitch, self._pitch_limit)
+
 		a = self._command_filter_alpha
-		roll_f = (1.0 - a) * self._previous_roll_cmd + a * roll
-		pitch_f = (1.0 - a) * self._previous_pitch_cmd + a * pitch
-		thrust_f = (1.0 - a) * self._previous_thrust_cmd + a * thrust
+		roll_f = (1.0 - a) * self._previous_roll_cmd + a * desired_roll
+		pitch_f = (1.0 - a) * self._previous_pitch_cmd + a * desired_pitch
+		vertical_f = (
+			(1.0 - a) * self._previous_vertical_thrust_component
+			+ a * vertical_component
+		)
 
 		if self._enable_slew_rate_limits:
-			roll_s = self._slew_limit(self._previous_roll_cmd, roll_f, self._roll_slew_rate_rad_s * dt)
-			pitch_s = self._slew_limit(self._previous_pitch_cmd, pitch_f, self._pitch_slew_rate_rad_s * dt)
-			thrust_s = self._slew_limit(self._previous_thrust_cmd, thrust_f, self._thrust_slew_rate_per_s * dt)
+			roll_s = self._slew_limit(
+				self._previous_roll_cmd, roll_f, self._roll_slew_rate_rad_s * dt
+			)
+			pitch_s = self._slew_limit(
+				self._previous_pitch_cmd, pitch_f, self._pitch_slew_rate_rad_s * dt
+			)
+			# The thrust slew rate now applies to the requested vertical component.
+			vertical_s = self._slew_limit(
+				self._previous_vertical_thrust_component,
+				vertical_f,
+				self._thrust_slew_rate_per_s * dt,
+			)
 		else:
 			roll_s = roll_f
 			pitch_s = pitch_f
-			thrust_s = thrust_f
+			vertical_s = vertical_f
 
 		roll_s = self._clamp(roll_s, -self._roll_limit, self._roll_limit)
 		pitch_s = self._clamp(pitch_s, -self._pitch_limit, self._pitch_limit)
-		thrust_s = self._clamp(thrust_s, self._thrust_min, self._thrust_max)
+		vertical_s = self._clamp(vertical_s, self._thrust_min, self._thrust_max)
+
+		# Tilt compensation: keep the shaped vertical thrust component unchanged.
+		roll_s, pitch_s = self._fit_tilt_to_collective_limit(
+			roll_s, pitch_s, vertical_s, self._thrust_max
+		)
+		cos_tilt = max(1e-6, math.cos(roll_s) * math.cos(pitch_s))
+		thrust_s = self._clamp(vertical_s / cos_tilt, self._thrust_min, self._thrust_max)
 
 		self._previous_roll_cmd = roll_s
 		self._previous_pitch_cmd = pitch_s
+		self._previous_vertical_thrust_component = vertical_s
 		self._previous_thrust_cmd = thrust_s
 		return roll_s, pitch_s, thrust_s
+
+	@staticmethod
+	def _fit_tilt_to_collective_limit(
+		roll: float,
+		pitch: float,
+		vertical_component: float,
+		collective_limit: float,
+	):
+		"""Uniformly reduce tilt until vertical/cos(roll)/cos(pitch) fits.
+
+		This is the explicit authority boundary created by unified allocation:
+		vertical control is prioritized, and lateral acceleration is sacrificed
+		only when the available total thrust cannot realize both simultaneously.
+		"""
+		vertical_component = max(0.0, float(vertical_component))
+		collective_limit = max(vertical_component, float(collective_limit))
+
+		def required(scale: float) -> float:
+			denom = max(
+				1e-9,
+				math.cos(scale * float(roll)) * math.cos(scale * float(pitch)),
+			)
+			return vertical_component / denom
+
+		if required(1.0) <= collective_limit + 1e-12:
+			return float(roll), float(pitch)
+
+		low, high = 0.0, 1.0
+		for _ in range(28):
+			mid = 0.5 * (low + high)
+			if required(mid) <= collective_limit:
+				low = mid
+			else:
+				high = mid
+		return low * float(roll), low * float(pitch)
 
 	def _divergence_for_control(self, flow: FlowResult) -> float:
 		"""Blend filtered and raw divergence: (1-w) d_filt + w d_raw."""
