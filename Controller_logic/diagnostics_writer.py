@@ -65,7 +65,7 @@ class _AsyncCsvSink:
 
 
 class DiagnosticsWriter:
-	CONTROLLER_SCHEMA_VERSION = "4.7-controller"
+	CONTROLLER_SCHEMA_VERSION = "4.9-controller"
 	TRUTH_LOG_SCHEMA_VERSION = "1.0-truth-log"
 
 	def __init__(self, output_dir="logs", filename=None, *,
@@ -252,11 +252,36 @@ class DiagnosticsWriter:
 		]
 		mission = [
 			"substate", "divergence_setpoint_1_s", "thrust_gain_k",
-			"lateral_p_scale", "lateral_d_scale", "enable_integral", "peak_accel_m_s2",
+			"lateral_p_scale", "lateral_d_scale",
+			"roll_p_scale", "roll_d_scale", "pitch_p_scale", "pitch_d_scale",
+			"enable_integral", "peak_accel_m_s2",
+			"roll_peak_accel_m_s2", "pitch_peak_accel_m_s2",
 			"k_min", "k_explore", "k_probe", "k_floor", "k_ceiling_leg",
-			"h_crit_m", "h_pred_m", "feasible", "probe_phase",
+			"h_crit_m", "h_pred_m", "vertical_feasible", "roll_feasible",
+			"pitch_feasible", "feasible", "roll_k_min", "pitch_k_min",
+			"roll_k_probe", "pitch_k_probe", "roll_k_applied", "pitch_k_applied",
+			"roll_k_target", "pitch_k_target", "roll_k_floor", "pitch_k_floor",
+			"roll_k_touchdown", "pitch_k_touchdown", "roll_k_ceiling_leg",
+			"pitch_k_ceiling_leg", "roll_k_ceiling_probe",
+			"pitch_k_ceiling_probe",
+			"vertical_accel_capacity_floor_m_s2",
+			"vertical_accel_capacity_ceiling_m_s2",
+			"roll_accel_capacity_floor_m_s2",
+			"roll_accel_capacity_ceiling_m_s2",
+			"pitch_accel_capacity_floor_m_s2",
+			"pitch_accel_capacity_ceiling_m_s2",
+			"vertical_window_exists", "roll_window_exists", "pitch_window_exists",
+			"roll_probe_within_ceiling", "pitch_probe_within_ceiling",
+			"infeasible_reason", "probe_phase",
 			"probe_accel_m_s2", "probe_mean_accel_m_s2",
 			"probe_residual_accel_m_s2", "probe_percentile_accel_m_s2",
+			"probe_peak_accel_at_handoff_m_s2",
+			"roll_probe_accel_m_s2", "roll_probe_mean_accel_m_s2",
+			"roll_probe_residual_accel_m_s2", "roll_probe_percentile_accel_m_s2",
+			"roll_probe_peak_accel_at_handoff_m_s2",
+			"pitch_probe_accel_m_s2", "pitch_probe_mean_accel_m_s2",
+			"pitch_probe_residual_accel_m_s2", "pitch_probe_percentile_accel_m_s2",
+			"pitch_probe_peak_accel_at_handoff_m_s2",
 		]
 		timing = [
 			"camera_receipt_wall_timestamp_sec",

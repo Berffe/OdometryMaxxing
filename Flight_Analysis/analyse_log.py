@@ -329,12 +329,24 @@ def _shade_phases(ax, data_or_intervals, labels=True):
 		)
 
 
-def _finish_figure(fig: plt.Figure, axes: Iterable[plt.Axes], data: AnalysisData, path: Path) -> None:
+def _finish_figure(
+	fig: plt.Figure,
+	axes: Iterable[plt.Axes],
+	data: AnalysisData,
+	path: Path,
+	*,
+	x_end: Optional[float] = None,
+) -> None:
 	axes = list(axes)
+	plot_end = (
+		max(0.0, data.t1 - data.t0)
+		if x_end is None
+		else max(0.0, float(x_end))
+	)
 	for i, ax in enumerate(axes):
 		ax.grid(True, alpha=0.25)
 		_shade_phases(ax, data, labels=(i == 0))
-		ax.set_xlim(0.0, max(0.0, data.t1 - data.t0))
+		ax.set_xlim(0.0, plot_end)
 	fig.tight_layout()
 	fig.savefig(path, dpi=170, bbox_inches="tight")
 	plt.close(fig)
@@ -344,6 +356,27 @@ def _legend(ax: plt.Axes, *, loc: str = "best", ncol: int = 1) -> None:
 	handles, labels = ax.get_legend_handles_labels()
 	if handles:
 		ax.legend(loc=loc, ncol=ncol, framealpha=0.92)
+
+
+def _last_finite_value(df: pd.DataFrame, column: str) -> float:
+	values = _num(df, column).to_numpy(float)
+	values = values[np.isfinite(values)]
+	return float(values[-1]) if values.size else np.nan
+
+
+def _probe_plot_end_sim_time(data: AnalysisData) -> float:
+	"""First DESCENT/INFEASIBLE timestamp, or the analysed end if neither occurs."""
+	df = data.controller
+	if df.empty or "mission_substate" not in df.columns:
+		return float(data.t1)
+
+	phase = _clean_string(df["mission_substate"])
+	times = _num(df, "_sim_time").to_numpy(float)
+	terminal = phase.isin(["descend", "infeasible"]).to_numpy()
+	valid = terminal & np.isfinite(times)
+	if not np.any(valid):
+		return float(data.t1)
+	return min(float(data.t1), float(np.min(times[valid])))
 
 
 def plot_detections_boxes_fov(data: AnalysisData, out: Path) -> None:
@@ -401,9 +434,9 @@ def plot_drone_platform_position(data: AnalysisData, out: Path) -> None:
 def plot_gain_schedule(data: AnalysisData, out: Path) -> None:
 	c = data.control
 	t = _relative_time(c["_sim_time"], data.t0)
-	truth_h = _interp_truth(data, "truth_min_pad_signed_distance_m", c["_sim_time"].to_numpy(float))
 	fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
 
+	# Vertical gain: retain the existing upper panel.
 	axes[0].plot(t, _num(c, "mission_thrust_gain_k"), label="Applied vertical gain K")
 	for col, label, style in [
 		("mission_k_min", "Estimated disturbance floor", "--"),
@@ -413,23 +446,38 @@ def plot_gain_schedule(data: AnalysisData, out: Path) -> None:
 		y = _num(c, col)
 		if np.isfinite(y).any():
 			axes[0].plot(t, y, linestyle=style, label=label)
-	axes[0].set_ylabel("Gain K")
+	axes[0].set_ylabel("Vertical gain K")
 	axes[0].set_title("Mission gain schedule")
 	_legend(axes[0], ncol=2)
 
-	axes[1].plot(t, _num(c, "mission_lateral_p_scale"), label="Lateral P scale")
-	axes[1].plot(t, _num(c, "mission_lateral_d_scale"), label="Lateral D scale")
-	axes[1].set_ylabel("Scale")
-	_legend(axes[1], ncol=2)
+	def plot_lateral_axis(ax: plt.Axes, axis: str) -> None:
+		prefix = f"mission_{axis}"
+		applied = _num(c, f"{prefix}_k_applied")
+		if np.isfinite(applied).any():
+			ax.plot(t, applied, label=f"Applied {axis} D gain")
 
-	axes[2].plot(t, truth_h, label="True minimum skid clearance")
-	pred = _num(c, "mission_h_pred_m")
-	if np.isfinite(pred).any():
-		axes[2].plot(t, pred, label="Mission open-loop height prediction")
-	axes[2].axhline(0.0, linestyle="--", linewidth=1.0, label="Contact plane")
-	axes[2].set_ylabel("Height [m]")
+		for suffix, label, style in [
+			("k_min", "Estimated disturbance floor", "--"),
+			("k_floor", "Scheduled floor", "-."),
+			("k_ceiling_leg", "Touchdown stability ceiling", ":"),
+		]:
+			y = _num(c, f"{prefix}_{suffix}")
+			if np.isfinite(y).any():
+				ax.plot(t, y, linestyle=style, label=label)
+
+		# Compatibility fallback for older logs without independent-axis gains.
+		if not np.isfinite(applied).any():
+			legacy = _num(c, "mission_lateral_d_scale")
+			if np.isfinite(legacy).any():
+				ax.plot(t, legacy, label=f"{axis.capitalize()} D scale (legacy log)")
+
+		ax.set_ylabel(f"{axis.capitalize()} D gain")
+		_legend(ax, ncol=2)
+
+	plot_lateral_axis(axes[1], "roll")
+	plot_lateral_axis(axes[2], "pitch")
 	axes[2].set_xlabel("Time since common log start [s SIM]")
-	_legend(axes[2], ncol=2)
+
 	_finish_figure(fig, axes, data, out / "gain_schedule.png")
 
 
@@ -462,38 +510,146 @@ def plot_lateral_control(data: AnalysisData, out: Path) -> None:
 	_finish_figure(fig, axes, data, out / "lateral_control.png")
 
 
-def plot_probe_acceleration(data: AnalysisData, out: Path) -> None:
-	c = data.control
+def _plot_probe_axis(
+	data: AnalysisData,
+	out: Path,
+	*,
+	axis_name: str,
+	truth_axis: str,
+	truth_sign: float,
+	probe_prefix: str,
+	peak_column: str,
+	capacity_floor_column: str,
+	capacity_ceiling_column: str,
+	filename: str,
+) -> None:
+	"""Plot one acceleration probe using the same layout for all three axes.
+
+	The camera/control channels do not coincide with the Gazebo world axes:
+	image-x drives roll, which accelerates the vehicle along world Y; image-y
+	drives pitch, which accelerates it along world X.  PX4's positive roll and
+	pitch command conventions produce the opposite sign to the corresponding
+	Gazebo world acceleration, hence the explicit ``truth_sign`` mapping.
+	"""
+	c_all = data.control
+	probe_end_sim = _probe_plot_end_sim_time(data)
+
+	# Keep only samples strictly before the terminal feasibility decision. The
+	# gate capacities are read from c_all below because they may first appear on
+	# the transition row itself.
+	if probe_end_sim < data.t1 - 1e-9:
+		c = c_all[c_all["_sim_time"] < probe_end_sim].copy()
+	else:
+		c = c_all.copy()
+
 	t = _relative_time(c["_sim_time"], data.t0)
 	tc = c["_sim_time"].to_numpy(float)
-	drone_az = _interp_truth(data, "truth_drone_linear_acceleration_z_m_s2", tc)
-	platform_az = _interp_truth(data, "truth_platform_linear_acceleration_z_m_s2", tc)
-	relative_az = drone_az - platform_az
+
+	drone_accel = _interp_truth(
+		data, f"truth_drone_linear_acceleration_{truth_axis}_m_s2", tc
+	)
+	platform_accel = _interp_truth(
+		data, f"truth_platform_linear_acceleration_{truth_axis}_m_s2", tc
+	)
+	relative_accel = float(truth_sign) * (drone_accel - platform_accel)
+	truth_label = f"True {axis_name.lower()} relative acceleration"
 
 	fig, axes = plt.subplots(2, 1, figsize=(13, 7), sharex=True)
-	axes[0].plot(t, _num(c, "mission_probe_accel_m_s2"), label="Command-derived probe acceleration")
-	if np.isfinite(relative_az).any():
-		axes[0].plot(t, relative_az, alpha=0.72, label="True vertical relative acceleration")
+	axes[0].plot(
+		t,
+		_num(c, f"mission_{probe_prefix}_accel_m_s2"),
+		label=f"Command-derived {axis_name.lower()} probe acceleration",
+	)
+	if np.isfinite(relative_accel).any():
+		axes[0].plot(t, relative_accel, alpha=0.72, label=truth_label)
 	axes[0].set_ylabel("Acceleration [m/s²]")
-	axes[0].set_title("Probe disturbance estimate versus Gazebo truth")
+	axes[0].set_title(f"{axis_name} probe disturbance estimate versus Gazebo truth")
 	_legend(axes[0], ncol=2)
 
 	for col, label, style in [
-		("mission_probe_mean_accel_m_s2", "Probe mean", "-"),
-		("mission_probe_residual_accel_m_s2", "Probe residual", "--"),
-		("mission_probe_percentile_accel_m_s2", "Probe percentile", ":"),
-		("mission_peak_accel_m_s2", "Peak used by gate", "-."),
+		(f"mission_{probe_prefix}_mean_accel_m_s2", "Probe mean", "-"),
+		(f"mission_{probe_prefix}_residual_accel_m_s2", "Probe residual", "--"),
+		(f"mission_{probe_prefix}_percentile_accel_m_s2", "Probe percentile", ":"),
+		(peak_column, "Peak used by gate", "-."),
 	]:
 		y = _num(c, col)
 		if np.isfinite(y).any():
 			axes[1].plot(t, y, linestyle=style, label=label)
-			
-	if np.isfinite(relative_az).any():
-		axes[1].plot(t, relative_az, alpha=0.52, label="True vertical relative acceleration")
-	axes[1].set_ylabel("Estimator terms [m/s²]")
+
+	if np.isfinite(relative_accel).any():
+		axes[1].plot(t, relative_accel, alpha=0.52, label=truth_label)
+
+	capacity_floor = _last_finite_value(c_all, capacity_floor_column)
+	capacity_ceiling = _last_finite_value(c_all, capacity_ceiling_column)
+	if np.isfinite(capacity_floor):
+		axes[1].axhline(
+			capacity_floor,
+			linestyle="--",
+			linewidth=1.6,
+			label=f"Scheduled-floor capacity: {capacity_floor:.3f} m/s²",
+		)
+	if np.isfinite(capacity_ceiling):
+		axes[1].axhline(
+			capacity_ceiling,
+			linestyle=":",
+			linewidth=1.8,
+			label=f"Stability-ceiling capacity: {capacity_ceiling:.3f} m/s²",
+		)
+	axes[1].set_ylabel("Estimator / capacity [m/s²]")
 	axes[1].set_xlabel("Time since common log start [s SIM]")
 	_legend(axes[1], ncol=2)
-	_finish_figure(fig, axes, data, out / "probe_acceleration.png")
+	_finish_figure(
+		fig,
+		axes,
+		data,
+		out / filename,
+		x_end=probe_end_sim - data.t0,
+	)
+
+
+def plot_probe_vertical(data: AnalysisData, out: Path) -> None:
+	_plot_probe_axis(
+		data,
+		out,
+		axis_name="vertical",
+		truth_axis="z",
+		truth_sign=1.0,
+		probe_prefix="probe",
+		peak_column="mission_peak_accel_m_s2",
+		capacity_floor_column="mission_vertical_accel_capacity_floor_m_s2",
+		capacity_ceiling_column="mission_vertical_accel_capacity_ceiling_m_s2",
+		filename="probe_vertical.png",
+	)
+
+
+def plot_probe_roll(data: AnalysisData, out: Path) -> None:
+	_plot_probe_axis(
+		data,
+		out,
+		axis_name="roll channel (image X -> world Y)",
+		truth_axis="y",
+		truth_sign=-1.0,
+		probe_prefix="roll_probe",
+		peak_column="mission_roll_peak_accel_m_s2",
+		capacity_floor_column="mission_roll_accel_capacity_floor_m_s2",
+		capacity_ceiling_column="mission_roll_accel_capacity_ceiling_m_s2",
+		filename="probe_roll.png",
+	)
+
+
+def plot_probe_pitch(data: AnalysisData, out: Path) -> None:
+	_plot_probe_axis(
+		data,
+		out,
+		axis_name="pitch channel (image Y -> world X)",
+		truth_axis="x",
+		truth_sign=-1.0,
+		probe_prefix="pitch_probe",
+		peak_column="mission_pitch_peak_accel_m_s2",
+		capacity_floor_column="mission_pitch_accel_capacity_floor_m_s2",
+		capacity_ceiling_column="mission_pitch_accel_capacity_ceiling_m_s2",
+		filename="probe_pitch.png",
+	)
 
 
 def plot_vertical_descent(data: AnalysisData, out: Path) -> None:
@@ -507,9 +663,6 @@ def plot_vertical_descent(data: AnalysisData, out: Path) -> None:
 	fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
 	axes[0].plot(t, h_pad, label="True minimum skid clearance")
 	axes[0].plot(t, h_camera, label="True camera-to-deck distance", alpha=0.8)
-	pred = _num(c, "mission_h_pred_m")
-	if np.isfinite(pred).any():
-		axes[0].plot(t, pred, linestyle="--", label="Mission predicted height")
 	axes[0].axhline(0.0, linestyle=":", linewidth=1.0, label="Contact plane")
 	axes[0].set_ylabel("Distance [m]")
 	axes[0].set_title("Vertical descent against Gazebo truth")
@@ -1015,6 +1168,26 @@ def write_summary(data: AnalysisData, out: Path, controller_path: Path, truth_pa
 		if good.sum() >= 3:
 			lines.append(f"Divergence correlation: {np.corrcoef(measured[good], truth_d[good])[0,1]:.4f}")
 
+	# Final three-axis feasibility result and immediate failure explanation.
+	feasible_values = _num(c, "mission_feasible").to_numpy(float)
+	feasible_values = feasible_values[np.isfinite(feasible_values)]
+	if feasible_values.size:
+		lines.extend([
+			"",
+			"Landing feasibility",
+			"-------------------",
+			f"Combined vertical/roll/pitch verdict: {'FEASIBLE' if feasible_values[-1] > 0.5 else 'INFEASIBLE'}",
+		])
+		for axis in ("vertical", "roll", "pitch"):
+			flag = _last_finite_value(c, f"mission_{axis}_feasible")
+			if np.isfinite(flag):
+				lines.append(f"{axis.capitalize()} probe: {'OK' if flag > 0.5 else 'FAILED'}")
+		reasons = c.get("mission_infeasible_reason", pd.Series("", index=c.index))
+		reasons = reasons.fillna("").astype(str).str.strip()
+		reasons = reasons[reasons != ""]
+		if len(reasons):
+			lines.append(f"Reason: {reasons.iloc[-1]}")
+
 	_append_vision_delay_table(data, lines)
 
 	lines += [
@@ -1063,7 +1236,9 @@ def main(argv: Optional[list[str]] = None) -> int:
 		plot_drone_platform_position,
 		plot_gain_schedule,
 		plot_lateral_control,
-		plot_probe_acceleration,
+		plot_probe_vertical,
+		plot_probe_roll,
+		plot_probe_pitch,
 		plot_vertical_descent,
 		plot_vertical_divergence,
 	]

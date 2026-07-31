@@ -1,131 +1,35 @@
 """
-mission_routine.py
+Bio-inspired near-field mission routine.
 
-Bio-inspired near-field mission routine:
+Sequence:
+    CENTER -> APPROACH_PROBE -> FINAL_PROBE -> DESCEND
 
-	CENTER
-	-> APPROACH_PROBE      (slow visual descent while probing -- FAR probe)
-	-> FINAL_PROBE         (near-field D*=0 probe once target saturates -- NEAR probe)
-	-> DESCEND             (final committed landing descent)
+The control law remains in control_law.py. This module selects the divergence
+setpoint, vertical gain, lateral gain scales, integral enable flag, and the final
+landing-feasibility decision.
 
-The control law is still formed only in control_law.py. This module only chooses:
-	- divergence_setpoint
-	- thrust_gain_override
-	- lateral gain scales
-	- whether the divergence integral is enabled
+Three acceleration probes run in parallel from APPROACH_PROBE through
+FINAL_PROBE:
+    - vertical command acceleration;
+    - roll-channel command acceleration;
+    - pitch-channel command acceleration.
 
-All timers use the same clock `t` passed into update(), which bee_node feeds from
-the camera/image timestamp.
+Each probe uses the same de-biasing, rolling-percentile and leaky-peak logic. The
+far-field estimates carry into FINAL_PROBE, where all three probes are retuned to
+the near-field time constants without resetting their accumulated envelopes.
+The final transition requires all three probes to be ready and all three gain
+windows to be feasible.
 
+Vertical feasibility compares the Herisse disturbance-rejection floor with the
+safety-scaled de Croon ceiling at landing-gear height. Roll and pitch feasibility
+use the acceleration-domain lateral bound
 
-ONE CONTINUOUS PROBE, RETUNED AT THE FAR->NEAR HANDOFF
------------------------------------------------------
-The platform's own oscillation is SLOW (measured ~0.055-0.06 Hz -> a period of
-~17-18 s). A short probe cannot resolve it: the near-field D*=0 hold is only
-final_probe_duration_sec long (a fraction of one platform period), and the old
-PlatformProbe forgot an excursion within a few seconds (percentile_window_sec=2,
-peak_decay_tau=3). The previous design -- run a probe, RESET it at the
-FINAL_PROBE transition, gate on what survived -- therefore both discarded the
-entire approach-phase measurement and structurally could not see the slow mode.
+    K_min = c_max / kappa + peak_accel / omega_adm
 
-There is now ONE probe (self._probe), running continuously from APPROACH_PROBE
-entry to the end of FINAL_PROBE, whose TIME CONSTANTS change at the handoff
-(PlatformProbe.retune()) while its ESTIMATE carries through:
+and verify that the planned D gain at touchdown lies below the corresponding
+discrete lateral ceiling. No online height estimate is used.
 
-  FAR field (APPROACH_PROBE): long time constants (far_probe_window_sec /
-      far_probe_decay_tau_sec / far_probe_highpass_tau_sec), sized to the
-      platform period so the probe actually integrates the slow oscillation
-      instead of seeing only its last few seconds.
-
-  HANDOFF (FINAL_PROBE hold start): retune() to the near-field time constants.
-      The accumulated peak is KEPT, not reset; the residual window is dropped
-      (its samples were taken under a different window length, from a different
-      vantage, and under a non-zero D* descent).
-
-  NEAR field (FINAL_PROBE hold): short time constants
-      (near_probe_window_sec / near_probe_decay_tau_sec /
-      near_probe_highpass_tau_sec). Close to the platform the loop synchronizes
-      to the platform's motion far better, so the thrust-command residual is a
-      much more faithful proxy for its true acceleration. These samples are
-      therefore the ones we WANT to dominate the estimate.
-
-The mechanism that makes the near field dominate is the leaky max already in
-update(): peak <- max(fresh_percentile, exp(-dt/peak_decay_tau) * peak). A fresh
-near-field excursion raises the peak immediately, while the carried-over far
-value decays at near_probe_decay_tau_sec. That constant is thus literally "how
-long we keep trusting the far-field number once better data is available", and
-is the main knob for the handoff:
-
-  short (<< hold length) -> the near field is authoritative almost at once, but a
-      hold shorter than the platform period may observe no excursion at all and
-      the estimate can collapse toward zero (optimistic gate -- the unsafe
-      direction);
-  long (~ platform period) -> the far value survives as a floor for the whole
-      hold and is overwritten only where the near field actually measures more.
-
-Default is the latter, deliberately: a probe estimate that is too LOW yields a
-too-low k_min and a too-permissive feasibility gate, so decaying the old estimate
-slowly is the conservative choice.
-
-The gate fires only when the probe is ready in BOTH senses: enough time in the
-near-field hold (final_probe_duration_sec) AND enough total probing across both
-phases (probe_min_duration_sec, ~ one platform period) -- the near hold alone can
-never supply the latter.
-
-
-THE DESCENT GAIN NOW RIDES THE CEILING, NOT THE FLOOR
-----------------------------------------------------
-Two admissible bounds on the thrust gain k in a_cmd = k*(D - D*):
-
-  FLOOR   k_min = peak_accel / D*     (Herisse: enough authority to reject the
-          platform's own acceleration)
-  CEILING k_ceiling(h) = 2*s*h/dt     (de Croon: the safety-scaled stability
-          limit; shrinks with height. This is exactly the inverse of
-          critical_height(), which solves k_ceiling(h_crit) = k_min.)
-
-Feasibility (h_crit <= leg_clearance) is precisely the statement that at leg
-height the ceiling is still at or above the floor, i.e. that a non-empty gain
-window [k_min, k_ceiling(leg)] exists at touchdown.
-
-The OLD schedule decayed k from k_explore toward k_min -- i.e. it asymptotically
-approached the FLOOR of that window. Measured against the actual constants, that
-put the whole descent at a roughly CONSTANT ~6.5% of the de Croon ceiling
-(k(t)/k_ceiling(h) = k_explore*dt/(2*s*h0), height-independent, because k(t) and
-the ceiling both decay proportionally to h).
-
-The NEW schedule instead targets a fixed fraction of the ceiling AT LEG HEIGHT:
-
-  k_ceiling_leg = 2*s*leg_clearance_m / stability_dt_sec
-  k_target      = ceiling_margin * k_ceiling_leg          (ceiling_margin ~ 0.8)
-  k_floor       = max(k_min, k_target)
-  k(t)          = clamp(k_explore * exp(-integral(D*_cmd dt)), k_floor, k_explore)
-
-Rationale (from the Bode analysis): higher gain buys bandwidth, and bandwidth is
-what lets the vertical loop synchronize with the platform's motion at touchdown.
-The exponential decay from k_explore is retained as the TRAJECTORY (it is still a
-smooth, conservative approach that decays faster than the height does), but its
-asymptote is now the near-ceiling k_target rather than the far-more-conservative
-k_min.
-
-Note this is deliberately a CONSTANT per mission attempt, computed once in
-compute_gate(): it depends only on leg_clearance_m (a known airframe number) and
-stability_dt_sec, NOT on the predicted height h_pred. h_pred / h0 / t_crit remain
-DIAGNOSTIC ONLY -- no control path reads them (scheduled_gain_at_time derives its
-decay from elapsed time and D* alone), which is what makes it safe to leave h0
-loosely seeded.
-
-k_min is kept as a hard FLOOR under k_target, not as the target: if a mission is
-feasible but marginal (k_min close to k_ceiling_leg), then ceiling_margin < 1
-could otherwise place k_target BELOW the disturbance-rejection floor. max() makes
-the schedule fall back to the old, safe behavior in exactly that case.
-
-TWO MULTIPLICATIVE SAFETY FACTORS, not one -- keep them distinct when tuning:
-  ceiling_safety_factor (s, ~0.5) : derates the THEORETICAL de Croon instability
-      limit down to a "safety-scaled ceiling". A stability-theory margin.
-  ceiling_margin        (~0.8)    : how close to that ALREADY-DERATED ceiling we
-      are willing to ride. An aggressiveness knob.
-Reading ceiling_margin=0.8 as "80% of the stability limit" is WRONG -- it is 80%
-of 50% of it.
+All timers use the camera/image timestamp supplied as ``t`` to update().
 """
 
 from __future__ import annotations
@@ -139,15 +43,10 @@ from typing import Deque, Optional
 G_ACCEL = 9.80665
 
 CENTER = "center"
-PROBE = "probe"  # kept for old diagnostics / mental model
+PROBE = "probe"
 APPROACH_PROBE = "approach_probe"
 FINAL_PROBE = "final_probe"
-# Terminal state, latched by bee_node via mark_landed() when its touchdown
-# detector fires. Before this existed, mission_substate stayed "descend" for the
-# whole post-touchdown zero-thrust hold: in the last run 1437 of 2065 "descend"
-# rows were actually the vehicle sitting on the platform with thrust=0, which
-# silently poisoned every per-phase statistic and plot computed from the log
-# (descent divergence read 0.012 instead of 0.238, etc).
+# Terminal state, latched by bee_node via mark_landed().
 LANDED = "landed"
 PROBE_HOLD = "probe_hold"
 DESCEND = "descend"
@@ -185,28 +84,12 @@ class ProbeResult:
 
 
 class PlatformProbe:
-	"""Estimate a robust acceleration envelope from thrust-command residuals.
+	"""Estimate a robust acceleration envelope from a command history.
 
-	ONE probe, run CONTINUOUSLY from APPROACH_PROBE entry through the end of
-	FINAL_PROBE. The slow EMA mean removes hover-thrust bias; the leaky rolling-
-	percentile peak is conservative while still privileging recent samples.
-
-	The three time constants are constructor arguments AND can be changed mid-run
-	by retune() -- see that method. They must be sized against the PLATFORM PERIOD
-	(~17-18 s at the measured ~0.055-0.06 Hz), not the control rate:
-
-	  highpass_tau_sec     : EMA time constant of the mean that is subtracted off
-	      (the de-biasing high-pass). Must stay WELL LONGER than the platform
-	      period, or the mean starts tracking -- and therefore cancelling -- the
-	      very oscillation being measured.
-	  percentile_window_sec: length of the rolling window the peak percentile is
-	      taken over. To resolve a slow oscillation this must be comparable to its
-	      PERIOD; the old 2.0 s (against a ~18 s period) could only ever report a
-	      local slice of one cycle.
-	  peak_decay_tau_sec   : leak rate of the held peak -- i.e. the HALF-LIFE OF
-	      TRUST in an old measurement. This is the knob that decides how fast a
-	      far-field estimate is forgotten once better near-field samples start
-	      arriving (see retune()).
+	The EMA removes the slow command bias, the rolling percentile rejects isolated
+	outliers, and the leaky maximum retains the largest recent excursion. The same
+	object can consume normalized thrust through update() or an acceleration
+	directly through update_accel().
 	"""
 
 	def __init__(
@@ -262,38 +145,10 @@ class PlatformProbe:
 		percentile_window_sec: Optional[float] = None,
 		peak_decay_tau_sec: Optional[float] = None,
 	) -> None:
-		"""Switch to near-field time constants WITHOUT discarding the estimate.
+		"""Apply new time constants while preserving the mean and peak.
 
-		This is the far->near handoff, and it is deliberately NOT a reset. What is
-		preserved and what is dropped:
-
-		  KEPT: self._peak -- the accumulated acceleration envelope. It continues to
-		      decay at the (new) peak_decay_tau and can still be raised by fresh
-		      samples, so the far-field estimate remains the working value at the
-		      instant the near-field hold begins and is then progressively
-		      superseded by better data rather than thrown away and re-learned from
-		      zero. This is the whole point: the near-field samples are the more
-		      trustworthy ones (the loop synchronizes far better this close in), so
-		      they should OVERWRITE the far estimate as they arrive -- but a probe
-		      that reset here would spend its first seconds reporting a
-		      spuriously-low peak, and a short near-field window can miss a slow
-		      excursion entirely and never recover it.
-		  KEPT: self._mean -- a valid running bias estimate; it simply adapts faster
-		      under the new (shorter) highpass tau.
-		  DROPPED: the residual window. Its samples were collected under the old
-		      window length and at a different vantage (and, during APPROACH_PROBE,
-		      under a non-zero D* descent); mixing them into a percentile taken over
-		      the new, shorter window would be comparing unlike measurements.
-
-		The rate at which the carried-over far estimate fades is EXACTLY
-		peak_decay_tau_sec: after the retune the old peak is multiplied by
-		exp(-t/tau) each step, so tau is literally "how long we keep trusting the
-		far-field number once near-field data is available". Setting it very short
-		makes the near-field hold authoritative almost immediately (but then a hold
-		shorter than the platform period may see no excursion at all, and the
-		estimate collapses); setting it near the platform period keeps the far value
-		alive as a floor for the whole hold. This is the main tuning knob for the
-		handoff, not an implementation detail.
+		The phase clock and rolling window restart, while the accumulated envelope
+		carries into the near-field probe.
 		"""
 		if highpass_tau_sec is not None:
 			self._tau = max(1e-3, float(highpass_tau_sec))
@@ -314,7 +169,7 @@ class PlatformProbe:
 
 	@property
 	def accel(self) -> float:
-		"""Instantaneous commanded vertical accel implied by the last thrust cmd."""
+		"""Instantaneous commanded acceleration used by the last probe update."""
 		return float(self._last_accel)
 
 	@property
@@ -337,8 +192,13 @@ class PlatformProbe:
 		return float(self._peak_decay_tau)
 
 	def update(self, thrust_cmd: float, dt: float) -> None:
+		"""Update from normalized collective thrust (vertical probe compatibility)."""
+		self.update_accel(self._tm.accel_from_thrust(thrust_cmd), dt)
+
+	def update_accel(self, accel_cmd: float, dt: float) -> None:
+		"""Update directly from a commanded acceleration in m/s^2."""
 		dt = max(1e-3, float(dt))
-		a = self._tm.accel_from_thrust(thrust_cmd)
+		a = float(accel_cmd)
 
 		if not self._has_mean:
 			self._mean = a
@@ -417,7 +277,7 @@ class GateResult:
 	k_min: float = 0.0          # Herisse floor: peak_accel / D*
 	h_crit: float = 0.0         # height at which the safety-scaled ceiling == k_min
 	k_explore: float = 0.0      # hand-tuned exploration gain (schedule's start value)
-	feasible: bool = False      # h_crit <= leg_clearance, i.e. gain window is non-empty at touchdown
+	feasible: bool = False      # landing window exists and FINAL_PROBE gain reaches k_min
 
 	# --- Ceiling-riding descent target (see module docstring). ---
 	k_ceiling_leg: float = 0.0    # de Croon safety-scaled ceiling AT LEG HEIGHT
@@ -428,6 +288,131 @@ class GateResult:
 	                              # The descent continues down from where FINAL_PROBE
 	                              # left the gain; it never jumps back up to the
 	                              # far-field value.
+	accel_capacity_floor: float = 0.0
+	accel_capacity_ceiling: float = 0.0
+	window_exists: bool = False
+	start_above_floor: bool = False
+
+
+@dataclass
+class LateralGateResult:
+	peak_accel: float = 0.0
+	k_min: float = 0.0
+	k_probe: float = 0.0
+	k_touchdown: float = 0.0
+	k_target: float = 0.0
+	k_floor: float = 0.0
+	k_descend_start: float = 0.0
+	k_ceiling_probe: float = 0.0
+	k_ceiling_leg: float = 0.0
+	ceiling_margin: float = 0.0
+	accel_capacity_floor: float = 0.0
+	accel_capacity_ceiling: float = 0.0
+	probe_within_ceiling: bool = False
+	window_exists: bool = False
+	start_above_floor: bool = False
+	floor_within_ceiling: bool = False
+	feasible: bool = False
+
+
+def lateral_ceiling_gain_at_height(
+	height_m: float,
+	control_period_sec: float,
+	kappa: float,
+	max_closing_speed_m_s: float,
+	safety: float = 1.0,
+) -> float:
+	"""Safety-scaled discrete lateral ceiling with bounded closing speed."""
+	s = max(1e-3, float(safety))
+	dt = max(1e-6, float(control_period_sec))
+	kappa = max(1e-6, float(kappa))
+	c_max = max(0.0, float(max_closing_speed_m_s))
+	return max(0.0, 2.0 * s * max(0.0, float(height_m)) / (kappa * dt) - c_max / kappa)
+
+
+def lateral_accel_capacity(
+	gain: float,
+	flow_admissible_norm_s: float,
+	max_closing_speed_m_s: float,
+	kappa: float,
+) -> float:
+	"""Maximum lateral platform acceleration rejected by ``gain``."""
+	omega_adm = max(1e-6, float(flow_admissible_norm_s))
+	kappa = max(1e-6, float(kappa))
+	closing_term = max(0.0, float(max_closing_speed_m_s)) / kappa
+	return omega_adm * max(0.0, float(gain) - closing_term)
+
+
+def compute_lateral_gate(
+	peak_accel: float,
+	flow_admissible_norm_s: float,
+	max_closing_speed_m_s: float,
+	kappa: float,
+	probe_gain: float,
+	near_field_height_m: float,
+	leg_clearance_m: float,
+	control_period_sec: float,
+	ceiling_safety_factor: float = 0.5,
+	ceiling_margin: float = 0.8,
+) -> LateralGateResult:
+	"""Build an independent lateral gain floor and verify its gain window."""
+	kappa = max(1e-6, float(kappa))
+	omega_adm = max(1e-6, float(flow_admissible_norm_s))
+	c_max = max(0.0, float(max_closing_speed_m_s))
+	margin = max(0.0, float(ceiling_margin))
+
+	k_min = c_max / kappa + max(0.0, float(peak_accel)) / omega_adm
+	k_probe = max(0.0, float(probe_gain))
+	k_ceiling_probe = lateral_ceiling_gain_at_height(
+		near_field_height_m, control_period_sec, kappa, c_max,
+		ceiling_safety_factor,
+	)
+	k_ceiling_leg = lateral_ceiling_gain_at_height(
+		leg_clearance_m, control_period_sec, kappa, c_max,
+		ceiling_safety_factor,
+	)
+
+	k_target = margin * k_ceiling_leg
+	k_floor = max(k_min, k_target)
+	# A scheduled floor may never exceed the gain at descent entry: the
+	# trajectory is a monotone decay from the FINAL_PROBE gain.
+	k_floor = min(k_floor, k_probe) if k_probe > 0.0 else k_floor
+	k_touchdown = k_floor
+
+	probe_within_ceiling = k_probe <= k_ceiling_probe
+	window_exists = k_min <= k_ceiling_leg
+	start_above_floor = k_probe >= k_min
+	floor_within_ceiling = k_floor <= k_ceiling_leg
+	feasible = (
+		probe_within_ceiling
+		and window_exists
+		and start_above_floor
+		and floor_within_ceiling
+	)
+
+	return LateralGateResult(
+		peak_accel=max(0.0, float(peak_accel)),
+		k_min=float(k_min),
+		k_probe=float(k_probe),
+		k_touchdown=float(k_touchdown),
+		k_target=float(k_target),
+		k_floor=float(k_floor),
+		k_descend_start=float(k_probe),
+		k_ceiling_probe=float(k_ceiling_probe),
+		k_ceiling_leg=float(k_ceiling_leg),
+		ceiling_margin=float(margin),
+		accel_capacity_floor=lateral_accel_capacity(
+			k_floor, omega_adm, c_max, kappa
+		),
+		accel_capacity_ceiling=lateral_accel_capacity(
+			k_ceiling_leg, omega_adm, c_max, kappa
+		),
+		probe_within_ceiling=bool(probe_within_ceiling),
+		window_exists=bool(window_exists),
+		start_above_floor=bool(start_above_floor),
+		floor_within_ceiling=bool(floor_within_ceiling),
+		feasible=bool(feasible),
+	)
 
 
 def critical_height(k_min: float, control_period_sec: float, safety: float = 1.0) -> float:
@@ -484,7 +469,6 @@ def compute_gate(
 	k_min = max(0.0, float(peak_accel)) / d_star
 	h_crit = critical_height(k_min, control_period_sec, s)
 	k_explore = max(0.0, float(initial_thrust_gain))
-	feasible = h_crit <= float(leg_clearance_m)
 
 	k_ceiling_leg = ceiling_gain_at_height(leg_clearance_m, control_period_sec, s)
 	k_target = margin * k_ceiling_leg
@@ -493,6 +477,9 @@ def compute_gate(
 	# from the far-field k_explore -- the gain has already been walked down the
 	# ceiling during the approach and must not step back up.
 	k_start = float(k_explore if descend_start_gain is None else descend_start_gain)
+	window_exists = h_crit <= float(leg_clearance_m)
+	start_above_floor = k_start >= k_min
+	feasible = window_exists and start_above_floor
 
 	# Never below the Herisse floor, and never above the gain the schedule starts
 	# from (it only ever decays -- a k_floor above the start would turn the
@@ -510,6 +497,10 @@ def compute_gate(
 		k_floor=float(k_floor),
 		ceiling_margin=float(margin),
 		k_descend_start=k_start,
+		accel_capacity_floor=float(d_star * k_floor),
+		accel_capacity_ceiling=float(d_star * k_ceiling_leg),
+		window_exists=bool(window_exists),
+		start_above_floor=bool(start_above_floor),
 	)
 
 
@@ -554,9 +545,8 @@ def scheduled_gain_at_time(
 	Depends only on elapsed time and the commanded D* -- NOT on any height
 	estimate. h_pred/h0 stay diagnostic-only.
 
-	(The old `safety` argument is gone: it was never used here -- `_ = safety` --
-	because the ceiling played no part in the schedule. It now enters through
-	k_floor, which compute_gate() derives using it.)
+	The ceiling margin enters through k_floor, which compute_gate() derives from
+	the known landing-gear height and the stability period.
 	"""
 	exponent = commanded_divergence_integral(
 		elapsed_sec, descent_divergence_setpoint, d_star_ramp_in_sec
@@ -617,6 +607,10 @@ class MissionControl:
 	thrust_gain_override: Optional[float] = None
 	lateral_p_scale: float = 1.0
 	lateral_d_scale: float = 1.0
+	roll_p_scale: Optional[float] = None
+	roll_d_scale: Optional[float] = None
+	pitch_p_scale: Optional[float] = None
+	pitch_d_scale: Optional[float] = None
 	enable_integral: bool = True
 	substate: str = CENTER
 	info: dict = field(default_factory=dict)
@@ -639,13 +633,23 @@ class MissionRoutine:
 		ceiling_safety_factor: float = 0.5,
 		stability_dt_sec: Optional[float] = 1.0 / 30.0,
 		initial_thrust_gain: float = 6.5,
+		roll_d_gain: float = 3.5,
+		pitch_d_gain: float = 3.5,
+		roll_kappa: float = 1.0,
+		pitch_kappa: float = 1.0,
+		roll_flow_admissible_norm_s: float = 0.25,
+		pitch_flow_admissible_norm_s: float = 0.25,
+		max_closing_speed_m_s: float = 0.20,
 		# --- Descent gain target: ride the ceiling at leg height, not the floor. ---
 		# k(t) decays from k_explore toward max(k_min, ceiling_margin *
 		# k_ceiling_leg) instead of toward k_min. 0.8 = settle at 80% of the
 		# ALREADY-safety-derated ceiling (see module docstring: this is the second
 		# of two multiplicative margins, not the only one).
 		ceiling_margin: float = 0.8,
-		probe_accel_margin_m_s2: float = 0.05,
+		probe_vert_accel_margin_m_s2: float = 0.05,
+		probe_roll_accel_margin_m_s2: float = 0.01,
+		probe_pitch_accel_margin_m_s2: float = 0.01,
+
 		probe_attenuation_comp: float = 1.2,
 		# Height at which the near-field trigger (FOV saturation / area_fraction)
 		# actually fires. This is the ANCHOR for the whole gain schedule -- see
@@ -710,6 +714,13 @@ class MissionRoutine:
 
 		self._safety = max(1e-3, min(1.0, float(ceiling_safety_factor)))
 		self._initial_thrust_gain = max(0.0, float(initial_thrust_gain))
+		self._roll_d_gain = max(0.0, float(roll_d_gain))
+		self._pitch_d_gain = max(0.0, float(pitch_d_gain))
+		self._roll_kappa = max(1e-6, float(roll_kappa))
+		self._pitch_kappa = max(1e-6, float(pitch_kappa))
+		self._roll_flow_admissible = max(1e-6, float(roll_flow_admissible_norm_s))
+		self._pitch_flow_admissible = max(1e-6, float(pitch_flow_admissible_norm_s))
+		self._max_closing_speed = max(0.0, float(max_closing_speed_m_s))
 		self._ceiling_margin = max(0.0, float(ceiling_margin))
 		self._near_field_height = max(1e-3, float(near_field_height_m))
 
@@ -734,17 +745,29 @@ class MissionRoutine:
 
 		self._tm = ThrustModel(hover_thrust)
 
-		# ONE probe for the whole mission. Built with the FAR-field time constants;
-		# retune()d in place to the NEAR-field ones at FINAL_PROBE hold start, which
-		# keeps the accumulated estimate and lets the better near-field samples
-		# progressively supersede it. It is never reset mid-mission -- that reset is
-		# exactly what used to throw the entire approach-phase measurement away.
+		# Three parallel probes share the same far/near timing design.
 		self._probe = PlatformProbe(
 			self._tm,
 			highpass_tau_sec=float(far_probe_highpass_tau_sec),
 			percentile_window_sec=float(far_probe_window_sec),
 			peak_decay_tau_sec=float(far_probe_decay_tau_sec),
-			accel_margin=float(probe_accel_margin_m_s2),
+			accel_margin=float(probe_vert_accel_margin_m_s2),
+			probe_attenuation_comp=float(probe_attenuation_comp),
+		)
+		self._roll_probe = PlatformProbe(
+			self._tm,
+			highpass_tau_sec=float(far_probe_highpass_tau_sec),
+			percentile_window_sec=float(far_probe_window_sec),
+			peak_decay_tau_sec=float(far_probe_decay_tau_sec),
+			accel_margin=float(probe_roll_accel_margin_m_s2),
+			probe_attenuation_comp=float(probe_attenuation_comp),
+		)
+		self._pitch_probe = PlatformProbe(
+			self._tm,
+			highpass_tau_sec=float(far_probe_highpass_tau_sec),
+			percentile_window_sec=float(far_probe_window_sec),
+			peak_decay_tau_sec=float(far_probe_decay_tau_sec),
+			accel_margin=float(probe_pitch_accel_margin_m_s2),
 			probe_attenuation_comp=float(probe_attenuation_comp),
 		)
 		self._far_probe_window = float(far_probe_window_sec)
@@ -756,11 +779,17 @@ class MissionRoutine:
 		self._near_probe_highpass_tau = float(near_probe_highpass_tau_sec)
 
 		self.gate = GateResult()
+		self.roll_gate = LateralGateResult()
+		self.pitch_gate = LateralGateResult()
 		self.probe_result = ProbeResult()
+		self.roll_probe_result = ProbeResult()
+		self.pitch_probe_result = ProbeResult()
 		# peak_accel at the instant of the far->near handoff, frozen for diagnostics:
 		# comparing it against the final peak_accel shows how much the near field
 		# actually revised the far-field estimate (and in which direction).
 		self.peak_accel_at_handoff: Optional[float] = None
+		self.roll_peak_accel_at_handoff: Optional[float] = None
+		self.pitch_peak_accel_at_handoff: Optional[float] = None
 
 		self._substate = CENTER if self._enable_center else APPROACH_PROBE
 		self._t0: Optional[float] = None
@@ -793,15 +822,22 @@ class MissionRoutine:
 		self._t_landed = float(t)
 
 	def reset(self) -> None:
-		self._probe.reset()
-		self._probe.retune(
-			highpass_tau_sec=self._far_probe_highpass_tau,
-			percentile_window_sec=self._far_probe_window,
-			peak_decay_tau_sec=self._far_probe_decay_tau,
-		)
+		for probe in (self._probe, self._roll_probe, self._pitch_probe):
+			probe.reset()
+			probe.retune(
+				highpass_tau_sec=self._far_probe_highpass_tau,
+				percentile_window_sec=self._far_probe_window,
+				peak_decay_tau_sec=self._far_probe_decay_tau,
+			)
 		self.gate = GateResult()
+		self.roll_gate = LateralGateResult()
+		self.pitch_gate = LateralGateResult()
 		self.probe_result = ProbeResult()
+		self.roll_probe_result = ProbeResult()
+		self.pitch_probe_result = ProbeResult()
 		self.peak_accel_at_handoff = None
+		self.roll_peak_accel_at_handoff = None
+		self.pitch_peak_accel_at_handoff = None
 
 		self._substate = CENTER if self._enable_center else APPROACH_PROBE
 		self._t0 = None
@@ -827,28 +863,7 @@ class MissionRoutine:
 		return self._substate
 
 	def probe_telemetry(self) -> dict:
-		"""Per-step probe internals, for the probe-acceleration diagnostic plot.
-
-		peak_accel alone is a slow envelope and hides WHY it sits where it does.
-		These are the quantities it is built from, every step:
-
-		  accel      : commanded vertical accel implied by the thrust command.
-		  mean_accel : the EMA bias being removed (hover trim, plus -- during
-		      APPROACH_PROBE -- the slow contribution of the D*>0 descent itself).
-		  residual   : |accel - mean_accel|, the de-biased signal.
-		  percentile : the rolling-window percentile the envelope chases.
-		  peak       : the leaky-max envelope; what the gate actually consumes.
-
-		Reading the plot: `peak` should sit on top of `residual`'s excursions. If it
-		visibly coasts ABOVE them (decaying, never re-raised), the probe is running
-		on a stale measurement -- either the window is too short to catch the
-		platform's slow swing, or peak_decay_tau is too long. If `mean_accel` is
-		visibly oscillating rather than flat, the highpass tau is short enough to be
-		tracking (and therefore cancelling) the very platform motion being measured.
-
-		`phase` is which set of time constants is live -- the far/near retune is
-		exactly where the estimate is expected to be revised.
-		"""
+		"""Return per-step vertical, roll and pitch probe diagnostics."""
 		active = self._substate in (APPROACH_PROBE, FINAL_PROBE)
 		near = self._t_final_probe_hold_start is not None
 
@@ -873,6 +888,22 @@ class MissionRoutine:
 			"probe_elapsed_sec": self.probe_result.duration_sec,
 			"probe_total_elapsed_sec": self.probe_result.total_duration_sec,
 			"probe_peak_accel_at_handoff": self.peak_accel_at_handoff,
+			"roll_probe_accel": self._roll_probe.accel if active else None,
+			"roll_probe_mean_accel": self._roll_probe.mean_accel if active else None,
+			"roll_probe_residual_accel": self._roll_probe.residual_accel if active else None,
+			"roll_probe_percentile_accel": self._roll_probe.percentile_accel if active else None,
+			"roll_probe_peak_accel": self._roll_probe.peak_accel,
+			"roll_probe_peak_accel_at_handoff": self.roll_peak_accel_at_handoff,
+			"pitch_probe_accel": self._pitch_probe.accel if active else None,
+			"pitch_probe_mean_accel": self._pitch_probe.mean_accel if active else None,
+			"pitch_probe_residual_accel": self._pitch_probe.residual_accel if active else None,
+			"pitch_probe_percentile_accel": self._pitch_probe.percentile_accel if active else None,
+			"pitch_probe_peak_accel": self._pitch_probe.peak_accel,
+			"pitch_probe_peak_accel_at_handoff": self.pitch_peak_accel_at_handoff,
+			"vertical_probe_feasible": self.gate.feasible,
+			"roll_probe_feasible": self.roll_gate.feasible,
+			"pitch_probe_feasible": self.pitch_gate.feasible,
+			"landing_feasible": self.feasible,
 			"k_probe": self._compute_probe_gain(),
 			"near_field_height_m": self._near_field_height,
 		}
@@ -910,7 +941,19 @@ class MissionRoutine:
 
 	@property
 	def feasible(self) -> bool:
-		return self.gate.feasible
+		return self.gate.feasible and self.roll_gate.feasible and self.pitch_gate.feasible
+
+	@property
+	def vertical_feasible(self) -> bool:
+		return bool(self.gate.feasible)
+
+	@property
+	def roll_feasible(self) -> bool:
+		return bool(self.roll_gate.feasible)
+
+	@property
+	def pitch_feasible(self) -> bool:
+		return bool(self.pitch_gate.feasible)
 
 	def update(
 		self,
@@ -925,6 +968,9 @@ class MissionRoutine:
 		flow_valid: bool = False,
 		area_fraction: float = 0.0,
 		fov_saturated: bool = False,
+		last_vertical_accel_cmd: Optional[float] = None,
+		last_roll_accel_cmd: float = 0.0,
+		last_pitch_accel_cmd: float = 0.0,
 	) -> MissionControl:
 		t = float(t)
 		dt = max(1e-3, float(dt))
@@ -951,6 +997,9 @@ class MissionRoutine:
 				t,
 				dt,
 				last_thrust_cmd,
+				last_vertical_accel_cmd,
+				last_roll_accel_cmd,
+				last_pitch_accel_cmd,
 				offset_x,
 				offset_y,
 				target_found,
@@ -959,7 +1008,10 @@ class MissionRoutine:
 			)
 
 		if self._substate == FINAL_PROBE:
-			return self._do_final_probe(t, dt, last_thrust_cmd)
+			return self._do_final_probe(
+				t, dt, last_thrust_cmd,
+				last_vertical_accel_cmd, last_roll_accel_cmd, last_pitch_accel_cmd,
+			)
 
 		if self._substate == PROBE_HOLD:
 			return self._do_probe_hold(t)
@@ -968,6 +1020,118 @@ class MissionRoutine:
 			return self._do_infeasible(t)
 
 		return self._do_descend(t)
+
+	def _update_probes(
+		self,
+		last_thrust_cmd: float,
+		last_vertical_accel_cmd: Optional[float],
+		last_roll_accel_cmd: float,
+		last_pitch_accel_cmd: float,
+		dt: float,
+	) -> None:
+		if last_vertical_accel_cmd is None:
+			self._probe.update(last_thrust_cmd, dt)
+		else:
+			self._probe.update_accel(last_vertical_accel_cmd, dt)
+		self._roll_probe.update_accel(last_roll_accel_cmd, dt)
+		self._pitch_probe.update_accel(last_pitch_accel_cmd, dt)
+
+	def _retune_probes(self) -> None:
+		for probe in (self._probe, self._roll_probe, self._pitch_probe):
+			probe.retune(
+				highpass_tau_sec=self._near_probe_highpass_tau,
+				percentile_window_sec=self._near_probe_window,
+				peak_decay_tau_sec=self._near_probe_decay_tau,
+			)
+
+	def _refresh_probe_results(
+		self,
+		min_duration_sec: float,
+		min_total_duration_sec: float,
+	) -> None:
+		kwargs = dict(
+			min_duration_sec=min_duration_sec,
+			min_total_duration_sec=min_total_duration_sec,
+		)
+		self.probe_result = self._probe.result(**kwargs)
+		self.roll_probe_result = self._roll_probe.result(**kwargs)
+		self.pitch_probe_result = self._pitch_probe.result(**kwargs)
+
+	def _compute_lateral_gates(self) -> None:
+		roll_probe_gain = self._roll_d_gain * self._probe_lateral_d_scale
+		pitch_probe_gain = self._pitch_d_gain * self._probe_lateral_d_scale
+		self.roll_gate = compute_lateral_gate(
+			peak_accel=self.roll_probe_result.peak_accel,
+			flow_admissible_norm_s=self._roll_flow_admissible,
+			max_closing_speed_m_s=self._max_closing_speed,
+			kappa=self._roll_kappa,
+			probe_gain=roll_probe_gain,
+			near_field_height_m=self._near_field_height,
+			leg_clearance_m=self._leg_clearance,
+			control_period_sec=self._stability_dt,
+			ceiling_safety_factor=self._safety,
+			ceiling_margin=self._ceiling_margin,
+		)
+		self.pitch_gate = compute_lateral_gate(
+			peak_accel=self.pitch_probe_result.peak_accel,
+			flow_admissible_norm_s=self._pitch_flow_admissible,
+			max_closing_speed_m_s=self._max_closing_speed,
+			kappa=self._pitch_kappa,
+			probe_gain=pitch_probe_gain,
+			near_field_height_m=self._near_field_height,
+			leg_clearance_m=self._leg_clearance,
+			control_period_sec=self._stability_dt,
+			ceiling_safety_factor=self._safety,
+			ceiling_margin=self._ceiling_margin,
+		)
+
+
+	def _gate_failure_reasons(self) -> list[str]:
+		"""Return concise, axis-specific reasons for an INFEASIBLE decision."""
+		reasons: list[str] = []
+
+		if not self.gate.window_exists:
+			reasons.append(
+				"VERTICAL no gain window: "
+				f"K_min={self.gate.k_min:.3f} > "
+				f"K_ceiling_leg={self.gate.k_ceiling_leg:.3f}"
+			)
+		elif not self.gate.start_above_floor:
+			reasons.append(
+				"VERTICAL FINAL_PROBE gain below floor: "
+				f"K_probe={self.gate.k_descend_start:.3f} < "
+				f"K_min={self.gate.k_min:.3f}"
+			)
+
+		for label, gate in (("ROLL", self.roll_gate), ("PITCH", self.pitch_gate)):
+			if not gate.probe_within_ceiling:
+				reasons.append(
+					f"{label} probe gain above near-field ceiling: "
+					f"K_probe={gate.k_probe:.3f} > "
+					f"K_ceiling_probe={gate.k_ceiling_probe:.3f}"
+				)
+			if not gate.window_exists:
+				reasons.append(
+					f"{label} no gain window: "
+					f"K_min={gate.k_min:.3f} > "
+					f"K_ceiling_leg={gate.k_ceiling_leg:.3f}"
+				)
+			elif not gate.start_above_floor:
+				reasons.append(
+					f"{label} FINAL_PROBE gain below floor: "
+					f"K_probe={gate.k_probe:.3f} < K_min={gate.k_min:.3f}"
+				)
+			elif not gate.floor_within_ceiling:
+				reasons.append(
+					f"{label} scheduled floor above touchdown ceiling: "
+					f"K_floor={gate.k_floor:.3f} > "
+					f"K_ceiling_leg={gate.k_ceiling_leg:.3f}"
+				)
+
+		if not self._enable_descent:
+			reasons.append("DESCENT disabled by configuration")
+
+		return reasons
 
 
 	def _do_center(
@@ -1026,14 +1190,19 @@ class MissionRoutine:
 		)
 
 		if settled or timeout_handoff:
-			self._probe.reset()
-			self._probe.retune(
-				highpass_tau_sec=self._far_probe_highpass_tau,
-				percentile_window_sec=self._far_probe_window,
-				peak_decay_tau_sec=self._far_probe_decay_tau,
-			)
+			for probe in (self._probe, self._roll_probe, self._pitch_probe):
+				probe.reset()
+				probe.retune(
+					highpass_tau_sec=self._far_probe_highpass_tau,
+					percentile_window_sec=self._far_probe_window,
+					peak_decay_tau_sec=self._far_probe_decay_tau,
+				)
 			self.probe_result = ProbeResult()
+			self.roll_probe_result = ProbeResult()
+			self.pitch_probe_result = ProbeResult()
 			self.peak_accel_at_handoff = None
+			self.roll_peak_accel_at_handoff = None
+			self.pitch_peak_accel_at_handoff = None
 			self._t_approach_entry = t
 			self._substate = APPROACH_PROBE
 
@@ -1088,6 +1257,9 @@ class MissionRoutine:
 		t: float,
 		dt: float,
 		last_thrust_cmd: float,
+		last_vertical_accel_cmd: Optional[float],
+		last_roll_accel_cmd: float,
+		last_pitch_accel_cmd: float,
 		offset_x: float,
 		offset_y: float,
 		target_found: bool,
@@ -1133,10 +1305,8 @@ class MissionRoutine:
 			d_star_ramp_in_sec=self._d_star_ramp_in,
 		)
 
-		# FAR-field probing. Unlike the old design this is NOT monitoring-only: the
-		# estimate built here is carried across the handoff into the gate, because
-		# this phase is the only one long enough to resolve the platform's slow
-		# oscillation.
+		# FAR-field probing supplies the long observation interval needed to resolve
+		# the platform motion. The three envelopes carry into FINAL_PROBE.
 		#
 		# CAVEAT, deliberate: k is RAMPING during this phase, so the loop gain that
 		# shapes the thrust-command residual is itself moving, and the far-field
@@ -1146,10 +1316,11 @@ class MissionRoutine:
 		# alternative, dropping the gain before probing starts, would fly the whole
 		# approach far below the ceiling and throw away the bandwidth this design is
 		# built to exploit.
-		self._probe.update(last_thrust_cmd, dt)
-		self.probe_result = self._probe.result(
-			min_duration_sec=0.0, min_total_duration_sec=self._probe_min
+		self._update_probes(
+			last_thrust_cmd, last_vertical_accel_cmd,
+			last_roll_accel_cmd, last_pitch_accel_cmd, dt,
 		)
+		self._refresh_probe_results(0.0, self._probe_min)
 
 		near_field = self._near_field_reached(
 			offset_x=offset_x,
@@ -1163,10 +1334,7 @@ class MissionRoutine:
 			self._substate = FINAL_PROBE
 			self._t_final_probe_entry = t
 			self._t_final_probe_hold_start = None
-			# NOTE: the probe is deliberately NOT reset here -- that reset is exactly
-			# what used to discard the entire approach-phase measurement. It is
-			# retune()d to the near-field time constants at hold start instead (in
-			# _do_final_probe), keeping its accumulated estimate.
+			# All three accumulated envelopes carry into the near-field hold.
 
 			return MissionControl(
 				divergence_setpoint=d_approach_cmd,
@@ -1204,12 +1372,20 @@ class MissionRoutine:
 				"approach_ramp_frac": approach_blend,
 				"lateral_ramp_frac": lateral_blend,
 				"peak_accel": self.probe_result.peak_accel,
+				"roll_peak_accel": self.roll_probe_result.peak_accel,
+				"pitch_peak_accel": self.pitch_probe_result.peak_accel,
 				"probe_elapsed_sec": self.probe_result.total_duration_sec,
 			},
 		)
 
 	def _do_final_probe(
-		self, t: float, dt: float, last_thrust_cmd: float
+		self,
+		t: float,
+		dt: float,
+		last_thrust_cmd: float,
+		last_vertical_accel_cmd: Optional[float],
+		last_roll_accel_cmd: float,
+		last_pitch_accel_cmd: float,
 	) -> MissionControl:
 		if self._t_final_probe_entry is None:
 			self._t_final_probe_entry = t
@@ -1220,6 +1396,11 @@ class MissionRoutine:
 		if self._final_probe_entry_ramp > 1e-9 and entry_elapsed < self._final_probe_entry_ramp:
 			frac = raised_cosine01(entry_elapsed / self._final_probe_entry_ramp)
 			d_cmd = self._approach_d_star * (1.0 - frac)
+			self._update_probes(
+				last_thrust_cmd, last_vertical_accel_cmd,
+				last_roll_accel_cmd, last_pitch_accel_cmd, dt,
+			)
+			self._refresh_probe_results(0.0, self._probe_min)
 
 			return MissionControl(
 				divergence_setpoint=d_cmd,
@@ -1233,35 +1414,33 @@ class MissionRoutine:
 					"k": self._compute_probe_gain(),
 					"final_probe_entry_elapsed_sec": entry_elapsed,
 					"final_probe_entry_ramp_frac": frac,
-					"probe_elapsed_sec": 0.0,
+					"probe_elapsed_sec": self.probe_result.total_duration_sec,
 				},
 			)
 
 		if self._t_final_probe_hold_start is None:
 			self._t_final_probe_hold_start = t
-			# THE HANDOFF. Not a reset: the accumulated far-field peak carries over
-			# and keeps decaying at the new (near-field) peak_decay_tau, so it stays
-			# the working estimate at the instant the hold begins and is then
-			# progressively superseded by the more trustworthy near-field samples.
-			# Only the residual window is dropped (see PlatformProbe.retune()).
+			# Retune all probes together while preserving their far-field envelopes.
 			self.peak_accel_at_handoff = self._probe.peak_accel
-			self._probe.retune(
-				highpass_tau_sec=self._near_probe_highpass_tau,
-				percentile_window_sec=self._near_probe_window,
-				peak_decay_tau_sec=self._near_probe_decay_tau,
-			)
+			self.roll_peak_accel_at_handoff = self._roll_probe.peak_accel
+			self.pitch_peak_accel_at_handoff = self._pitch_probe.peak_accel
+			self._retune_probes()
 
-		self._probe.update(last_thrust_cmd, dt)
+		self._update_probes(
+			last_thrust_cmd, last_vertical_accel_cmd,
+			last_roll_accel_cmd, last_pitch_accel_cmd, dt,
+		)
 		# ready requires BOTH: a full near-field hold, AND enough TOTAL probing
 		# across both phases (~ one platform period) -- the hold alone is far too
 		# short to supply the latter, so this is what keeps a fast FOV saturation
 		# from gating on a fraction of one platform cycle.
-		self.probe_result = self._probe.result(
-			min_duration_sec=self._final_probe_duration,
-			min_total_duration_sec=self._probe_min,
-		)
+		self._refresh_probe_results(self._final_probe_duration, self._probe_min)
 
-		if self.probe_result.ready:
+		if (
+			self.probe_result.ready
+			and self.roll_probe_result.ready
+			and self.pitch_probe_result.ready
+		):
 			self.gate = compute_gate(
 				peak_accel=self.probe_result.peak_accel,
 				descent_divergence_setpoint=self._d_star,
@@ -1272,12 +1451,21 @@ class MissionRoutine:
 				ceiling_margin=self._ceiling_margin,
 				descend_start_gain=self._compute_probe_gain(),
 			)
+			self._compute_lateral_gates()
 
 			if self._probe_only:
 				self._substate = PROBE_HOLD
 				return self._do_probe_hold(t, just_entered=True)
 
-			if self.gate.feasible and self._enable_descent:
+			vertical_probe_ok = self.vertical_feasible
+			roll_probe_ok = self.roll_feasible
+			pitch_probe_ok = self.pitch_feasible
+			if (
+				vertical_probe_ok
+				and roll_probe_ok
+				and pitch_probe_ok
+				and self._enable_descent
+			):
 				self._substate = DESCEND
 				self._t_descend_start = t
 				return self._do_descend(t, just_entered=True)
@@ -1304,7 +1492,11 @@ class MissionRoutine:
 				"event": "final_probe_hold",
 				"k": self._compute_probe_gain(),
 				"peak_accel": self.probe_result.peak_accel,
+				"roll_peak_accel": self.roll_probe_result.peak_accel,
+				"pitch_peak_accel": self.pitch_probe_result.peak_accel,
 				"peak_accel_at_handoff": self.peak_accel_at_handoff,
+				"roll_peak_accel_at_handoff": self.roll_peak_accel_at_handoff,
+				"pitch_peak_accel_at_handoff": self.pitch_peak_accel_at_handoff,
 				"hold_elapsed_sec": self.probe_result.duration_sec,
 				"probe_total_elapsed_sec": self.probe_result.total_duration_sec,
 				"hold_min_sec": self._final_probe_duration,
@@ -1316,10 +1508,8 @@ class MissionRoutine:
 	def _do_descend(self, t: float, just_entered: bool = False) -> MissionControl:
 		elapsed = t - (self._t_descend_start if self._t_descend_start is not None else t)
 
-		# k now decays toward gate.k_floor = max(k_min, ceiling_margin *
-		# k_ceiling_leg) -- i.e. it settles just under the de Croon ceiling at leg
-		# height (bandwidth/synchronization at touchdown) instead of sinking to the
-		# Herisse floor. The exponential trajectory itself is unchanged.
+		# Each translational axis now follows the same exponential trajectory but
+		# keeps its own independently probed disturbance floor.
 		k = scheduled_gain_at_time(
 			elapsed_sec=elapsed,
 			descent_divergence_setpoint=self._d_star,
@@ -1327,13 +1517,39 @@ class MissionRoutine:
 			k_explore=self.gate.k_descend_start,
 			d_star_ramp_in_sec=self._d_star_ramp_in,
 		)
+		roll_k = scheduled_gain_at_time(
+			elapsed_sec=elapsed,
+			descent_divergence_setpoint=self._d_star,
+			k_floor=self.roll_gate.k_floor,
+			k_explore=self.roll_gate.k_descend_start,
+			d_star_ramp_in_sec=self._d_star_ramp_in,
+		)
+		pitch_k = scheduled_gain_at_time(
+			elapsed_sec=elapsed,
+			descent_divergence_setpoint=self._d_star,
+			k_floor=self.pitch_gate.k_floor,
+			k_explore=self.pitch_gate.k_descend_start,
+			d_star_ramp_in_sec=self._d_star_ramp_in,
+		)
 
-		# Normalize on the DESCENT'S OWN start gain (k_probe), not k_explore, so the
-		# lateral scale is 1.0 at DESCEND entry and hands over continuously from
-		# FINAL_PROBE's probe_lateral_* scales. Normalizing on k_explore would make
-		# the lateral gains step DOWN discontinuously the instant descent begins,
-		# purely because the vertical gain had already been walked down the ceiling.
-		scale = (k / self.gate.k_descend_start) if self.gate.k_descend_start > 1e-9 else 1.0
+		roll_ratio = (
+			roll_k / self.roll_gate.k_descend_start
+			if self.roll_gate.k_descend_start > 1e-9 else 1.0
+		)
+		pitch_ratio = (
+			pitch_k / self.pitch_gate.k_descend_start
+			if self.pitch_gate.k_descend_start > 1e-9 else 1.0
+		)
+		roll_p_scale = self._probe_lateral_p_scale * roll_ratio
+		roll_d_scale = self._probe_lateral_d_scale * roll_ratio
+		pitch_p_scale = self._probe_lateral_p_scale * pitch_ratio
+		pitch_d_scale = self._probe_lateral_d_scale * pitch_ratio
+
+		# Legacy shared fields remain populated for compatibility and represent the
+		# most demanding active lateral axis. ControlLaw receives the specific
+		# per-axis fields below.
+		lateral_p_scale = max(roll_p_scale, pitch_p_scale)
+		lateral_d_scale = max(roll_d_scale, pitch_d_scale)
 		h_pred = predicted_height(self._h0, self._d_star, elapsed, self._d_star_ramp_in)
 
 		if self._d_star_ramp_in <= 1e-9:
@@ -1347,33 +1563,44 @@ class MissionRoutine:
 		return MissionControl(
 			divergence_setpoint=d_star_cmd,
 			thrust_gain_override=k,
-			lateral_p_scale=self._probe_lateral_p_scale * scale,
-			lateral_d_scale=self._probe_lateral_d_scale * scale,
+			lateral_p_scale=lateral_p_scale,
+			lateral_d_scale=lateral_d_scale,
+			roll_p_scale=roll_p_scale,
+			roll_d_scale=roll_d_scale,
+			pitch_p_scale=pitch_p_scale,
+			pitch_d_scale=pitch_d_scale,
 			enable_integral=False,
 			substate=DESCEND,
 			info={
 				"just_entered": just_entered,
 				"event": "descent_start" if just_entered else "",
-				# DIAGNOSTIC ONLY -- h_pred/h0/t_crit are never read by any control
-				# path (scheduled_gain_at_time derives its decay from elapsed time
-				# and D* alone), which is what makes a loosely-seeded h0 harmless.
 				"h_pred": h_pred,
 				"k": k,
-				"lateral_scale": scale,
-				"lateral_p_scale": self._probe_lateral_p_scale * scale,
-				"lateral_d_scale": self._probe_lateral_d_scale * scale,
 				"k_min": self.gate.k_min,
 				"k_floor": self.gate.k_floor,
 				"k_target": self.gate.k_target,
 				"k_ceiling_leg": self.gate.k_ceiling_leg,
-				"ceiling_margin": self.gate.ceiling_margin,
-				"k_over_ceiling_leg": (
-					k / self.gate.k_ceiling_leg
-					if self.gate.k_ceiling_leg > 1e-9 else 0.0
-				),
 				"k_explore": self.gate.k_explore,
 				"k_descend_start": self.gate.k_descend_start,
 				"h_crit": self.gate.h_crit,
+				"vertical_accel_capacity_floor": self.gate.accel_capacity_floor,
+				"vertical_accel_capacity_ceiling": self.gate.accel_capacity_ceiling,
+				"roll_k": roll_k,
+				"roll_k_floor": self.roll_gate.k_floor,
+				"roll_k_target": self.roll_gate.k_target,
+				"roll_k_ceiling_leg": self.roll_gate.k_ceiling_leg,
+				"roll_accel_capacity_floor": self.roll_gate.accel_capacity_floor,
+				"roll_accel_capacity_ceiling": self.roll_gate.accel_capacity_ceiling,
+				"pitch_k": pitch_k,
+				"pitch_k_floor": self.pitch_gate.k_floor,
+				"pitch_k_target": self.pitch_gate.k_target,
+				"pitch_k_ceiling_leg": self.pitch_gate.k_ceiling_leg,
+				"pitch_accel_capacity_floor": self.pitch_gate.accel_capacity_floor,
+				"pitch_accel_capacity_ceiling": self.pitch_gate.accel_capacity_ceiling,
+				"roll_p_scale": roll_p_scale,
+				"roll_d_scale": roll_d_scale,
+				"pitch_p_scale": pitch_p_scale,
+				"pitch_d_scale": pitch_d_scale,
 				"elapsed_sec": elapsed,
 				"t_crit_sec": critical_time(
 					self._h0,
@@ -1401,10 +1628,15 @@ class MissionRoutine:
 				"just_entered": just_entered,
 				"probe_only": True,
 				"peak_accel": self.probe_result.peak_accel,
+				"roll_peak_accel": self.roll_probe_result.peak_accel,
+				"pitch_peak_accel": self.pitch_probe_result.peak_accel,
 				"k_min": self.gate.k_min,
 				"h_crit": self.gate.h_crit,
 				"k_explore": self.gate.k_explore,
-				"feasible_if_descended": self.gate.feasible,
+				"vertical_feasible": self.vertical_feasible,
+				"roll_feasible": self.roll_feasible,
+				"pitch_feasible": self.pitch_feasible,
+				"feasible_if_descended": self.feasible,
 				"leg_clearance_m": self._leg_clearance,
 			},
 		)
@@ -1429,16 +1661,18 @@ class MissionRoutine:
 				"event": "landed",
 				"landed_since_sec": (t - self._t_landed) if self._t_landed is not None else 0.0,
 				"peak_accel": self.probe_result.peak_accel,
+				"roll_peak_accel": self.roll_probe_result.peak_accel,
+				"pitch_peak_accel": self.pitch_probe_result.peak_accel,
 				"k_min": self.gate.k_min,
 				"k_floor": self.gate.k_floor,
-				"feasible": self.gate.feasible,
+				"feasible": self.feasible,
 			},
 		)
 
 	def _do_infeasible(self, t: float, just_entered: bool = False) -> MissionControl:
-		# Abort hold, still in the near field -- so it holds k_probe, not k_explore.
-		# An abort that parked the vehicle above the stability ceiling would be a
-		# strange way to be safe.
+		# Active visual hover at the near-field probe gains.
+		reasons = self._gate_failure_reasons()
+		reason = "; ".join(reasons) if reasons else "unknown feasibility failure"
 		return MissionControl(
 			divergence_setpoint=0.0,
 			thrust_gain_override=self._compute_probe_gain(),
@@ -1448,11 +1682,27 @@ class MissionRoutine:
 			substate=INFEASIBLE,
 			info={
 				"just_entered": just_entered,
-				"reason": "near-field final probe h_crit exceeds leg clearance",
+				"reason": reason,
+				"infeasible_reason": reason,
 				"h_crit": self.gate.h_crit,
 				"leg_clearance_m": self._leg_clearance,
 				"k_min": self.gate.k_min,
 				"peak_accel": self.probe_result.peak_accel,
+				"vertical_accel_capacity_floor": self.gate.accel_capacity_floor,
+				"vertical_accel_capacity_ceiling": self.gate.accel_capacity_ceiling,
+				"roll_k_min": self.roll_gate.k_min,
+				"roll_k_floor": self.roll_gate.k_floor,
+				"roll_k_ceiling_leg": self.roll_gate.k_ceiling_leg,
+				"roll_accel_capacity_floor": self.roll_gate.accel_capacity_floor,
+				"roll_accel_capacity_ceiling": self.roll_gate.accel_capacity_ceiling,
+				"pitch_k_min": self.pitch_gate.k_min,
+				"pitch_k_floor": self.pitch_gate.k_floor,
+				"pitch_k_ceiling_leg": self.pitch_gate.k_ceiling_leg,
+				"pitch_accel_capacity_floor": self.pitch_gate.accel_capacity_floor,
+				"pitch_accel_capacity_ceiling": self.pitch_gate.accel_capacity_ceiling,
+				"vertical_feasible": self.vertical_feasible,
+				"roll_feasible": self.roll_feasible,
+				"pitch_feasible": self.pitch_feasible,
 			},
 		)
 
@@ -1473,24 +1723,8 @@ class MissionRoutine:
 	) -> bool:
 		centered = self._is_centered(offset_x, offset_y, target_found)
 
-		# AREA FRACTION ONLY. fov_saturated used to OR into this and it fired far
-		# too early: in the last run it went True at area_fraction = 0.49 and
-		# h = 2.1 m, tripping FINAL_PROBE while the platform was still small in
-		# frame. A bounding box touching all four borders at half the frame area is
-		# not a target filling the view -- it is a frame-spanning contour (the Canny
-		# edge channel will happily produce one). It was set on 55% of that log.
-		#
-		# Because that trigger is the PREMISE of the near-field paradigm (probe
-		# close in, where the loop synchronizes with the platform and the
-		# acceleration estimate is trustworthy), a false positive there does not
-		# merely mistime a phase -- it means the near-field probe never happens.
-		# So the trigger is now the direct, monotone measurement:
-		#
-		#     area_fraction >= fov_near_area_fraction     (e.g. 0.70)
-		#
-		# fov_saturated is still logged and still means what state.py says it means
-		# (area_fraction has stopped tracking true range) -- it is simply no longer
-		# trusted to say WHEN we are close.
+		# Area fraction is the monotone near-field trigger. fov_saturated remains a
+		# diagnostic but does not drive the phase transition.
 		visually_close = float(area_fraction) >= self._fov_near_area_fraction
 		return centered and visually_close
 
@@ -1512,7 +1746,9 @@ class MissionRoutine:
 			return (
 				f"[approach_probe] D*_approach={self._approach_d_star:.2f} "
 				f"probe={self.probe_result.total_duration_sec:.1f}/{self._probe_min:.1f}s "
-				f"peak_accel={self.probe_result.peak_accel:.3f} m/s^2 "
+				f"peaks z/r/p={self.probe_result.peak_accel:.3f}/"
+				f"{self.roll_probe_result.peak_accel:.3f}/"
+				f"{self.pitch_probe_result.peak_accel:.3f} m/s^2 "
 				f"near_area_thr={self._fov_near_area_fraction:.2f}"
 			)
 
@@ -1525,12 +1761,14 @@ class MissionRoutine:
 				f"[final_probe] hold={self.probe_result.duration_sec:.1f}/"
 				f"{self._final_probe_duration:.1f}s "
 				f"total={self.probe_result.total_duration_sec:.1f}/{self._probe_min:.1f}s "
-				f"peak_accel={self.probe_result.peak_accel:.3f} m/s^2 "
+				f"peaks z/r/p={self.probe_result.peak_accel:.3f}/"
+				f"{self.roll_probe_result.peak_accel:.3f}/"
+				f"{self.pitch_probe_result.peak_accel:.3f} m/s^2 "
 				f"(at handoff {handoff})"
 			)
 
 		if self._substate == PROBE_HOLD:
-			verdict = "WOULD-LAND" if self.gate.feasible else "WOULD-ABORT"
+			verdict = "WOULD-LAND" if self.feasible else "WOULD-ABORT"
 			handoff = (
 				f"{self.peak_accel_at_handoff:.3f}"
 				if self.peak_accel_at_handoff is not None else "--"
@@ -1541,14 +1779,16 @@ class MissionRoutine:
 				f"k_min={self.gate.k_min:.2f} k_floor={self.gate.k_floor:.2f} "
 				f"k_ceiling_leg={self.gate.k_ceiling_leg:.2f} "
 				f"h_crit={self.gate.h_crit:.2f}m "
+				f"flags z/r/p={int(self.vertical_feasible)}/"
+				f"{int(self.roll_feasible)}/{int(self.pitch_feasible)} "
 				f"vs leg={self._leg_clearance:.2f}m -> {verdict} (hovering, no descent)"
 			)
 
 		if self._substate == INFEASIBLE:
+			reasons = "; ".join(self._gate_failure_reasons())
 			return (
-				f"[infeasible] h_crit={self.gate.h_crit:.2f}m > "
-				f"leg_clearance={self._leg_clearance:.2f}m "
-				f"(k_min={self.gate.k_min:.2f}, peak_accel={self.probe_result.peak_accel:.3f})"
+				f"[infeasible] flags z/r/p={int(self.vertical_feasible)}/"
+				f"{int(self.roll_feasible)}/{int(self.pitch_feasible)}: {reasons}"
 			)
 
 		return (
@@ -1567,6 +1807,7 @@ def _smoke_test() -> None:
 	for label, a_peak in (("calm", 0.05), ("moderate", 0.30), ("violent", 1.50)):
 		m = MissionRoutine(
 			hover_thrust=hover,
+			enable_center=False,
 			control_period_sec=dt,
 			descent_divergence_setpoint=0.30,
 			approach_divergence_setpoint=0.12,
@@ -1604,8 +1845,12 @@ def _smoke_test() -> None:
 				offset_x=0.0,
 				offset_y=0.0,
 				target_found=True,
+				flow_valid=True,
 				area_fraction=area,
 				fov_saturated=False,
+				last_vertical_accel_cmd=a_plat,
+				last_roll_accel_cmd=0.6 * a_plat,
+				last_pitch_accel_cmd=0.4 * a_plat,
 			)
 			t += dt
 

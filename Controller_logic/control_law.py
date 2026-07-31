@@ -213,6 +213,9 @@ class ControlLaw:
 		self._previous_pitch_cmd = 0.0
 		self._previous_vertical_thrust_component = self._hover_thrust
 		self._previous_thrust_cmd = self._hover_thrust
+		self._last_roll_accel_cmd = 0.0
+		self._last_pitch_accel_cmd = 0.0
+		self._last_vertical_accel_cmd = 0.0
 		self._has_previous_command = False
 
 	@property
@@ -235,12 +238,30 @@ class ControlLaw:
 	def divergence_integral(self) -> float:
 		return self._divergence_integral
 
+	@property
+	def last_roll_accel_cmd(self) -> float:
+		"""Allocated roll-channel acceleration from the previous control tick."""
+		return float(self._last_roll_accel_cmd)
+
+	@property
+	def last_pitch_accel_cmd(self) -> float:
+		"""Allocated pitch-channel acceleration from the previous control tick."""
+		return float(self._last_pitch_accel_cmd)
+
+	@property
+	def last_vertical_accel_cmd(self) -> float:
+		"""Allocated world-vertical acceleration relative to hover."""
+		return float(self._last_vertical_accel_cmd)
+
 	def reset_visual_integrators(self):
 		self._divergence_integral = 0.0
 		self._previous_roll_cmd = 0.0
 		self._previous_pitch_cmd = 0.0
 		self._previous_vertical_thrust_component = self._hover_thrust
 		self._previous_thrust_cmd = self._hover_thrust
+		self._last_roll_accel_cmd = 0.0
+		self._last_pitch_accel_cmd = 0.0
+		self._last_vertical_accel_cmd = 0.0
 		self._has_previous_command = False
 
 	def reset_divergence_integral(self):
@@ -264,6 +285,10 @@ class ControlLaw:
 		thrust_gain_override: Optional[float] = None,
 		lateral_p_scale: float = 1.0,
 		lateral_d_scale: float = 1.0,
+		roll_p_scale: Optional[float] = None,
+		roll_d_scale: Optional[float] = None,
+		pitch_p_scale: Optional[float] = None,
+		pitch_d_scale: Optional[float] = None,
 		enable_integral: bool = True,
 	) -> AttitudeSetpoint:
 		"""Desired roll/pitch/yaw/thrust from visual data only.
@@ -277,9 +302,10 @@ class ControlLaw:
 		    untouched). 0 for the probe/hover hold, small positive to descend.
 		thrust_gain_override: "k" in a_z_cmd = k*(D-D*). Supplied per tick by
 		    the mission (hand-tuned exploration gain, decayed through descent).
-		lateral_p_scale / lateral_d_scale: independent multipliers on the
-		    offset (P) and optical-flow (D) acceleration terms. Existing mission
-		    callouts therefore remain valid.
+		lateral_p_scale / lateral_d_scale: legacy shared multipliers.
+		roll_p_scale / roll_d_scale / pitch_p_scale / pitch_d_scale:
+		    optional per-axis overrides used by the independent lateral schedules.
+		    When omitted, the shared values preserve the existing callouts.
 		enable_integral: when False, the divergence integral neither accumulates
 		    nor contributes to the vertical thrust component this tick.
 		"""
@@ -299,20 +325,26 @@ class ControlLaw:
 			offset_x = float(target.offset_x)
 			offset_y = float(target.offset_y)
 
-			# Error-magnitude blend still scales P and D together: it protects
-			# the compound request against authority saturation and does not
-			# alter the independently scheduled P/D balance.
+			# Error-magnitude blend protects both axes against authority
+			# saturation, while the mission may now schedule roll and pitch
+			# independently after the three-axis feasibility probe.
 			err_scale = self._offset_magnitude_gain_scale(offset_x, offset_y)
-			p_scale = max(0.0, float(lateral_p_scale)) * err_scale
-			d_scale = max(0.0, float(lateral_d_scale)) * err_scale
+			roll_p = lateral_p_scale if roll_p_scale is None else roll_p_scale
+			roll_d = lateral_d_scale if roll_d_scale is None else roll_d_scale
+			pitch_p = lateral_p_scale if pitch_p_scale is None else pitch_p_scale
+			pitch_d = lateral_d_scale if pitch_d_scale is None else pitch_d_scale
+			roll_p = max(0.0, float(roll_p)) * err_scale
+			roll_d = max(0.0, float(roll_d)) * err_scale
+			pitch_p = max(0.0, float(pitch_p)) * err_scale
+			pitch_d = max(0.0, float(pitch_d)) * err_scale
 
 			roll_accel_cmd = self._roll_output_sign * -(
-				self._roll_kp * p_scale * offset_x
-				+ self._roll_kd * d_scale * flow_x
+				self._roll_kp * roll_p * offset_x
+				+ self._roll_kd * roll_d * flow_x
 			)
 			pitch_accel_cmd = self._pitch_output_sign * -(
-				self._pitch_kp * p_scale * offset_y
-				+ self._pitch_kd * d_scale * flow_y
+				self._pitch_kp * pitch_p * offset_y
+				+ self._pitch_kd * pitch_d * flow_y
 			)
 
 		# --- Vertical axis: accel-domain divergence law -> vertical thrust component. ---
@@ -468,6 +500,18 @@ class ControlLaw:
 		)
 		cos_tilt = max(1e-6, math.cos(roll_s) * math.cos(pitch_s))
 		thrust_s = self._clamp(vertical_s / cos_tilt, self._thrust_min, self._thrust_max)
+
+		# Store the accelerations represented by the final shaped and
+		# authority-limited setpoint. MissionRoutine consumes these one camera tick
+		# later for the three parallel platform probes.
+		specific_thrust = G_ACCEL * thrust_s / max(self._hover_thrust, 1e-6)
+		self._last_roll_accel_cmd = specific_thrust * math.sin(roll_s)
+		self._last_pitch_accel_cmd = (
+			specific_thrust * math.cos(roll_s) * math.sin(pitch_s)
+		)
+		self._last_vertical_accel_cmd = (
+			specific_thrust * math.cos(roll_s) * math.cos(pitch_s) - G_ACCEL
+		)
 
 		self._previous_roll_cmd = roll_s
 		self._previous_pitch_cmd = pitch_s

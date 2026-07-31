@@ -12,6 +12,7 @@ by a non-blocking diagnostics sink; only the contact subset reaches control wiri
 from __future__ import annotations
 
 import inspect
+import math
 import multiprocessing as mp
 import queue
 import threading
@@ -99,9 +100,11 @@ FINAL_PROBE_DURATION_SEC = 2.0 * PROBE_DESIGN_PERIOD_SEC
 
 CEILING_SAFETY_FACTOR = 0.6
 DESCENT_CEILING_MARGIN = 0.7
-PROBE_ACCEL_MARGIN_M_S2 = 0.05   # additive m/s^2 floor: unmodeled perturbation + ground effect + cold-start
+PROBE_VERT_ACCEL_MARGIN_M_S2 = 0.05   # additive m/s^2 floor: unmodeled perturbation + ground effect + cold-start
+PROBE_ROLL_ACCEL_MARGIN_M_S2 = 0.01   # additive m/s^2 floor: unmodeled perturbation + ground effect + cold-start
+PROBE_PITCH_ACCEL_MARGIN_M_S2 = 0.01   # additive m/s^2 floor: unmodeled perturbation + ground effect + cold-start
 PROBE_ATTENUATION_COMP  = 1.15   # multiplicative >=1: inverts the height-dependent (few-dB) probe under-read
-NEAR_FIELD_HEIGHT_M = 0.4
+NEAR_FIELD_HEIGHT_M = 0.3
 
 SMOOTHING_DELAYS = 0.03
 CAMERA_FRAME_PERIOD_SEC = 1.0 / 60.0
@@ -114,10 +117,18 @@ STABILITY_DT_SEC = (CAMERA_FRAME_PERIOD_SEC +
 LEG_CLEARANCE_M = 0.182
 HOVER_PROBE_ONLY = False
 INITIAL_THRUST_GAIN = 6.50
-INITIAL_ROLL_KP = 6.5
+INITIAL_ROLL_KP = 5.0
 INITIAL_ROLL_KD = 3.5
-INITIAL_PITCH_KP = 6.5
+INITIAL_PITCH_KP = 5.0
 INITIAL_PITCH_KD = 3.5
+
+CAMERA_HORIZONTAL_FOV_DEG = 80.0
+CAMERA_VERTICAL_FOV_DEG = 80.0
+ROLL_KAPPA = 1.0 / math.tan(math.radians(CAMERA_HORIZONTAL_FOV_DEG / 2.0))
+PITCH_KAPPA = 1.0 / math.tan(math.radians(CAMERA_VERTICAL_FOV_DEG / 2.0))
+ROLL_FLOW_ADMISSIBLE_NORM_S = 0.4
+PITCH_FLOW_ADMISSIBLE_NORM_S = 0.4
+LATERAL_MAX_CLOSING_SPEED_M_S = 0.05
 
 # MAVSDK/PX4
 TAKEOFF_ALTITUDE_M = 5.0
@@ -266,6 +277,13 @@ class BeeLandNode(Node):
             near_field_height_m=NEAR_FIELD_HEIGHT_M,
             probe_only=HOVER_PROBE_ONLY,
             initial_thrust_gain=INITIAL_THRUST_GAIN,
+            roll_d_gain=INITIAL_ROLL_KD,
+            pitch_d_gain=INITIAL_PITCH_KD,
+            roll_kappa=ROLL_KAPPA,
+            pitch_kappa=PITCH_KAPPA,
+            roll_flow_admissible_norm_s=ROLL_FLOW_ADMISSIBLE_NORM_S,
+            pitch_flow_admissible_norm_s=PITCH_FLOW_ADMISSIBLE_NORM_S,
+            max_closing_speed_m_s=LATERAL_MAX_CLOSING_SPEED_M_S,
             d_star_ramp_in_sec=D_STAR_RAMP_IN_SEC,
             center_to_probe_lateral_ramp_sec=CENTER_TO_PROBE_LATERAL_RAMP_SEC,
             enable_center_condition_gate=ENABLE_CENTER_CONDITION_GATE,
@@ -279,7 +297,9 @@ class BeeLandNode(Node):
             probe_lateral_p_scale=PROBE_LATERAL_P_SCALE,
             probe_lateral_d_scale=PROBE_LATERAL_D_SCALE,
             stability_dt_sec=STABILITY_DT_SEC,
-            probe_accel_margin_m_s2=PROBE_ACCEL_MARGIN_M_S2,
+			probe_vert_accel_margin_m_s2=PROBE_VERT_ACCEL_MARGIN_M_S2,
+			probe_roll_accel_margin_m_s2=PROBE_ROLL_ACCEL_MARGIN_M_S2,
+			probe_pitch_accel_margin_m_s2=PROBE_PITCH_ACCEL_MARGIN_M_S2,
             probe_attenuation_comp=PROBE_ATTENUATION_COMP,
         )
         return MissionRoutine(**_supported_kwargs(MissionRoutine, values))
@@ -623,6 +643,9 @@ class BeeLandNode(Node):
             flow_valid=bool(getattr(flow, "valid", False)),
             area_fraction=float(tgt.area_fraction),
             fov_saturated=bool(tgt.fov_saturated),
+            last_vertical_accel_cmd=self.control_law.last_vertical_accel_cmd,
+            last_roll_accel_cmd=self.control_law.last_roll_accel_cmd,
+            last_pitch_accel_cmd=self.control_law.last_pitch_accel_cmd,
         )
         self._announce_mission_substate(mc)
 
@@ -646,6 +669,10 @@ class BeeLandNode(Node):
             thrust_gain_override=mc.thrust_gain_override,
             lateral_p_scale=mc.lateral_p_scale,
             lateral_d_scale=mc.lateral_d_scale,
+            roll_p_scale=getattr(mc, "roll_p_scale", None),
+            roll_d_scale=getattr(mc, "roll_d_scale", None),
+            pitch_p_scale=getattr(mc, "pitch_p_scale", None),
+            pitch_d_scale=getattr(mc, "pitch_d_scale", None),
             lateral_gain_scale=mc.lateral_p_scale,
             enable_integral=mc.enable_integral,
         )
@@ -720,11 +747,16 @@ class BeeLandNode(Node):
         detail = (
             f"{previous} -> {substate}; "
             f"D*={float(getattr(mc, 'divergence_setpoint', 0.0)):+.4f} 1/s, "
-            f"K={float(getattr(mc, 'thrust_gain_override', 0.0)):.4f}, "
-            f"Pscale={float(getattr(mc, 'lateral_p_scale', 0.0)):.4f}, "
-            f"Dscale={float(getattr(mc, 'lateral_d_scale', 0.0)):.4f}, "
+            f"K={float(getattr(mc, 'thrust_gain_override', 0.0) or 0.0):.4f}, "
+            f"RP/RD={float(getattr(mc, 'roll_p_scale', None) or getattr(mc, 'lateral_p_scale', 0.0)):.4f}/"
+            f"{float(getattr(mc, 'roll_d_scale', None) or getattr(mc, 'lateral_d_scale', 0.0)):.4f}, "
+            f"PP/PD={float(getattr(mc, 'pitch_p_scale', None) or getattr(mc, 'lateral_p_scale', 0.0)):.4f}/"
+            f"{float(getattr(mc, 'pitch_d_scale', None) or getattr(mc, 'lateral_d_scale', 0.0)):.4f}, "
             f"integral={int(bool(getattr(mc, 'enable_integral', False)))}"
         )
+        infeasible_reason = (getattr(mc, "info", {}) or {}).get("infeasible_reason")
+        if infeasible_reason:
+            detail += f"; {infeasible_reason}"
         self.get_logger().info(f"MISSION PHASE: {display} ({detail})")
 
         # Preserve the exact MissionCommand that caused the transition in the
@@ -747,6 +779,11 @@ class BeeLandNode(Node):
     def _mission_dict(self, mc):
         gate = getattr(self.mission, "gate", None)
         probe = getattr(self.mission, "probe_result", None)
+        roll_gate = getattr(self.mission, "roll_gate", None)
+        pitch_gate = getattr(self.mission, "pitch_gate", None)
+        roll_probe = getattr(self.mission, "roll_probe_result", None)
+        pitch_probe = getattr(self.mission, "pitch_probe_result", None)
+        info = getattr(mc, "info", {}) or {}
         current_substate = getattr(
             mc, "substate", getattr(self.mission, "substate", "")
         )
@@ -761,20 +798,74 @@ class BeeLandNode(Node):
             "thrust_gain_k": getattr(mc, "thrust_gain_override", None),
             "lateral_p_scale": getattr(mc, "lateral_p_scale", None),
             "lateral_d_scale": getattr(mc, "lateral_d_scale", None),
+            "roll_p_scale": getattr(mc, "roll_p_scale", None),
+            "roll_d_scale": getattr(mc, "roll_d_scale", None),
+            "pitch_p_scale": getattr(mc, "pitch_p_scale", None),
+            "pitch_d_scale": getattr(mc, "pitch_d_scale", None),
             "enable_integral": int(bool(getattr(mc, "enable_integral", False))),
             "peak_accel_m_s2": getattr(probe, "peak_accel", None),
+            "roll_peak_accel_m_s2": getattr(roll_probe, "peak_accel", None),
+            "pitch_peak_accel_m_s2": getattr(pitch_probe, "peak_accel", None),
             "k_min": getattr(gate, "k_min", None),
+            "k_explore": getattr(gate, "k_explore", None),
+            "k_probe": getattr(self.mission, "probe_gain", None),
+            "k_floor": getattr(gate, "k_floor", None),
+            "k_ceiling_leg": getattr(gate, "k_ceiling_leg", None),
             "h_crit_m": getattr(gate, "h_crit", None),
-            "feasible": int(bool(getattr(gate, "feasible", False))) if gate is not None else None,
+            "h_pred_m": info.get("h_pred"),
+            "roll_k_min": getattr(roll_gate, "k_min", None),
+            "pitch_k_min": getattr(pitch_gate, "k_min", None),
+            "roll_k_probe": getattr(roll_gate, "k_probe", None),
+            "pitch_k_probe": getattr(pitch_gate, "k_probe", None),
+            "roll_k_applied": info.get("roll_k"),
+            "pitch_k_applied": info.get("pitch_k"),
+            "roll_k_target": getattr(roll_gate, "k_target", None),
+            "pitch_k_target": getattr(pitch_gate, "k_target", None),
+            "roll_k_floor": getattr(roll_gate, "k_floor", None),
+            "pitch_k_floor": getattr(pitch_gate, "k_floor", None),
+            "roll_k_touchdown": getattr(roll_gate, "k_touchdown", None),
+            "pitch_k_touchdown": getattr(pitch_gate, "k_touchdown", None),
+            "roll_k_ceiling_probe": getattr(roll_gate, "k_ceiling_probe", None),
+            "pitch_k_ceiling_probe": getattr(pitch_gate, "k_ceiling_probe", None),
+            "roll_k_ceiling_leg": getattr(roll_gate, "k_ceiling_leg", None),
+            "pitch_k_ceiling_leg": getattr(pitch_gate, "k_ceiling_leg", None),
+            "vertical_accel_capacity_floor_m_s2": getattr(gate, "accel_capacity_floor", None),
+            "vertical_accel_capacity_ceiling_m_s2": getattr(gate, "accel_capacity_ceiling", None),
+            "roll_accel_capacity_floor_m_s2": getattr(roll_gate, "accel_capacity_floor", None),
+            "roll_accel_capacity_ceiling_m_s2": getattr(roll_gate, "accel_capacity_ceiling", None),
+            "pitch_accel_capacity_floor_m_s2": getattr(pitch_gate, "accel_capacity_floor", None),
+            "pitch_accel_capacity_ceiling_m_s2": getattr(pitch_gate, "accel_capacity_ceiling", None),
+            "vertical_window_exists": int(bool(getattr(gate, "window_exists", False))) if gate is not None else None,
+            "roll_window_exists": int(bool(getattr(roll_gate, "window_exists", False))) if roll_gate is not None else None,
+            "pitch_window_exists": int(bool(getattr(pitch_gate, "window_exists", False))) if pitch_gate is not None else None,
+            "roll_probe_within_ceiling": int(bool(getattr(roll_gate, "probe_within_ceiling", False))) if roll_gate is not None else None,
+            "pitch_probe_within_ceiling": int(bool(getattr(pitch_gate, "probe_within_ceiling", False))) if pitch_gate is not None else None,
+            "infeasible_reason": info.get("infeasible_reason"),
+            "vertical_feasible": int(bool(getattr(gate, "feasible", False))) if gate is not None else None,
+            "roll_feasible": int(bool(getattr(roll_gate, "feasible", False))) if roll_gate is not None else None,
+            "pitch_feasible": int(bool(getattr(pitch_gate, "feasible", False))) if pitch_gate is not None else None,
+            "feasible": int(bool(getattr(self.mission, "feasible", False))),
         }
         telemetry = getattr(self.mission, "probe_telemetry", None)
         if callable(telemetry):
             raw = telemetry()
             mapping = {
-                "phase": "probe_phase", "accel": "probe_accel_m_s2",
-                "mean_accel": "probe_mean_accel_m_s2",
-                "residual_accel": "probe_residual_accel_m_s2",
-                "percentile_accel": "probe_percentile_accel_m_s2",
+                "probe_phase": "probe_phase",
+                "probe_accel": "probe_accel_m_s2",
+                "probe_mean_accel": "probe_mean_accel_m_s2",
+                "probe_residual_accel": "probe_residual_accel_m_s2",
+                "probe_percentile_accel": "probe_percentile_accel_m_s2",
+                "probe_peak_accel_at_handoff": "probe_peak_accel_at_handoff_m_s2",
+                "roll_probe_accel": "roll_probe_accel_m_s2",
+                "roll_probe_mean_accel": "roll_probe_mean_accel_m_s2",
+                "roll_probe_residual_accel": "roll_probe_residual_accel_m_s2",
+                "roll_probe_percentile_accel": "roll_probe_percentile_accel_m_s2",
+                "roll_probe_peak_accel_at_handoff": "roll_probe_peak_accel_at_handoff_m_s2",
+                "pitch_probe_accel": "pitch_probe_accel_m_s2",
+                "pitch_probe_mean_accel": "pitch_probe_mean_accel_m_s2",
+                "pitch_probe_residual_accel": "pitch_probe_residual_accel_m_s2",
+                "pitch_probe_percentile_accel": "pitch_probe_percentile_accel_m_s2",
+                "pitch_probe_peak_accel_at_handoff": "pitch_probe_peak_accel_at_handoff_m_s2",
             }
             for old, new in mapping.items():
                 if old in raw:

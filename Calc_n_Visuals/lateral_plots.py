@@ -3,10 +3,10 @@
 The landing target has already been centered during CENTER. In FINAL_PROBE,
 the roll controller regulates only the lateral translational optical flow
 
-    lambda = (v_platform - v_drone) / h
+    omega = (v_platform - v_drone) / h
 
 toward zero. With the small-angle approximation a_drone = g * phi and
-phi_cmd = k_D * lambda, the acceleration-equivalent gain is K = g * k_D.
+phi_cmd = k_D * omega, the acceleration-equivalent gain is K = g * k_D.
 
 The continuous relative-velocity dynamics are exactly discretized with a
 zero-order hold. The script produces only:
@@ -32,13 +32,13 @@ class LateralConfig:
     # Frozen height during FINAL_PROBE.
     height_m: float = 0.18
 
-    # Roll D gains: phi_cmd = k_D * lambda.
+    # Roll D gains: phi_cmd = k_D * omega.
     # Units: rad / (1/s) = rad*s.
     roll_kd_values: tuple[float, ...] = (0.10, 0.30, 0.80)
 
     # Effective visual/control update interval.
     sample_time_s: float = 0.06
-    gravity_m_s2: float = 9.81
+    gravity_m_s2: float = 1
 
     # Lateral platform oscillation.
     platform_frequency_hz: float = 0.4
@@ -66,13 +66,13 @@ def lateral_flow_plant_response(
     cfg: LateralConfig,
     frequencies_hz: np.ndarray,
 ) -> np.ndarray:
-    """Return P_lambda(z) from residual acceleration to lateral optical flow.
+    """Return P_omega(z) from residual acceleration to lateral optical flow.
 
     Frozen-height model:
-        lambda[k+1] = lambda[k] + T/h * (a_p[k] - a_d[k])
+        omega[k+1] = omega[k] + T/h * (a_p[k] - a_d[k])
 
     Therefore:
-        P_lambda(z) = (T/h) / (z - 1)
+        P_omega(z) = (T/h) / (z - 1)
     """
     T = cfg.sample_time_s
     h = cfg.height_m
@@ -105,10 +105,10 @@ def closed_loop_pole(cfg: LateralConfig, roll_kd: float) -> complex:
 
 def compute_for_gain(cfg: LateralConfig, roll_kd: float) -> dict:
     frequencies_hz = frequency_grid(cfg)
-    P_lambda = lateral_flow_plant_response(cfg, frequencies_hz)
+    P_omega = lateral_flow_plant_response(cfg, frequencies_hz)
 
     K = acceleration_gain(cfg, roll_kd)
-    L = K * P_lambda
+    L = K * P_omega
     pole = closed_loop_pole(cfg, roll_kd)
 
     return {
@@ -117,7 +117,7 @@ def compute_for_gain(cfg: LateralConfig, roll_kd: float) -> dict:
         "K": K,
         "mu": K * cfg.sample_time_s / cfg.height_m,
         "T_platform": L / (1.0 + L),       # a_d / a_p
-        "H_lambda_ap": P_lambda / (1.0 + L),  # lambda / a_p
+        "H_omega_ap": P_omega / (1.0 + L),  # omega / a_p
         "pole": pole,
         "stable": bool(abs(pole) < 1.0 - 1e-10),
     }
@@ -174,44 +174,44 @@ def plot_lateral_flow_residual(
     fig.suptitle(
         "Résiduel de flux optique latéral causé par les oscillations "
         "de la plateforme\n"
-        r"$e_\lambda=\lambda-\lambda_{\mathrm{ref}},\quad "
-        r"\lambda_{\mathrm{ref}}=0$"
+        r"$e_\omega=\omega-\omega_{\mathrm{ref}},\quad "
+        r"\omega_{\mathrm{ref}}=0$"
     )
 
     for response in responses:
         f = response["f"]
-        H_lambda_ap = response["H_lambda_ap"]
-        H_lambda_xp = -(2.0 * math.pi * f) ** 2 * H_lambda_ap
+        H_omega_ap = response["H_omega_ap"]
+        H_omega_xp = -(2.0 * math.pi * f) ** 2 * H_omega_ap
         label, linestyle = curve_style(response)
 
         axes[0, 0].loglog(
             f,
-            np.maximum(np.abs(H_lambda_xp), 1e-12),
+            np.maximum(np.abs(H_omega_xp), 1e-12),
             linestyle=linestyle,
             label=label,
         )
         axes[1, 0].semilogx(
             f,
-            phase_deg(H_lambda_xp),
+            phase_deg(H_omega_xp),
             linestyle=linestyle,
             label=label,
         )
         axes[0, 1].loglog(
             f,
-            np.maximum(np.abs(H_lambda_ap), 1e-12),
+            np.maximum(np.abs(H_omega_ap), 1e-12),
             linestyle=linestyle,
             label=label,
         )
         axes[1, 1].semilogx(
             f,
-            phase_deg(H_lambda_ap),
+            phase_deg(H_omega_ap),
             linestyle=linestyle,
             label=label,
         )
 
         f0 = cfg.platform_frequency_hz
-        H_xp_0 = complex_at_frequency(f, H_lambda_xp, f0)
-        H_ap_0 = complex_at_frequency(f, H_lambda_ap, f0)
+        H_xp_0 = complex_at_frequency(f, H_omega_xp, f0)
+        H_ap_0 = complex_at_frequency(f, H_omega_ap, f0)
         residual_amp = abs(H_xp_0) * cfg.platform_amplitude_m
 
         axes[0, 0].scatter([f0], [abs(H_xp_0)], s=35)
@@ -240,15 +240,15 @@ def plot_lateral_flow_residual(
         ax.grid(True, which="both")
         ax.legend(loc="best")
 
-    axes[0, 0].set_title(r"Entrée position : $e_\lambda/x_p$")
+    axes[0, 0].set_title(r"Entrée position : $e_\omega/x_p$")
     axes[0, 0].set_ylabel(
-        r"$|e_\lambda/x_p|$ [s$^{-1}$/m]"
+        r"$|e_\omega/x_p|$ [s$^{-1}$/m]"
     )
     axes[1, 0].set_ylabel("phase [deg]")
     axes[1, 0].set_xlabel("fréquence [Hz]")
 
-    axes[0, 1].set_title(r"Entrée accélération : $e_\lambda/a_p$")
-    axes[0, 1].set_ylabel(r"$|e_\lambda/a_p|$ [s/m]")
+    axes[0, 1].set_title(r"Entrée accélération : $e_\omega/a_p$")
+    axes[0, 1].set_ylabel(r"$|e_\omega/a_p|$ [s/m]")
     axes[1, 1].set_ylabel("phase [deg]")
     axes[1, 1].set_xlabel("fréquence [Hz]")
 
@@ -424,7 +424,7 @@ def print_summary(cfg: LateralConfig, responses: list[dict]) -> None:
         )
         H0 = complex_at_frequency(
             response["f"],
-            response["H_lambda_ap"],
+            response["H_omega_ap"],
             cfg.platform_frequency_hz,
         )
         state = "stable" if response["stable"] else "UNSTABLE"
@@ -435,7 +435,7 @@ def print_summary(cfg: LateralConfig, responses: list[dict]) -> None:
             f"pole={response['pole'].real:.4f}, "
             f"|a_d/a_p|={abs(T0):.4f}, "
             f"phase={np.angle(T0, deg=True):.2f} deg, "
-            f"|e_lambda|={abs(H0) * a_platform:.4f} 1/s"
+            f"|e_omega|={abs(H0) * a_platform:.4f} 1/s"
         )
 
 
@@ -450,8 +450,8 @@ def run_analysis(cfg: LateralConfig) -> None:
 
 if __name__ == "__main__":
     configuration = LateralConfig(
-        height_m=0.18,
-        roll_kd_values=(0.10, 0.30, 0.80),
+        height_m=0.45,
+        roll_kd_values=(2.0, 6.5, 13.0),
         sample_time_s=0.077,
         platform_frequency_hz=0.4,
         platform_amplitude_m=0.10,

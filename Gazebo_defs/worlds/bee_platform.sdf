@@ -183,8 +183,8 @@
 			<component><amplitude>0.05</amplitude><frequency>0.270</frequency><phase>0.0</phase></component>
 		</axis_x>
 		<axis_y>
-			<component><amplitude>0.30</amplitude><frequency>0.190</frequency><phase>0.0</phase></component>
-			<component><amplitude>0.2</amplitude><frequency>0.110</frequency><phase>2.1</phase></component>
+			<component><amplitude>0.21</amplitude><frequency>0.190</frequency><phase>0.0</phase></component>
+			<component><amplitude>0.1</amplitude><frequency>0.110</frequency><phase>2.1</phase></component>
 		</axis_y>
 		<axis_z>
 			<component><amplitude>0.15</amplitude><frequency>0.150</frequency><phase>1.3</phase></component>

@@ -167,6 +167,10 @@ class OpticalFlowEstimator:
 		# spatial resolution, which the rotational-field model samples at
 		# full resolution).
 		derotator=None,
+		# Diagnostic-only comparison between divergence before and after
+		# de-rotation. Disabled by default because it requires a second affine
+		# fit on the raw flow field and does not feed the controller.
+		compute_prederotation_diagnostic: bool = False,
 	):
 		self._prev_gray = None
 		self._prev_bgr = None
@@ -209,6 +213,13 @@ class OpticalFlowEstimator:
 
 		# Ego-rotation removal (see derotation.py). None -> disabled.
 		self._derotator = derotator
+
+		# When enabled, run an additional non-robust affine fit on the raw
+		# (pre-de-rotation) flow for offline diagnostics. This value is never
+		# used by the control-facing divergence estimate.
+		self._compute_prederotation_diagnostic = bool(
+			compute_prederotation_diagnostic
+		)
 
 	def update(
 		self,
@@ -463,7 +474,10 @@ class OpticalFlowEstimator:
 		timing["divergence_filter_ms"] = 1000.0 * (time.perf_counter() - stage_start)
 
 		stage_start = time.perf_counter()
-		if derotation_active:
+		prederotation_diagnostic_active = (
+			derotation_active and self._compute_prederotation_diagnostic
+		)
+		if prederotation_diagnostic_active:
 			divergence_prederotation, _, _ = self._fit_divergence_affine(
 				flow_px_s=raw_flow_px_s,
 				image_width=image_width,
@@ -473,7 +487,13 @@ class OpticalFlowEstimator:
 				pixel_scale=fit_pixel_scale,
 			)
 		else:
-			divergence_prederotation = raw_divergence
+			# Do not report the post-de-rotation result as though it had been
+			# measured before de-rotation. NaN clearly marks the diagnostic as
+			# unavailable while preserving the existing FlowResult interface.
+			divergence_prederotation = float("nan")
+		timing["prederotation_diagnostic_active"] = int(
+			prederotation_diagnostic_active
+		)
 		timing["prederotation_fit_ms"] = 1000.0 * (time.perf_counter() - stage_start)
 
 		stage_start = time.perf_counter()
