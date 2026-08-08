@@ -220,6 +220,75 @@ def _interp_truth(data: AnalysisData, column: str, at_sim_time: np.ndarray) -> n
 	return out
 
 
+def _quaternion_to_euler_xyz(
+	x: np.ndarray,
+	y: np.ndarray,
+	z: np.ndarray,
+	w: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+	"""Convert Gazebo quaternions to roll, pitch and yaw [rad].
+
+	The returned angles follow the standard XYZ roll-pitch-yaw convention used
+	for Gazebo poses. Quaternions are normalized sample by sample, invalid samples
+	remain NaN, and roll/yaw are unwrapped to show a continuous angle evolution.
+	"""
+	x = np.asarray(x, dtype=float)
+	y = np.asarray(y, dtype=float)
+	z = np.asarray(z, dtype=float)
+	w = np.asarray(w, dtype=float)
+
+	roll = np.full_like(x, np.nan, dtype=float)
+	pitch = np.full_like(x, np.nan, dtype=float)
+	yaw = np.full_like(x, np.nan, dtype=float)
+
+	norm = np.sqrt(x * x + y * y + z * z + w * w)
+	good = (
+		np.isfinite(x)
+		& np.isfinite(y)
+		& np.isfinite(z)
+		& np.isfinite(w)
+		& (norm > 1e-12)
+	)
+	if not np.any(good):
+		return roll, pitch, yaw
+
+	qx = x[good] / norm[good]
+	qy = y[good] / norm[good]
+	qz = z[good] / norm[good]
+	qw = w[good] / norm[good]
+
+	sin_roll = 2.0 * (qw * qx + qy * qz)
+	cos_roll = 1.0 - 2.0 * (qx * qx + qy * qy)
+	roll_good = np.arctan2(sin_roll, cos_roll)
+
+	sin_pitch = 2.0 * (qw * qy - qz * qx)
+	pitch_good = np.arcsin(np.clip(sin_pitch, -1.0, 1.0))
+
+	sin_yaw = 2.0 * (qw * qz + qx * qy)
+	cos_yaw = 1.0 - 2.0 * (qy * qy + qz * qz)
+	yaw_good = np.arctan2(sin_yaw, cos_yaw)
+
+	roll[good] = np.unwrap(roll_good)
+	pitch[good] = pitch_good
+	yaw[good] = np.unwrap(yaw_good)
+	return roll, pitch, yaw
+
+
+def _truth_euler_angles(
+	data: AnalysisData,
+	entity: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+	"""Return one truth entity's roll, pitch and yaw arrays [rad]."""
+	tr = data.truth
+	prefix = f"truth_{entity}_orientation"
+	return _quaternion_to_euler_xyz(
+		_num(tr, f"{prefix}_x").to_numpy(float),
+		_num(tr, f"{prefix}_y").to_numpy(float),
+		_num(tr, f"{prefix}_z").to_numpy(float),
+		_num(tr, f"{prefix}_w").to_numpy(float),
+	)
+
+
 def _phase_intervals(data: AnalysisData) -> list[tuple[float, float, str]]:
 	df = data.control
 	if df.empty or "mission_substate" not in df.columns:
@@ -561,23 +630,50 @@ def _plot_probe_axis(
 		label=f"Command-derived {axis_name.lower()} probe acceleration",
 	)
 	if np.isfinite(relative_accel).any():
-		axes[0].plot(t, relative_accel, alpha=0.72, label=truth_label)
+		axes[0].plot(
+			t,
+			relative_accel,
+			alpha=0.72,
+			label=f"{truth_label} (mapped to command sign)",
+		)
+
+	# peak_accel is a non-negative magnitude. Plot both sides of the envelope on
+	# the signed command/truth panel so the gate input can be read directly without
+	# making it look like another signed acceleration channel.
+	peak_used = _num(c, peak_column)
+	if np.isfinite(peak_used).any():
+		peak_line = axes[0].plot(
+			t,
+			peak_used,
+			linestyle="-.",
+			linewidth=1.8,
+			label="Peak used by gate",
+		)[0]
+		axes[0].plot(
+			t,
+			-peak_used,
+			linestyle="-.",
+			linewidth=1.2,
+			alpha=0.70,
+			color=peak_line.get_color(),
+			label="_nolegend_",
+		)
 	axes[0].set_ylabel("Acceleration [m/s²]")
 	axes[0].set_title(f"{axis_name} probe disturbance estimate versus Gazebo truth")
 	_legend(axes[0], ncol=2)
 
 	for col, label, style in [
 		(f"mission_{probe_prefix}_mean_accel_m_s2", "Probe mean", "-"),
-		(f"mission_{probe_prefix}_residual_accel_m_s2", "Probe residual", "--"),
+		(
+			f"mission_{probe_prefix}_residual_accel_m_s2",
+			"Probe residual magnitude |a_cmd − mean|",
+			"--",
+		),
 		(f"mission_{probe_prefix}_percentile_accel_m_s2", "Probe percentile", ":"),
-		(peak_column, "Peak used by gate", "-."),
 	]:
 		y = _num(c, col)
 		if np.isfinite(y).any():
 			axes[1].plot(t, y, linestyle=style, label=label)
-
-	if np.isfinite(relative_accel).any():
-		axes[1].plot(t, relative_accel, alpha=0.52, label=truth_label)
 
 	capacity_floor = _last_finite_value(c_all, capacity_floor_column)
 	capacity_ceiling = _last_finite_value(c_all, capacity_ceiling_column)
@@ -762,6 +858,70 @@ def plot_platform_motion(data: AnalysisData, out: Path) -> None:
 	for ax in axes:
 		_legend(ax, ncol=3)
 	_finish_figure(fig, axes, data, out / "platform_motion.png")
+
+
+def plot_platform_angles(data: AnalysisData, out: Path) -> None:
+	"""Plot the platform's Gazebo-truth roll, pitch and yaw evolution."""
+	tr = data.truth
+	t = _relative_time(tr["_sim_time"], data.t0)
+	roll, pitch, yaw = _truth_euler_angles(data, "platform")
+
+	fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
+	for ax, name, angle in zip(
+		axes,
+		("Roll", "Pitch", "Yaw"),
+		(roll, pitch, yaw),
+	):
+		ax.plot(t, np.degrees(angle), label=f"Platform {name.lower()} truth")
+		ax.axhline(0.0, linestyle="--", linewidth=1.0)
+		ax.set_ylabel(f"{name} [deg]")
+		_legend(ax)
+	axes[0].set_title("Gazebo truth: platform attitude evolution")
+	axes[-1].set_xlabel("Time since common log start [s SIM]")
+	_finish_figure(fig, axes, data, out / "platform_angles.png")
+
+
+def plot_drone_angles(data: AnalysisData, out: Path) -> None:
+	"""Plot true drone attitude together with the commanded Euler angles."""
+	tr = data.truth
+	c = data.control
+	t_truth = _relative_time(tr["_sim_time"], data.t0)
+	t_command = _relative_time(c["_sim_time"], data.t0)
+	roll, pitch, yaw = _truth_euler_angles(data, "drone")
+
+	fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
+	# PX4's pitch-command convention is opposite to the Gazebo Euler pitch sign
+	# in this logging setup. Map truth to the command convention only in this
+	# command-tracking figure; the platform-attitude plot remains raw Gazebo truth.
+	for ax, name, angle, command_column, truth_sign in zip(
+		axes,
+		("Roll", "Pitch", "Yaw"),
+		(roll, pitch, yaw),
+		("command_roll_rad", "command_pitch_rad", "command_yaw_rad"),
+		(1.0, -1.0, 1.0),
+	):
+		truth_label = f"True drone {name.lower()}"
+		if truth_sign < 0.0:
+			truth_label += " (mapped to command sign)"
+		ax.plot(
+			t_truth,
+			np.degrees(truth_sign * angle),
+			label=truth_label,
+		)
+		command = _num(c, command_column).to_numpy(float)
+		if np.isfinite(command).any():
+			ax.plot(
+				t_command,
+				np.degrees(command),
+				alpha=0.78,
+				label=f"Commanded {name.lower()}",
+			)
+		ax.axhline(0.0, linestyle="--", linewidth=1.0)
+		ax.set_ylabel(f"{name} [deg]")
+		_legend(ax, ncol=2)
+	axes[0].set_title("Drone attitude evolution: Gazebo truth and commanded angles")
+	axes[-1].set_xlabel("Time since common log start [s SIM]")
+	_finish_figure(fig, axes, data, out / "drone_angles.png")
 
 
 def plot_relative_motion(data: AnalysisData, out: Path) -> None:
@@ -1209,7 +1369,10 @@ def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
 	parser.add_argument(
 		"--full",
 		action="store_true",
-		help="Also generate platform_motion, relative_motion, and target_detection.",
+		help=(
+			"Also generate platform_motion, platform_angles, drone_angles, "
+			"relative_motion, and target_detection."
+		),
 	)
 	parser.add_argument(
 		"--max-time",
@@ -1247,7 +1410,13 @@ def main(argv: Optional[list[str]] = None) -> int:
 		print(f"saved {args.output_dir / (fn.__name__.replace('plot_', '') + '.png')}")
 
 	if args.full:
-		for fn in [plot_platform_motion, plot_relative_motion, plot_target_detection]:
+		for fn in [
+			plot_platform_motion,
+			plot_platform_angles,
+			plot_drone_angles,
+			plot_relative_motion,
+			plot_target_detection,
+		]:
 			fn(data, args.output_dir)
 			print(f"saved {args.output_dir / (fn.__name__.replace('plot_', '') + '.png')}")
 

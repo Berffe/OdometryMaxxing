@@ -7,5 +7,6 @@ logs*
 *.png
 *.mp4
 *.jpg
+calculator.py
 
 __pycache__

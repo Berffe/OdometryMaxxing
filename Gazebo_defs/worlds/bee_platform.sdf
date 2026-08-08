@@ -169,32 +169,50 @@
 
 
 	<!-- ---------------------------------------------------------------------------
-		B. Deterministic multi-frequency composition.
+		E. Deck roll and pitch -- PLUMBED IN, OFF BY DEFAULT.
+			Add <axis_roll> / <axis_pitch> exactly as for the translational axes
+			(amplitudes in radians) and set <angular_enabled>true</angular_enabled>
+			to activate. With angular_enabled false the link is held level, so this
+			block behaves identically to the current plugin and the components below
+			are parsed, reported at startup as DEFINED BUT DISABLED, and ignored.
 
-			Hand-written components, no RNG involved. Useful as the intermediate
-			step between a single sinusoid and a stochastic family: the disturbance
-			is richer but every line of it is stated explicitly in the paper.
-		--------------------------------------------------------------------------- -->
+			Before switching it on, note that a tilting deck changes three things at
+			once: the apparent shape of the visual target (and hence the centroid
+			estimate), the deck normal against which minimum_view_alignment is
+			tested, and the geometry of skid contact at touchdown. It is the case
+			Herisse et al. name in their concluding remarks as open -- the situation
+			where the platform orientation is time varying and its normal is not
+			assumed known -- so it is worth introducing on its own rather than
+			folded into a stochastic-translation run.
+	--------------------------------------------------------------------------- -->
 	<plugin filename="libOscillatingPlatformController.so" name="custom::OscillatingPlatformController">
 		<link_name>platform_link</link_name>
 
 		<axis_x>
-			<component><amplitude>0.20</amplitude><frequency>0.100</frequency><phase>1.5</phase></component>
-			<component><amplitude>0.05</amplitude><frequency>0.270</frequency><phase>0.0</phase></component>
+			<component><amplitude>0.35</amplitude><frequency>0.200</frequency><phase>1.5</phase></component>
 		</axis_x>
 		<axis_y>
-			<component><amplitude>0.21</amplitude><frequency>0.190</frequency><phase>0.0</phase></component>
-			<component><amplitude>0.1</amplitude><frequency>0.110</frequency><phase>2.1</phase></component>
+			<component><amplitude>0.30</amplitude><frequency>0.100</frequency><phase>0.0</phase></component>
 		</axis_y>
 		<axis_z>
-			<component><amplitude>0.15</amplitude><frequency>0.150</frequency><phase>1.3</phase></component>
-			<component><amplitude>0.29</amplitude><frequency>0.270</frequency><phase>0.7</phase></component>
-			<component><amplitude>0.09</amplitude><frequency>0.310</frequency><phase>4.0</phase></component>
+			<component><amplitude>0.2</amplitude><frequency>0.270</frequency><phase>0.7</phase></component>
 		</axis_z>
+
+		<!-- 0.087 rad = 5 deg. Deck roll and pitch usually sit near the heave
+			frequency, phase-shifted; here roll leads z by pi/2. -->
+		<axis_roll>
+			<component><amplitude>0.087</amplitude><frequency>0.270</frequency><phase>2.27</phase></component>
+		</axis_roll>
+		<axis_pitch>
+			<component><amplitude>0.052</amplitude><frequency>0.200</frequency><phase>0.0</phase></component>
+		</axis_pitch>
+
+		<angular_enabled>true</angular_enabled>
+		<angular_gain>8.0</angular_gain>
+		<max_angular_velocity>2.0</max_angular_velocity>
 
 		<position_gain>20.0</position_gain>
 		<max_linear_velocity>5.0</max_linear_velocity>
-		<angular_enabled>false</angular_enabled>
 	</plugin>
 
 
