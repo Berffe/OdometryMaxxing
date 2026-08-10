@@ -505,12 +505,13 @@ def plot_gain_schedule(data: AnalysisData, out: Path) -> None:
 	t = _relative_time(c["_sim_time"], data.t0)
 	fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
 
-	# Vertical gain: retain the existing upper panel.
+	# Vertical gain: use the same four-curve semantics as the lateral panels:
+	# applied gain, rejection lower bound, scheduled floor, touchdown ceiling.
 	axes[0].plot(t, _num(c, "mission_thrust_gain_k"), label="Applied vertical gain K")
 	for col, label, style in [
 		("mission_k_min", "Estimated disturbance floor", "--"),
-		("mission_k_explore", "Exploration gain", ":"),
 		("mission_k_floor", "Scheduled floor", "-."),
+		("mission_k_ceiling_leg", "Touchdown stability ceiling", ":"),
 	]:
 		y = _num(c, col)
 		if np.isfinite(y).any():
@@ -519,12 +520,92 @@ def plot_gain_schedule(data: AnalysisData, out: Path) -> None:
 	axes[0].set_title("Mission gain schedule")
 	_legend(axes[0], ncol=2)
 
+	def actual_lateral_d_gain(axis: str) -> pd.Series:
+		"""Reconstruct the D gain that ControlLaw actually receives.
+
+		The mission historically commands lateral *scales*. The independent
+		``mission_<axis>_k_applied`` quantity is the scheduled physical K used by
+		the lateral gate/descent logic and is not necessarily populated in CENTER,
+		APPROACH_PROBE or FINAL_PROBE. Plotting it directly therefore creates gaps
+		or apparent jumps that do not exist in the controller.
+
+		For every active phase the physical coefficient is instead
+
+		    K_D,actual = K_D,base * effective_axis_d_scale,
+
+		where the effective scale is the independent axis scale when available and
+		the historical shared lateral D scale otherwise.
+
+		Recover the immutable base K_D from rows where both the independently
+		scheduled K and the exact per-axis scale are logged. In DESCEND their ratio
+		is identically the base controller gain. If a run never reaches DESCEND, use
+		the FINAL_PROBE/PROBE_HOLD value k_probe and its contemporaneous scale.
+		"""
+		prefix = f"mission_{axis}"
+		axis_scale = _num(c, f"{prefix}_d_scale")
+		shared_scale = _num(c, "mission_lateral_d_scale")
+
+		# CENTER / APPROACH_PROBE / FINAL_PROBE still use the historical shared
+		# lateral scale in some mission versions. DESCEND supplies independent
+		# per-axis scales. Reconstruct the scale exactly as ControlLaw sees it:
+		# prefer the axis-specific value when present, otherwise use the shared one.
+		scale = axis_scale.where(np.isfinite(axis_scale), shared_scale)
+		scheduled = _num(c, f"{prefix}_k_applied")
+
+		scale_values = scale.to_numpy(float)
+		scheduled_values = scheduled.to_numpy(float)
+		base_gain = np.nan
+
+		# Preferred identification: DESCEND's scheduled K divided by the exact
+		# per-axis scale sent to ControlLaw. This remains valid even when roll and
+		# pitch have different independently scheduled floors.
+		valid = (
+			np.isfinite(scheduled_values)
+			& np.isfinite(scale_values)
+			& (np.abs(scale_values) > 1e-9)
+		)
+		if np.any(valid):
+			ratios = scheduled_values[valid] / scale_values[valid]
+			ratios = ratios[np.isfinite(ratios) & (ratios > 0.0)]
+			if ratios.size:
+				base_gain = float(np.nanmedian(ratios))
+
+		# Probe-only / infeasible-run fallback: k_probe is the actual D gain held
+		# during FINAL_PROBE, so k_probe / d_scale identifies the same base K_D.
+		if not np.isfinite(base_gain):
+			k_probe = _num(c, f"{prefix}_k_probe").to_numpy(float)
+			phase = _clean_string(
+				c.get("mission_substate", pd.Series("", index=c.index))
+			).to_numpy()
+			probe_phase = np.isin(phase, ["final_probe", "probe_hold", "infeasible"])
+			valid_probe = (
+				probe_phase
+				& np.isfinite(k_probe)
+				& np.isfinite(scale_values)
+				& (np.abs(scale_values) > 1e-9)
+			)
+			if np.any(valid_probe):
+				ratios = k_probe[valid_probe] / scale_values[valid_probe]
+				ratios = ratios[np.isfinite(ratios) & (ratios > 0.0)]
+				if ratios.size:
+					base_gain = float(np.nanmedian(ratios))
+
+		if np.isfinite(base_gain) and np.isfinite(scale_values).any():
+			return pd.Series(base_gain * scale_values, index=c.index, dtype=float)
+
+		# Older logs may only contain the physical scheduled K. It is preferable
+		# to show the available actual-gain samples than to relabel a unitless
+		# legacy scale as a physical gain.
+		return scheduled
+
 	def plot_lateral_axis(ax: plt.Axes, axis: str) -> None:
 		prefix = f"mission_{axis}"
-		applied = _num(c, f"{prefix}_k_applied")
-		if np.isfinite(applied).any():
-			ax.plot(t, applied, label=f"Applied {axis} D gain")
+		actual = actual_lateral_d_gain(axis)
+		if np.isfinite(actual).any():
+			ax.plot(t, actual, linewidth=1.9, label=f"Actual {axis} D gain")
 
+		# All gate quantities below already live in the same physical D-gain
+		# coordinates, so they can now be compared directly with the solid curve.
 		for suffix, label, style in [
 			("k_min", "Estimated disturbance floor", "--"),
 			("k_floor", "Scheduled floor", "-."),
@@ -534,11 +615,16 @@ def plot_gain_schedule(data: AnalysisData, out: Path) -> None:
 			if np.isfinite(y).any():
 				ax.plot(t, y, linestyle=style, label=label)
 
-		# Compatibility fallback for older logs without independent-axis gains.
-		if not np.isfinite(applied).any():
+		# Very old logs have neither an independent per-axis scale nor physical K.
+		# Retain a clearly marked diagnostic fallback without pretending it has K
+		# units. Current logs should never take this branch.
+		if not np.isfinite(actual).any():
 			legacy = _num(c, "mission_lateral_d_scale")
 			if np.isfinite(legacy).any():
-				ax.plot(t, legacy, label=f"{axis.capitalize()} D scale (legacy log)")
+				ax.plot(
+					t, legacy, alpha=0.75,
+					label=f"{axis.capitalize()} D scale (legacy, unitless)",
+				)
 
 		ax.set_ylabel(f"{axis.capitalize()} D gain")
 		_legend(ax, ncol=2)

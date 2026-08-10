@@ -48,16 +48,16 @@
 	<link_name>platform_link</link_name>
 
 	<axis_x>
-		<component><amplitude>0.20</amplitude><frequency>0.200</frequency><phase>1.5</phase></component>
-		<component><amplitude>0.05</amplitude><frequency>0.470</frequency><phase>0.0</phase></component>
+		<component><amplitude>0.20</amplitude><frequency>0.180</frequency><phase>1.5</phase></component>
+		<component><amplitude>0.05</amplitude><frequency>0.320</frequency><phase>0.0</phase></component>
 	</axis_x>
 	<axis_y>
 		<component><amplitude>0.30</amplitude><frequency>0.100</frequency><phase>0.0</phase></component>
 		<component><amplitude>0.06</amplitude><frequency>0.310</frequency><phase>2.1</phase></component>
 	</axis_y>
 	<axis_z>
-		<component><amplitude>0.40</amplitude><frequency>0.270</frequency><phase>0.7</phase></component>
-		<component><amplitude>0.08</amplitude><frequency>0.310</frequency><phase>4.0</phase></component>
+		<component><amplitude>0.40</amplitude><frequency>0.150</frequency><phase>0.7</phase></component>
+		<component><amplitude>0.25</amplitude><frequency>0.310</frequency><phase>4.0</phase></component>
 	</axis_z>
 
 	<position_gain>20.0</position_gain>
