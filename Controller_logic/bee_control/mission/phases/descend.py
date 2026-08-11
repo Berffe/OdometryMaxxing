@@ -27,6 +27,11 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
 
     elapsed = t - (routine._t_descend_start if routine._t_descend_start is not None else t)
 
+    # Commitment has already been made in FINAL_PROBE. Keep measuring chi all
+    # the way down because it is valuable bandwidth diagnostic data, but never
+    # turn a post-commit mismatch into an INFEASIBLE transition.
+    routine._update_visual_mismatch(inputs)
+
     # Each translational axis now follows the same exponential trajectory but
     # keeps its own independently probed disturbance floor.
     k = scheduled_gain_at_time(

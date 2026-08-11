@@ -85,6 +85,8 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
     # alternative, dropping the gain before probing starts, would fly the whole
     # approach far below the ceiling and throw away the bandwidth this design is
     # built to exploit.
+    # Visual synchronisation evidence, gathered from the same frames.
+    routine._update_visual_mismatch(inputs)
     routine._update_probes(
         last_thrust_cmd, last_vertical_accel_cmd,
         last_roll_accel_cmd, last_pitch_accel_cmd, dt,

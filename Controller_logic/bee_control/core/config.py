@@ -77,6 +77,25 @@ class SchedulingConfig:
     px4_offboard_confirm_timeout_sec: float = 5.0
     px4_offboard_reengage_interval_sec: float = 0.5
 
+    # Run the ROS timers on CLOCK_MONOTONIC instead of the system clock.
+    #
+    # A system-clock STEP (VM host time sync -- WSL2, Hyper-V) moves every
+    # pending timer deadline by the size of the step. A 2 s backward step
+    # stalls the control and setpoint timers for 2 s, which is four times
+    # PX4's COM_OF_LOSS_T, and the vehicle drops to its offboard-loss
+    # failsafe. Observed three times per flight before this was fixed.
+    #
+    # Leave True. False reproduces the pre-fix behaviour for A/B testing only.
+    use_steady_timers: bool = True
+
+    # Same reasoning applied to outgoing PX4 message timestamps: project the
+    # Unix epoch off the monotonic clock so uORB stamps cannot jump backwards.
+    use_steady_wall_clock: bool = True
+
+    # A skew change larger than this between consecutive supervisor ticks is
+    # reported as a discontinuity rather than drift.
+    clock_step_threshold_sec: float = 0.05
+
     # uORB enum values, not tuning. Here so nothing else hardcodes them.
     px4_nav_state_offboard: int = 14
     px4_arming_state_armed: int = 2
@@ -194,7 +213,7 @@ class MissionConfig:
     # Height at which the near-field trigger actually fires. ANCHOR of the
     # whole gain schedule. A CAMERA-GEOMETRY constant (target diameter vs FOV),
     # calibratable from a log: read relative_z_m at FINAL_PROBE entry.
-    near_field_height_m: float = 0.3
+    near_field_height_m: float = 0.5
 
     # --- Gains handed to the schedule ---
     initial_thrust_gain: float = 6.50
@@ -258,6 +277,33 @@ class MissionConfig:
     center_lateral_d_scale: float = 0.70
     probe_lateral_p_scale: float = 0.30
     probe_lateral_d_scale: float = 1.0
+
+    # --- Visual synchronisation (tracking) gate ---
+    # A one-time REJECTION test during the stationary FINAL_PROBE hold on
+    #
+    #     chi = Ddot - D^2 = -hddot / h   [1/s^2]
+    #
+    # It produces no gain correction: the authority/stability gates already
+    # decide the admissible gain window. chi asks the independent bandwidth
+    # question -- is the vehicle actually keeping up with the deck at k_probe?
+    #
+    # The gate is evaluated only before DESCENT is committed. chi continues to
+    # be measured during DESCENT for diagnosis, but it cannot revoke a committed
+    # landing.
+    enable_tracking_gate: bool = True
+    # Provisional empirical limit separating the validated low-frequency run
+    # from the rejected high-frequency case. Keep this explicit until a larger
+    # validation set turns it into a formal safety margin.
+    tracking_chi_limit_1_s2: float = 2.0
+    # Ddot is the slope of a causal least-squares fit through this much recent
+    # FILTERED divergence history. The actual camera/Gazebo SIM dt values are
+    # preserved in the regression, so irregular frame spacing is handled
+    # correctly without a post-derivative low-pass and its extra phase lag.
+    tracking_derivative_window_sec: float = 0.20
+    # Minimum FINAL_PROBE-hold observation before chi is allowed to veto. The
+    # robust chi envelope is restarted at hold entry while the derivative
+    # history stays warm from the preceding visual samples.
+    tracking_min_observation_sec: float = 1.0 * PROBE_DESIGN_PERIOD_SEC
 
     # --- Mode switches ---
     enable_descent: bool = True
@@ -345,3 +391,4 @@ class BeeConfig:
             for f in fields(value):
                 out[f"{group.name}.{f.name}"] = getattr(value, f.name)
         return out
+    

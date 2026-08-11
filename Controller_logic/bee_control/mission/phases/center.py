@@ -38,6 +38,10 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
     flow_y_norm_s = inputs.flow_y_norm_s
     flow_valid = inputs.flow_valid
 
+    # Height-free visual mismatch is diagnostic in CENTER as well. The robust
+    # FINAL_PROBE decision envelope is not active yet.
+    routine._update_visual_mismatch(inputs)
+
     if routine._center_start_t is None:
         routine._center_start_t = t
 

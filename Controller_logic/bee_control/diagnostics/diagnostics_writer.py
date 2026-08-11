@@ -87,7 +87,7 @@ class _AsyncCsvSink:
 class DiagnosticsWriter:
     #: Bumped by hand when the MEANING of the base columns changes. The
     #: per-run fingerprint below covers accidental column drift automatically.
-    CONTROLLER_SCHEMA_VERSION = "5.0-controller"
+    CONTROLLER_SCHEMA_VERSION = "6.0-controller"
     TRUTH_LOG_SCHEMA_VERSION = "1.0-truth-log"
 
     #: Columns this writer owns outright. Everything else comes from sources.

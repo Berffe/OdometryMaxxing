@@ -35,6 +35,7 @@ import time
 import cv2
 import rclpy
 from cv_bridge import CvBridge, CvBridgeError
+from rclpy.clock import Clock, ClockType
 from rclpy.node import Node
 from rclpy.qos import (
     QoSDurabilityPolicy,
@@ -68,7 +69,19 @@ class BeeLandNode(Node):
         self.config = config or BeeConfig.default()
         cfg = self.config
 
-        self.time = TimeManager(self)
+        self.time = TimeManager(
+            self,
+            steady_wall=cfg.scheduling.use_steady_wall_clock,
+            step_threshold_sec=cfg.scheduling.clock_step_threshold_sec,
+        )
+        # Timers must not run on the system clock: a backward step moves every
+        # pending deadline forward by the size of the step and stalls the loop.
+        # rclpy computes those deadlines internally, so this cannot be fixed by
+        # projecting a Python value -- the clock object itself has to be steady.
+        self._timer_clock = (
+            Clock(clock_type=ClockType.STEADY_TIME)
+            if cfg.scheduling.use_steady_timers else None
+        )
         self.bridge = CvBridge()
 
         # --------------------------------------------------------- subsystems
@@ -107,6 +120,7 @@ class BeeLandNode(Node):
         # names; this node declares none of them.
         self.diagnostics = DiagnosticsWriter(
             sources=[
+                self.time,
                 self.px4_status,
                 self.state,
                 self.mission,
@@ -177,9 +191,12 @@ class BeeLandNode(Node):
             cfg, self.px4_status, self._build_sequencer_ports())
 
         self._start_vision_worker()
-        self.create_timer(cfg.scheduling.control_period_sec, self.on_control_timer)
-        self.create_timer(cfg.scheduling.px4_setpoint_period_sec, self.on_px4_timer)
-        self.create_timer(cfg.scheduling.supervisor_period_sec, self.on_supervisor_timer)
+        self.create_timer(cfg.scheduling.control_period_sec, self.on_control_timer,
+                          clock=self._timer_clock)
+        self.create_timer(cfg.scheduling.px4_setpoint_period_sec, self.on_px4_timer,
+                          clock=self._timer_clock)
+        self.create_timer(cfg.scheduling.supervisor_period_sec, self.on_supervisor_timer,
+                          clock=self._timer_clock)
         self.mavsdk.start()
 
         self.get_logger().info(
@@ -403,6 +420,16 @@ class BeeLandNode(Node):
 
     # ------------------------------------------------------- mission/control
     def on_supervisor_timer(self):
+        # Watch the host clock. A step no longer breaks the loop, but it is
+        # still a fault in the machine running this and must not pass silently.
+        step = self.time.check_clock_step()
+        if step is not None:
+            direction = "BACKWARD" if step.backward else "forward"
+            detail = f"system clock stepped {direction} by {step.step_sec:+.3f} s"
+            self.get_logger().warning(
+                f"{detail}; timers and PX4 stamps are on the steady clock and "
+                "are unaffected, but the host time source should be fixed")
+            self._log_event("clock_step", detail)
         self.sequencer.update()
 
     def on_control_timer(self):
@@ -578,3 +605,4 @@ def main(args=None):
 
 if __name__ == "__main__":
     main()
+    

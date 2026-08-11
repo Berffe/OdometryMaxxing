@@ -46,6 +46,17 @@ PHASE_COLORS = {
 PHASE_ALPHA = 0.055
 
 
+# Height-free visual trackability diagnostic.  The derivative is reconstructed
+# causally from the already-filtered divergence using a short least-squares
+# line fit.  The 2.0 s^-2 threshold is intentionally a diagnostic candidate:
+# it separates the currently validated feasible and high-frequency infeasible
+# runs, but it is not yet part of the mission feasibility verdict.
+VISUAL_MISMATCH_DERIVATIVE_WINDOW_SEC = 0.20
+VISUAL_MISMATCH_PERCENTILE = 95.0
+VISUAL_MISMATCH_MIN_SAMPLES = 10
+VISUAL_MISMATCH_LIMIT_S2 = 2.0
+
+
 @dataclass(frozen=True)
 class AnalysisData:
 	controller: pd.DataFrame
@@ -446,6 +457,372 @@ def _probe_plot_end_sim_time(data: AnalysisData) -> float:
 	if not np.any(valid):
 		return float(data.t1)
 	return min(float(data.t1), float(np.min(times[valid])))
+
+
+def _causal_linear_derivative(
+	times: np.ndarray,
+	values: np.ndarray,
+	window_sec: float,
+	*,
+	min_points: int = 4,
+) -> np.ndarray:
+	"""Estimate dy/dt from a causal trailing least-squares line fit.
+
+	The estimator only uses samples at or before the current timestamp, so the
+	diagnostic can later be reproduced online without relying on acausal
+	smoothing.  A 0.20 s window is long enough to suppress frame-to-frame
+	divergence noise while remaining short relative to the platform periods used
+	in the landing tests.
+	"""
+	t = np.asarray(times, dtype=float)
+	y = np.asarray(values, dtype=float)
+	out = np.full_like(y, np.nan, dtype=float)
+	left = 0
+
+	for i in range(len(t)):
+		if not np.isfinite(t[i]) or not np.isfinite(y[i]):
+			continue
+		while left < i and (t[i] - t[left]) > float(window_sec):
+			left += 1
+
+		idx = np.arange(left, i + 1)
+		good = np.isfinite(t[idx]) & np.isfinite(y[idx])
+		idx = idx[good]
+		if idx.size < int(min_points):
+			continue
+
+		t_local = t[idx]
+		y_local = y[idx]
+		t_centered = t_local - float(np.mean(t_local))
+		den = float(np.dot(t_centered, t_centered))
+		if den <= 1e-12:
+			continue
+
+		y_centered = y_local - float(np.mean(y_local))
+		out[i] = float(np.dot(t_centered, y_centered) / den)
+
+	return out
+
+
+def _visual_mismatch_series(
+	data: AnalysisData,
+	control: pd.DataFrame,
+) -> tuple[np.ndarray, np.ndarray]:
+	"""Return measured and Gazebo-truth chi = D_dot - D^2 [1/s^2]."""
+	t = control["_sim_time"].to_numpy(float)
+	measured_d = _num(control, "flow_divergence_1_s").to_numpy(float)
+	measured_d_dot = _causal_linear_derivative(
+		t,
+		measured_d,
+		VISUAL_MISMATCH_DERIVATIVE_WINDOW_SEC,
+	)
+	measured_chi = measured_d_dot - measured_d * measured_d
+
+	truth_d = _interp_truth(data, "truth_normal_expansion_rate_1_s", t)
+	truth_valid = _interp_truth(data, "truth_expansion_truth_valid", t) > 0.5
+	truth_d[~truth_valid] = np.nan
+	truth_d_dot = _causal_linear_derivative(
+		t,
+		truth_d,
+		VISUAL_MISMATCH_DERIVATIVE_WINDOW_SEC,
+	)
+	truth_chi = truth_d_dot - truth_d * truth_d
+	return measured_chi, truth_chi
+
+
+def _visual_mismatch_probe_statistics(
+	control: pd.DataFrame,
+	chi: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+	"""Cumulative FINAL_PROBE mismatch statistics in controller-row coordinates.
+
+	The robust probe statistic follows the same interpretation used for the
+	acceleration probe: persistent mismatch is represented by |mean| and the
+	oscillatory component by the percentile of |chi - mean|. Their sum is the
+	scalar quantity compared with the candidate trackability limit.
+	"""
+	mean_mag = np.full(len(control), np.nan, dtype=float)
+	residual = np.full(len(control), np.nan, dtype=float)
+	percentile = np.full(len(control), np.nan, dtype=float)
+	robust = np.full(len(control), np.nan, dtype=float)
+
+	phase = _clean_string(
+		control.get("mission_substate", pd.Series("", index=control.index))
+	).to_numpy()
+	probe_indices = np.flatnonzero((phase == "final_probe") & np.isfinite(chi))
+	values: list[float] = []
+
+	for i in probe_indices:
+		values.append(float(chi[i]))
+		arr = np.asarray(values, dtype=float)
+		mean = float(np.mean(arr))
+		mean_mag[i] = abs(mean)
+		residual[i] = abs(float(chi[i]) - mean)
+
+		if arr.size >= VISUAL_MISMATCH_MIN_SAMPLES:
+			p = float(np.percentile(np.abs(arr - mean), VISUAL_MISMATCH_PERCENTILE))
+			percentile[i] = p
+			robust[i] = abs(mean) + p
+
+	return mean_mag, residual, percentile, robust
+
+
+def _plot_visual_mismatch_legacy(data: AnalysisData, out: Path) -> None:
+	"""Legacy fallback for logs recorded before mission chi telemetry existed."""
+	c_all = data.control
+	probe_end_sim = _probe_plot_end_sim_time(data)
+	if probe_end_sim < data.t1 - 1e-9:
+		c = c_all[c_all["_sim_time"] < probe_end_sim].copy()
+	else:
+		c = c_all.copy()
+
+	if c.empty:
+		return
+
+	t = _relative_time(c["_sim_time"], data.t0)
+	measured_chi, truth_chi = _visual_mismatch_series(data, c)
+	mean_mag, residual, percentile, robust = _visual_mismatch_probe_statistics(c, measured_chi)
+
+	fig, axes = plt.subplots(2, 1, figsize=(13, 7), sharex=True)
+
+	axes[0].plot(
+		t,
+		measured_chi,
+		linewidth=1.6,
+		label=r"Visual mismatch $\chi=\dot{D}-D^2$",
+	)
+	if np.isfinite(truth_chi).any():
+		axes[0].plot(
+			t,
+			truth_chi,
+			alpha=0.72,
+			linewidth=1.5,
+			label="Gazebo-truth normalized relative acceleration",
+		)
+	axes[0].axhline(
+		VISUAL_MISMATCH_LIMIT_S2,
+		linestyle="--",
+		linewidth=1.5,
+		label=f"Candidate trackability limit: ±{VISUAL_MISMATCH_LIMIT_S2:.2f} s⁻²",
+	)
+	axes[0].axhline(
+		-VISUAL_MISMATCH_LIMIT_S2,
+		linestyle="--",
+		linewidth=1.5,
+		label="_nolegend_",
+	)
+	axes[0].axhline(0.0, linestyle=":", linewidth=1.0)
+	axes[0].set_ylabel("Mismatch χ [s⁻²]")
+	axes[0].set_title("Visual mismatch probe: height-free dynamic trackability")
+	_legend(axes[0], ncol=2)
+
+	axes[1].plot(t, mean_mag, label=r"Persistent term $|\bar{\chi}|$")
+	axes[1].plot(t, residual, alpha=0.55, label=r"Instantaneous residual $|\chi-\bar{\chi}|$")
+	axes[1].plot(
+		t,
+		percentile,
+		linestyle=":",
+		linewidth=1.7,
+		label=f"Residual P{VISUAL_MISMATCH_PERCENTILE:.0f}",
+	)
+	axes[1].plot(
+		t,
+		robust,
+		linewidth=2.0,
+		label=r"Probe statistic $|\bar{\chi}|+P_{95}(|\chi-\bar{\chi}|)$",
+	)
+	axes[1].axhline(
+		VISUAL_MISMATCH_LIMIT_S2,
+		linestyle="--",
+		linewidth=1.7,
+		label=f"Candidate limit: {VISUAL_MISMATCH_LIMIT_S2:.2f} s⁻²",
+	)
+	axes[1].set_ylabel("Probe statistic [s⁻²]")
+	axes[1].set_xlabel("Time since common log start [s SIM]")
+	_legend(axes[1], ncol=2)
+
+	_finish_figure(
+		fig,
+		axes,
+		data,
+		out / "visual_mismatch_probe.png",
+		x_end=probe_end_sim - data.t0,
+	)
+
+
+
+def _logged_visual_mismatch_available(control: pd.DataFrame) -> bool:
+	"""True when the controller log contains the mission's online chi estimator."""
+	return (
+		"mission_chi" in control.columns
+		and np.isfinite(_num(control, "mission_chi")).any()
+	)
+
+
+def _first_true_sample_time(df: pd.DataFrame, column: str) -> float:
+	"""Return the first SIM timestamp where a logged boolean telemetry flag is true."""
+	if column not in df.columns:
+		return np.nan
+	mask = _bool(df, column).to_numpy()
+	t = _num(df, "_sim_time").to_numpy(float)
+	idx = np.flatnonzero(mask & np.isfinite(t))
+	return float(t[idx[0]]) if idx.size else np.nan
+
+
+def _tracking_decision_value(control: pd.DataFrame, column: str) -> float:
+	"""Read a FINAL_PROBE gate value only from rows where tracking_ready is latched."""
+	if column not in control.columns:
+		return np.nan
+	ready = _bool(control, "mission_tracking_ready").to_numpy()
+	value = _num(control, column).to_numpy(float)
+	good = ready & np.isfinite(value)
+	if np.any(good):
+		return float(value[np.flatnonzero(good)[0]])
+	return np.nan
+
+
+def _tracking_decision_sample(df: pd.DataFrame) -> tuple[float, float, float]:
+	"""Return (time, decision_peak, observed_sec) at the first ready gate row.
+
+	Use the full controller log rather than only fresh-control rows: the actual
+	FINAL_PROBE decision may be emitted on the phase-transition event row.
+	"""
+	if "mission_tracking_ready" not in df.columns:
+		return np.nan, np.nan, np.nan
+	ready = _bool(df, "mission_tracking_ready").to_numpy()
+	t = _num(df, "_sim_time").to_numpy(float)
+	peak = _num(df, "mission_tracking_decision_chi_peak_1_s2").to_numpy(float)
+	obs = _num(df, "mission_chi_observed_sec").to_numpy(float)
+	good = ready & np.isfinite(t)
+	idx = np.flatnonzero(good)
+	if not idx.size:
+		return np.nan, np.nan, np.nan
+	i = int(idx[0])
+	return (
+		float(t[i]),
+		float(peak[i]) if np.isfinite(peak[i]) else np.nan,
+		float(obs[i]) if np.isfinite(obs[i]) else np.nan,
+	)
+
+
+def plot_visual_mismatch_probe(data: AnalysisData, out: Path) -> None:
+	"""Plot the ONLINE visual-mismatch estimator, envelope and FINAL_PROBE verdict.
+
+	Current logs expose the exact quantities computed onboard by
+	``VisualMismatchProbe``.  Plot those values directly rather than reconstructing
+	chi offline: this makes the figure a diagnostic of the estimator that actually
+	gated the mission.  The curve continues through DESCENT, while the FINAL_PROBE
+	decision peak is shown separately as a latched pre-commit value.
+
+	Older logs are still supported through the previous offline reconstruction.
+	"""
+	c = data.control
+	if c.empty:
+		return
+	if not _logged_visual_mismatch_available(c):
+		_plot_visual_mismatch_legacy(data, out)
+		return
+
+	t = _relative_time(c["_sim_time"], data.t0)
+	tc = c["_sim_time"].to_numpy(float)
+	chi = _num(c, "mission_chi").to_numpy(float)
+	abs_chi = _num(c, "mission_chi_abs_1_s2").to_numpy(float)
+	d_dot = _num(c, "mission_chi_divergence_rate_1_s2").to_numpy(float)
+	percentile = _num(c, "mission_chi_percentile_1_s2").to_numpy(float)
+	live_peak = _num(c, "mission_chi_peak_1_s2").to_numpy(float)
+	limit = _num(c, "mission_chi_limit_1_s2").to_numpy(float)
+	decision_peak = _num(c, "mission_tracking_decision_chi_peak_1_s2").to_numpy(float)
+	observed = _num(c, "mission_chi_observed_sec").to_numpy(float)
+
+	derivative_ready = _bool(c, "mission_chi_derivative_ready").to_numpy(float)
+	tracking_ready = _bool(c, "mission_tracking_ready").to_numpy(float)
+	tracking_sync = _bool(c, "mission_tracking_synchronized").to_numpy(float)
+	tracking_feasible = _bool(c, "mission_tracking_feasible").to_numpy(float)
+	tracking_sync_display = np.where(tracking_ready > 0.5, tracking_sync, np.nan)
+	tracking_feasible_display = np.where(tracking_ready > 0.5, tracking_feasible, np.nan)
+
+	# The truth curve is validation-only.  It is reconstructed from the dense
+	# Gazebo truth expansion rate with the same causal window used by the offline
+	# diagnostic; the mission gate never sees it.
+	truth_d = _interp_truth(data, "truth_normal_expansion_rate_1_s", tc)
+	truth_valid = _interp_truth(data, "truth_expansion_truth_valid", tc) > 0.5
+	truth_d[~truth_valid] = np.nan
+	truth_d_dot = _causal_linear_derivative(
+		tc, truth_d, VISUAL_MISMATCH_DERIVATIVE_WINDOW_SEC,
+	)
+	truth_chi = truth_d_dot - truth_d * truth_d
+
+	fig, axes = plt.subplots(3, 1, figsize=(13, 10), sharex=True)
+
+	# 1) The two mathematical quantities that form chi.  Same units, same timing.
+	if np.isfinite(d_dot).any():
+		axes[0].plot(t, d_dot, alpha=0.78, label=r"Online causal $\dot{D}$")
+	axes[0].plot(t, chi, linewidth=1.8, label=r"Online $\chi=\dot{D}-D^2$")
+	if np.isfinite(truth_chi).any():
+		axes[0].plot(
+			t, truth_chi, alpha=0.52, linewidth=1.3,
+			label="Gazebo-truth normalized relative acceleration",
+		)
+	axes[0].axhline(0.0, linestyle=":", linewidth=1.0)
+	axes[0].set_ylabel("Rate / mismatch [s⁻²]")
+	axes[0].set_title("Visual mismatch: online height-free bandwidth diagnostic")
+	_legend(axes[0], ncol=2)
+
+	# 2) Exact robust quantities used by VisualMismatchProbe.  live_peak keeps
+	# evolving after commitment; decision_peak is the frozen FINAL_PROBE verdict.
+	if np.isfinite(abs_chi).any():
+		axes[1].plot(t, abs_chi, alpha=0.42, label=r"Instantaneous $|\chi|$")
+	if np.isfinite(percentile).any():
+		axes[1].plot(t, percentile, linestyle=":", linewidth=1.8,
+		             label="Rolling |χ| percentile")
+	if np.isfinite(live_peak).any():
+		axes[1].plot(t, live_peak, linewidth=2.0,
+		             label="Live leaky mismatch peak")
+
+	# Read the committed gate sample from the FULL controller stream because the
+	# transition row itself may be event-tagged and therefore absent from c. Show
+	# it as a frozen post-decision segment, distinct from the live diagnostic peak.
+	decision_time_sim, committed_peak, _ = _tracking_decision_sample(data.controller)
+	if np.isfinite(decision_time_sim) and np.isfinite(committed_peak):
+		decision_time = decision_time_sim - data.t0
+		decision_plot = np.where(t >= decision_time, committed_peak, np.nan)
+		axes[1].plot(
+			t, decision_plot, linestyle="-.", linewidth=2.1,
+			label="Latched FINAL_PROBE decision peak",
+		)
+		for ax in axes:
+			ax.axvline(decision_time, linestyle=":", linewidth=1.0, alpha=0.65)
+
+	if np.isfinite(limit).any():
+		axes[1].plot(t, limit, linestyle="--", linewidth=1.8,
+		             label="FINAL_PROBE χ limit")
+	axes[1].set_ylabel("Mismatch magnitude [s⁻²]")
+	_legend(axes[1], ncol=2)
+
+	# 3) Estimator/gate validity.  observed_sec only advances while the
+	# FINAL_PROBE decision window is active; flags reveal exactly when the value
+	# became mathematically ready and when the one-time verdict was committed.
+	axes[2].step(t, derivative_ready, where="post", label="Derivative ready")
+	axes[2].step(t, tracking_ready, where="post", label="Tracking gate ready")
+	axes[2].step(t, tracking_sync_display, where="post", label="FINAL_PROBE synchronized")
+	axes[2].step(t, tracking_feasible_display, where="post", label="FINAL_PROBE feasible")
+	axes[2].set_ylim(-0.05, 1.08)
+	axes[2].set_ylabel("Estimator / gate flag")
+	axes[2].set_xlabel("Time since common log start [s SIM]")
+	_legend(axes[2], ncol=2)
+
+	if np.isfinite(observed).any():
+		ax_obs = axes[2].twinx()
+		ax_obs.plot(t, observed, alpha=0.38, linestyle=":",
+		            label="χ envelope observation time")
+		ax_obs.set_ylabel("Gate observation [s]")
+		obs_handles, obs_labels = ax_obs.get_legend_handles_labels()
+		if obs_handles:
+			handles, labels = axes[2].get_legend_handles_labels()
+			axes[2].legend(handles + obs_handles, labels + obs_labels,
+			               loc="best", ncol=2, framealpha=0.92)
+
+	_finish_figure(fig, axes, data, out / "visual_mismatch_probe.png")
 
 
 def plot_detections_boxes_fov(data: AnalysisData, out: Path) -> None:
@@ -1422,7 +1799,7 @@ def write_summary(data: AnalysisData, out: Path, controller_path: Path, truth_pa
 			"",
 			"Landing feasibility",
 			"-------------------",
-			f"Combined vertical/roll/pitch verdict: {'FEASIBLE' if feasible_values[-1] > 0.5 else 'INFEASIBLE'}",
+			f"Combined vertical/roll/pitch/tracking verdict: {'FEASIBLE' if feasible_values[-1] > 0.5 else 'INFEASIBLE'}",
 		])
 		for axis in ("vertical", "roll", "pitch"):
 			flag = _last_finite_value(c, f"mission_{axis}_feasible")
@@ -1433,6 +1810,83 @@ def write_summary(data: AnalysisData, out: Path, controller_path: Path, truth_pa
 		reasons = reasons[reasons != ""]
 		if len(reasons):
 			lines.append(f"Reason: {reasons.iloc[-1]}")
+
+	# Height-free bandwidth / trackability telemetry. Current logs expose the
+	# exact online estimator that makes the FINAL_PROBE decision; old logs fall
+	# back to the previous offline reconstruction so historical runs still parse.
+	if _logged_visual_mismatch_available(c):
+		chi = _num(c, "mission_chi").to_numpy(float)
+		abs_chi = _num(c, "mission_chi_abs_1_s2").to_numpy(float)
+		d_dot = _num(c, "mission_chi_divergence_rate_1_s2").to_numpy(float)
+		percentile = _num(c, "mission_chi_percentile_1_s2").to_numpy(float)
+		live_peak = _num(c, "mission_chi_peak_1_s2").to_numpy(float)
+		limit = _last_finite_value(c, "mission_chi_limit_1_s2")
+		decision_time, decision_peak, observed_at_decision = _tracking_decision_sample(
+			data.controller
+		)
+		tracking_ready = _last_finite_value(data.controller, "mission_tracking_ready")
+		tracking_sync = _last_finite_value(data.controller, "mission_tracking_synchronized")
+		tracking_enabled = _last_finite_value(data.controller, "mission_tracking_enabled")
+		tracking_feasible = _last_finite_value(data.controller, "mission_tracking_feasible")
+
+		phase = _clean_string(c.get("mission_substate", pd.Series("", index=c.index)))
+		descend_mask = (phase == "descend").to_numpy()
+		descend_peak = live_peak[descend_mask & np.isfinite(live_peak)]
+		max_descend_peak = float(np.max(descend_peak)) if descend_peak.size else np.nan
+		finite_abs = abs_chi[np.isfinite(abs_chi)]
+		finite_rate = np.abs(d_dot[np.isfinite(d_dot)])
+
+		lines.extend([
+			"",
+			"Visual mismatch / bandwidth gate",
+			"--------------------------------",
+			"Online definition: chi = D_dot - D^2 from the mission's causal regression estimator",
+		])
+		if finite_abs.size:
+			lines.append(f"Maximum instantaneous |chi| in analysed interval: {np.max(finite_abs):.4f} s^-2")
+		if finite_rate.size:
+			lines.append(f"Maximum |D_dot| in analysed interval: {np.max(finite_rate):.4f} s^-2")
+		if np.isfinite(decision_peak):
+			lines.append(f"FINAL_PROBE decision peak: {decision_peak:.4f} s^-2")
+		if np.isfinite(limit):
+			lines.append(f"FINAL_PROBE chi limit: {limit:.4f} s^-2")
+		if np.isfinite(decision_time):
+			lines.append(f"FINAL_PROBE tracking decision: {decision_time-data.t0:.3f} s plot time")
+		if np.isfinite(observed_at_decision):
+			lines.append(f"Chi observation accumulated at decision: {observed_at_decision:.3f} s")
+		if np.isfinite(tracking_enabled):
+			lines.append(f"Tracking gate enabled: {'YES' if tracking_enabled > 0.5 else 'NO'}")
+		if np.isfinite(tracking_ready):
+			lines.append(f"Tracking gate ready: {'YES' if tracking_ready > 0.5 else 'NO'}")
+		if np.isfinite(tracking_sync):
+			lines.append(f"FINAL_PROBE synchronized: {'YES' if tracking_sync > 0.5 else 'NO'}")
+		if np.isfinite(tracking_feasible):
+			lines.append(f"Tracking feasibility verdict: {'FEASIBLE' if tracking_feasible > 0.5 else 'INFEASIBLE'}")
+		if np.isfinite(max_descend_peak):
+			lines.append(
+				f"Maximum live chi peak during DESCENT: {max_descend_peak:.4f} s^-2 "
+				"(diagnostic only; commitment already made)"
+			)
+	else:
+		measured_chi, truth_chi = _visual_mismatch_series(data, c)
+		mean_mag, residual, percentile, robust = _visual_mismatch_probe_statistics(c, measured_chi)
+		finite_robust = robust[np.isfinite(robust)]
+		if finite_robust.size:
+			final_visual_mismatch = float(finite_robust[-1])
+			lines.extend([
+				"",
+				"Visual mismatch diagnostic (legacy reconstruction)",
+				"--------------------------------------------------",
+				(
+					"Definition: chi = D_dot - D^2, with D_dot reconstructed from a causal "
+					f"{VISUAL_MISMATCH_DERIVATIVE_WINDOW_SEC:.2f} s linear fit"
+				),
+				(
+					f"FINAL_PROBE reconstructed mismatch: {final_visual_mismatch:.4f} s^-2 "
+					f"(|mean| + P{VISUAL_MISMATCH_PERCENTILE:.0f} residual)"
+				),
+				f"Legacy candidate trackability limit: {VISUAL_MISMATCH_LIMIT_S2:.4f} s^-2",
+			])
 
 	_append_vision_delay_table(data, lines)
 
@@ -1488,6 +1942,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 		plot_probe_vertical,
 		plot_probe_roll,
 		plot_probe_pitch,
+		plot_visual_mismatch_probe,
 		plot_vertical_descent,
 		plot_vertical_divergence,
 	]

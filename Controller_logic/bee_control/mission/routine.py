@@ -52,12 +52,15 @@ from . import phases
 from .gates import (
     GateResult,
     LateralGateResult,
+    TrackingGateResult,
+    compute_tracking_gate,
     ceiling_gain_at_height,
     compute_lateral_gate,
 )
 from .math_utils import blank as _blank, clamp
 from .phases import PHASES
 from .probe import PlatformProbe, ProbeResult, ThrustModel
+from .visual_mismatch import VisualMismatchProbe
 from .types import (
     ABORTED,
     APPROACH_PROBE,
@@ -184,9 +187,30 @@ class MissionRoutine:
         self._near_probe_decay_tau = float(cfg.near_probe_decay_tau_sec)
         self._near_probe_highpass_tau = float(cfg.near_probe_highpass_tau_sec)
 
+        # Visual synchronisation probe. Fed the FILTERED divergence the
+        # controller actually acts on, so chi describes the loop being flown
+        # rather than an idealised one. Ddot is a causal least-squares slope over
+        # recent samples spaced by the real camera/Gazebo SIM dt values.
+        self._chi_probe = VisualMismatchProbe(
+            percentile_window_sec=cfg.far_probe_window_sec,
+            peak_decay_tau_sec=cfg.far_probe_decay_tau_sec,
+            derivative_window_sec=cfg.tracking_derivative_window_sec,
+        )
+        self._enable_tracking_gate = bool(cfg.enable_tracking_gate)
+        self._tracking_chi_limit = max(0.0, float(cfg.tracking_chi_limit_1_s2))
+        self._tracking_min_observation_sec = max(
+            0.0, float(cfg.tracking_min_observation_sec)
+        )
+        # Only the stationary FINAL_PROBE hold contributes to the gate clock and
+        # decision envelope. chi itself is still updated in every active visual
+        # phase for diagnosis.
+        self._chi_gate_window_active = False
+        self._chi_observed_sec = 0.0
+
         self.gate = GateResult()
         self.roll_gate = LateralGateResult()
         self.pitch_gate = LateralGateResult()
+        self.tracking_gate = TrackingGateResult()
         self.probe_result = ProbeResult()
         self.roll_probe_result = ProbeResult()
         self.pitch_probe_result = ProbeResult()
@@ -253,9 +277,13 @@ class MissionRoutine:
                 percentile_window_sec=self._far_probe_window,
                 peak_decay_tau_sec=self._far_probe_decay_tau,
             )
+        self._chi_probe.reset()
+        self._chi_gate_window_active = False
+        self._chi_observed_sec = 0.0
         self.gate = GateResult()
         self.roll_gate = LateralGateResult()
         self.pitch_gate = LateralGateResult()
+        self.tracking_gate = TrackingGateResult()
         self.probe_result = ProbeResult()
         self.roll_probe_result = ProbeResult()
         self.pitch_probe_result = ProbeResult()
@@ -351,6 +379,13 @@ class MissionRoutine:
         "pitch_probe_residual_accel_m_s2", "pitch_probe_percentile_accel_m_s2",
         "pitch_probe_peak_accel_m_s2", "pitch_probe_peak_accel_at_handoff_m_s2",
         "near_field_height_m",
+        # Visual synchronisation gate.
+        "chi", "chi_abs_1_s2", "chi_divergence_rate_1_s2",
+        "chi_percentile_1_s2", "chi_peak_1_s2", "chi_limit_1_s2",
+        "chi_observed_sec", "chi_derivative_ready",
+        "tracking_decision_chi_peak_1_s2",
+        "tracking_ready", "tracking_synchronized",
+        "tracking_enabled", "tracking_feasible",
     )
 
     _PROBE_COLUMNS: ClassVar[dict] = {
@@ -450,6 +485,25 @@ class MissionRoutine:
             "infeasible_reason": _blank(info.get("infeasible_reason")),
         }
 
+        tracking = self.tracking_gate
+        row.update({
+            "chi": self._chi_probe.chi,
+            "chi_abs_1_s2": self._chi_probe.abs_chi,
+            "chi_divergence_rate_1_s2": self._chi_probe.divergence_rate,
+            "chi_percentile_1_s2": self._chi_probe.percentile_chi,
+            "chi_peak_1_s2": self._chi_probe.peak_chi,
+            "chi_limit_1_s2": self._tracking_chi_limit,
+            "chi_observed_sec": self._chi_observed_sec,
+            "chi_derivative_ready": int(bool(self._chi_probe.derivative_ready)),
+            # Frozen value used by the one-time FINAL_PROBE decision. The live
+            # chi_peak above is free to keep evolving during DESCENT diagnostics.
+            "tracking_decision_chi_peak_1_s2": tracking.chi_peak,
+            "tracking_ready": int(bool(tracking.ready)),
+            "tracking_synchronized": int(bool(tracking.synchronized)),
+            "tracking_enabled": int(bool(tracking.enabled)),
+            "tracking_feasible": int(bool(tracking.feasible)),
+        })
+
         probe = self.probe_telemetry()
         for key, column in self._PROBE_COLUMNS.items():
             if key in probe:
@@ -538,7 +592,18 @@ class MissionRoutine:
 
     @property
     def feasible(self) -> bool:
-        return self.gate.feasible and self.roll_gate.feasible and self.pitch_gate.feasible
+        """All four pre-commit gates. The tracking verdict is frozen at the
+        FINAL_PROBE decision and is diagnostic-only after DESCENT begins."""
+        return (
+            self.gate.feasible
+            and self.roll_gate.feasible
+            and self.pitch_gate.feasible
+            and self.tracking_gate.feasible
+        )
+
+    @property
+    def tracking_feasible(self) -> bool:
+        return bool(self.tracking_gate.feasible)
 
     @property
     def vertical_feasible(self) -> bool:
@@ -581,6 +646,52 @@ class MissionRoutine:
         # handing the MissionControl back to the logger.
         self.last_control = control
         return control
+
+    def _update_visual_mismatch(self, inputs: MissionInputs) -> None:
+        """Fold one visual sample into the height-free bandwidth diagnostic.
+
+        chi is updated in every active visual phase from the FILTERED divergence
+        the controller actually sees. The mission's ``inputs.dt`` already comes
+        from consecutive fresh camera/Gazebo SIM timestamps, so the regression
+        preserves the real temporal spacing without introducing another clock.
+
+        Only the stationary FINAL_PROBE hold activates the gate clock/envelope;
+        DESCENT continues updating chi for diagnosis but cannot revoke commitment.
+        """
+        if not inputs.flow_valid:
+            return
+        self._chi_probe.update(
+            float(getattr(inputs.flow, "divergence", 0.0)),
+            inputs.dt,
+        )
+        if self._chi_gate_window_active and self._chi_probe.derivative_ready:
+            self._chi_observed_sec += inputs.dt
+
+    def _begin_tracking_gate_window(self) -> None:
+        """Start the FINAL_PROBE decision window without cooling Ddot history."""
+        self._chi_probe.retune(
+            percentile_window_sec=self._near_probe_window,
+            peak_decay_tau_sec=self._near_probe_decay_tau,
+        )
+        self._chi_probe.reset_envelope()
+        self._chi_observed_sec = 0.0
+        self._chi_gate_window_active = True
+        self.tracking_gate = TrackingGateResult()
+
+    def _refresh_tracking_gate(self) -> TrackingGateResult:
+        probe_ready = self._chi_probe.result(
+            min_duration_sec=self._tracking_min_observation_sec
+        ).ready
+        self.tracking_gate = compute_tracking_gate(
+            chi_peak=self._chi_probe.peak_chi,
+            chi_limit=self._tracking_chi_limit,
+            ready=(
+                probe_ready
+                and self._chi_observed_sec >= self._tracking_min_observation_sec
+            ),
+            enabled=self._enable_tracking_gate,
+        )
+        return self.tracking_gate
 
     def _update_probes(
         self,
@@ -688,6 +799,9 @@ class MissionRoutine:
                     f"K_ceiling_leg={gate.k_ceiling_leg:.3f}"
                 )
 
+        if not self.tracking_gate.feasible and self.tracking_gate.reason:
+            reasons.append(self.tracking_gate.reason)
+
         if not self._enable_descent:
             reasons.append("DESCENT disabled by configuration")
 
@@ -766,16 +880,18 @@ class MissionRoutine:
                 f"k_min={self.gate.k_min:.2f} k_floor={self.gate.k_floor:.2f} "
                 f"k_ceiling_leg={self.gate.k_ceiling_leg:.2f} "
                 f"h_crit={self.gate.h_crit:.2f}m "
-                f"flags z/r/p={int(self.vertical_feasible)}/"
-                f"{int(self.roll_feasible)}/{int(self.pitch_feasible)} "
+                f"flags z/r/p/chi={int(self.vertical_feasible)}/"
+                f"{int(self.roll_feasible)}/{int(self.pitch_feasible)}/"
+                f"{int(self.tracking_feasible)} "
                 f"vs leg={self._leg_clearance:.2f}m -> {verdict} (hovering, no descent)"
             )
 
         if self._substate == INFEASIBLE:
             reasons = "; ".join(self._gate_failure_reasons())
             return (
-                f"[infeasible] flags z/r/p={int(self.vertical_feasible)}/"
-                f"{int(self.roll_feasible)}/{int(self.pitch_feasible)}: {reasons}"
+                f"[infeasible] flags z/r/p/chi={int(self.vertical_feasible)}/"
+                f"{int(self.roll_feasible)}/{int(self.pitch_feasible)}/"
+                f"{int(self.tracking_feasible)}: {reasons}"
             )
 
         return (
@@ -790,4 +906,3 @@ class MissionRoutine:
     #: attribute so existing callers (``bee_node``, tests) can still reach it
     #: as ``MissionRoutine.PHASES``.
     PHASES: ClassVar[dict] = PHASES
-

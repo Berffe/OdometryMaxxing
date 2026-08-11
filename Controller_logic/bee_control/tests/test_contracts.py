@@ -18,8 +18,10 @@ px4_msgs, so it runs on a laptop with no ROS install.
 from __future__ import annotations
 
 import math
+import time
 import tempfile
 
+from bee_control.core.clock import SteadyWallClock, TimeManager
 from bee_control.core.config import BeeConfig, MissionConfig
 from bee_control.core.controller_state import ControllerState, PX4Status, VisionTelemetry
 from bee_control.diagnostics.diagnostics_writer import DiagnosticsWriter
@@ -29,8 +31,10 @@ from bee_control.interfaces.flight_sequencer import (
     SequencerPorts,
     SetpointPolicy,
 )
+from bee_control.mission.gates import compute_tracking_gate
 from bee_control.mission.routine import MissionRoutine
 from bee_control.mission.types import ActuationFeedback, ControlEffect, MissionInputs
+from bee_control.mission.visual_mismatch import VisualMismatchProbe
 from bee_control.vision.optical_flow import OpticalFlowEstimator
 from bee_control.core.state import AttitudeSetpoint, FlowResult, TargetEstimate
 from bee_control.diagnostics.telemetry import TelemetrySchemaError, collect_fields
@@ -251,6 +255,164 @@ def test_offboard_timeout_aborts():
     clock["t"] += cfg.scheduling.px4_offboard_confirm_timeout_sec + 0.1
     seq.update()
     assert seq.phase == "aborted" and aborted
+
+
+# --------------------------------------------------------------------------
+# Visual synchronisation gate
+# --------------------------------------------------------------------------
+def test_chi_regression_uses_old_values_and_real_dt_spacing():
+    """The causal derivative must use the whole timestamped window, not only
+    the previous sample. A linear D(t) has an exact least-squares slope even
+    with deliberately irregular camera intervals."""
+    probe = VisualMismatchProbe(
+        derivative_window_sec=0.20,
+        percentile_window_sec=1.0,
+        peak_decay_tau_sec=2.0,
+    )
+    slope, intercept = 1.75, 0.12
+    t = 0.0
+    dts = [0.010, 0.022, 0.014, 0.019, 0.011, 0.025, 0.016]
+    for i in range(80):
+        dt = dts[i % len(dts)]
+        t += dt
+        d = intercept + slope * t
+        probe.update(d, dt)
+
+    assert probe.derivative_ready
+    assert abs(probe.divergence_rate - slope) < 1e-10
+    expected_chi = slope - (intercept + slope * t) ** 2
+    assert abs(probe.chi - expected_chi) < 1e-10
+
+
+def test_constant_divergence_keeps_physical_chi_in_envelope():
+    """No D* subtraction and no high-pass: a persistent non-zero chi is real
+    mismatch evidence and must not be learned away as a bias."""
+    probe = VisualMismatchProbe(
+        derivative_window_sec=0.20,
+        percentile_window_sec=1.0,
+        peak_decay_tau_sec=2.0,
+    )
+    d, dt = 0.5, 1 / 60
+    for _ in range(600):
+        probe.update(d, dt)
+
+    expected = d * d
+    assert abs(probe.divergence_rate) < 1e-12
+    assert abs(probe.chi + expected) < 1e-12
+    assert abs(probe.abs_chi - expected) < 1e-12
+    assert abs(probe.percentile_chi - expected) < 1e-12
+    assert abs(probe.peak_chi - expected) < 1e-12
+
+
+def test_final_probe_envelope_reset_keeps_derivative_warm():
+    """FINAL_PROBE restarts only the gate evidence, not the Ddot history."""
+    probe = VisualMismatchProbe(
+        derivative_window_sec=0.20,
+        percentile_window_sec=1.0,
+        peak_decay_tau_sec=2.0,
+    )
+    dt = 1 / 60
+    for i in range(60):
+        probe.update(0.2 + 0.4 * i * dt, dt)
+    assert probe.derivative_ready
+    rate_before = probe.divergence_rate
+    assert probe.peak_chi > 0.0
+
+    probe.reset_envelope()
+    assert probe.derivative_ready
+    assert probe.peak_chi == 0.0
+    probe.update(0.2 + 0.4 * 60 * dt, dt)
+    assert probe.derivative_ready
+    assert abs(probe.divergence_rate - rate_before) < 1e-10
+    assert probe.peak_chi > 0.0
+
+
+def test_gate_is_advisory_until_enabled():
+    """Disabled, the gate must never veto -- it only logs."""
+    verdict = compute_tracking_gate(
+        chi_peak=99.0, chi_limit=2.0, ready=True, enabled=False)
+    assert not verdict.synchronized and verdict.feasible
+
+
+def test_unready_probe_never_rejects():
+    """No evidence must not read as evidence of desynchronisation."""
+    verdict = compute_tracking_gate(
+        chi_peak=99.0, chi_limit=2.0, ready=False, enabled=True)
+    assert verdict.feasible
+
+
+def test_absolute_chi_gate_separates_inside_and_outside_limit():
+    good = compute_tracking_gate(
+        chi_peak=0.8, chi_limit=2.0, ready=True, enabled=True)
+    bad = compute_tracking_gate(
+        chi_peak=3.5, chi_limit=2.0, ready=True, enabled=True)
+    assert good.synchronized and good.feasible
+    assert not bad.synchronized and not bad.feasible
+
+
+def test_tracking_gate_joins_overall_feasibility():
+    cfg = BeeConfig.default().mission
+    routine = MissionRoutine(hover_thrust=0.73, config=cfg)
+    routine.gate.feasible = True
+    routine.roll_gate.feasible = True
+    routine.pitch_gate.feasible = True
+    assert routine.feasible
+    routine.tracking_gate = compute_tracking_gate(
+        chi_peak=99.0, chi_limit=2.0, ready=True, enabled=True)
+    assert not routine.feasible, "a desynchronised vehicle was still feasible"
+    assert any("mismatch" in r for r in routine._gate_failure_reasons())
+
+
+# --------------------------------------------------------------------------
+# Host clock steps
+# --------------------------------------------------------------------------
+def test_steady_wall_clock_survives_a_backward_step():
+    """A backward system-clock step must not move the outgoing timebase.
+
+    This is the failure that produced three PX4 offboard failsafes per flight:
+    a VM host time sync stepped the guest clock back ~2.2 s, which moved every
+    pending timer deadline forward by the same amount and starved the setpoint
+    stream well past COM_OF_LOSS_T.
+    """
+    import bee_control.core.clock as clock_module
+    real_time, offset = time.time, {"value": 0.0}
+    clock_module.time.time = lambda: real_time() + offset["value"]
+    try:
+        clock = SteadyWallClock(step_threshold_sec=0.05)
+        before = clock.wall_sec()
+        offset["value"] = -2.2
+        step = clock.check_step()
+        after = clock.wall_sec()
+        assert step is not None and step.backward
+        assert after >= before, "the steady clock moved backwards"
+        assert abs(step.step_sec + 2.2) < 0.01
+    finally:
+        clock_module.time.time = real_time
+
+
+def test_px4_stamps_are_monotonic_across_a_step():
+    """uORB timestamps must never go backwards; PX4 may treat them as stale."""
+    import bee_control.core.clock as clock_module
+    real_time, offset = time.time, {"value": 0.0}
+    clock_module.time.time = lambda: real_time() + offset["value"]
+    try:
+        manager = TimeManager(steady_wall=True)
+        stamps = []
+        for i in range(5):
+            if i == 2:
+                offset["value"] -= 2.2
+            stamps.append(manager.px4_timestamp_us())
+            time.sleep(0.002)
+        assert all(b > a for a, b in zip(stamps, stamps[1:])), stamps
+    finally:
+        clock_module.time.time = real_time
+
+
+def test_clock_steps_reach_the_log():
+    """A step is no longer fatal, but it is still a host fault worth seeing."""
+    manager = TimeManager(steady_wall=True)
+    assert set(manager.telemetry()) <= set(manager.telemetry_fields())
+    assert "backward_steps_detected" in manager.telemetry_fields()
 
 
 if __name__ == "__main__":

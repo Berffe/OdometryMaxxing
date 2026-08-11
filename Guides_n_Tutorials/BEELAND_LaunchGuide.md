@@ -140,7 +140,7 @@ Notes:
 ## Terminal 4 — Run the BEE_LAND ROS node
 
 ```bash
-cd ~/PX4-Autopilot/BEE_LAND
+cd ~/PX4-Autopilot/BEE_LAND/controller
 
 ros_bee # Defined in ~/.bashrc
 

@@ -21,10 +21,10 @@ from ..types import MissionControl, PROBE_HOLD, PhaseSpec
 
 
 def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
-    # This phase is time-invariant: it holds the same command indefinitely,
-    # so it reads nothing off `inputs`. The signature stays uniform with every
-    # other phase so the registry can dispatch them identically.
-    del inputs
+    # Probe-only mode keeps the vehicle hovering after the one-time verdict,
+    # but chi remains useful diagnostic evidence. It cannot change the frozen
+    # FINAL_PROBE decision.
+    routine._update_visual_mismatch(inputs)
 
     return MissionControl(
         divergence_setpoint=0.0,

@@ -6,18 +6,25 @@ Production path:
     update(frame_bgr, timestamp, target=None) -> FlowResult
 
 When a valid TargetEstimate is provided, the dense optical flow and the
-scalar divergence are computed only inside the target bounding box.
+scalar expansion rate are computed only inside the target bounding box.
 
-Divergence is obtained by a least-squares affine fit to the flow field
-(see _fit_divergence_affine), not a per-pixel finite-difference field
-collapsed with a median. For an affine field u=a0+a1 x+a2 y, v=b0+b1
-x+b2 y, divergence = du/dx+dv/dy = a1+b2 is EXACT and constant -- fitting
-it directly uses every valid flow vector in the ROI, instead of computing
-a local spatial derivative pixel-by-pixel and taking the median, which is
-dominated by whichever response is most common pixel-by-pixel rather than
-by the actual expansion signal. This matters specifically once the
-target fills the frame: the interior of a uniform, texture-poor surface
-gives near-zero/noisy per-pixel flow (the classic aperture problem).
+The control-facing expansion rate is obtained from a constrained four-parameter
+least-squares fit to the flow field (see _fit_divergence_affine):
+
+    u(x, y) = t_x + lambda*x - r*y
+    v(x, y) = t_y + r*x + lambda*y
+
+The fit is performed directly in original-pixel coordinates and velocities, so
+``lambda`` has units of 1/s and is invariant to the ROI origin and image size.
+For an ideal fronto-parallel approach it is the physically useful quantity
+
+    lambda = -h_dot / h,
+
+not the full 2-D flow divergence ``du/dx + dv/dy = 2*lambda``.  The historical
+FlowResult field is still named ``divergence`` for interface compatibility, but
+from this revision onward it stores ``lambda``.  The constrained model uses all
+valid flow vectors while excluding shear/anisotropic scale modes that are not
+part of the intended fronto-parallel landing kinematics.
 
 The fit is WEIGHTED by each pixel's reference-frame image-gradient
 magnitude (see _gradient_magnitude / _weighted_affine_least_squares), so
@@ -430,7 +437,7 @@ class OpticalFlowEstimator:
             self._iterations,
             self._poly_n,
             self._poly_sigma,
-            0,
+            cv2.OPTFLOW_FARNEBACK_GAUSSIAN,
         )
         timing["farneback_ms"] = 1000.0 * (time.perf_counter() - stage_start)
 
@@ -579,76 +586,36 @@ class OpticalFlowEstimator:
         pixel_scale: float = 1.0,
         timing: Optional[dict] = None,
     ) -> Tuple[float, int, float]:
-        """
-        Divergence via a global affine fit, not a per-pixel median.
+        """Estimate the physical expansion rate ``lambda = -h_dot/h``.
 
-        robust: when True (the control-facing default), runs the
-            trim-and-refit outlier pass documented below. When False, returns
-            straight after the first weighted OLS solve -- roughly half the
-            cost, at the price of no outlier robustness. Only intended for
-            diagnostic-only callers (e.g. update()'s divergence_prederotation)
-            where a coarser number logged for offline analysis is an
-            acceptable trade for not doubling a control-path-adjacent cost
-            every frame.
+        The previous implementation fitted two independent affine fields,
 
-        pixel_scale: how many ORIGINAL ROI pixels each element of flow_px_s
-            represents, when flow_px_s is itself a downsampled array (see
-            update()'s ROI-adaptive downsampling: fitting directly on the
-            downsampled field, instead of reconstructing it to full ROI
-            resolution first, is what actually shrinks this fit's cost --
-            downsampling Farneback alone left this function solving over the
-            same point count as before). 1.0 (the default) means flow_px_s is
-            already at full ROI resolution -- unchanged behavior. A value s<1
-            means adjacent array elements are 1/s original pixels apart, so
-            the coordinate spacing (dx_norm/dy_norm below) widens by 1/s to
-            match -- the flow VALUES themselves are assumed to already be
-            amplitude-corrected to original-pixel units by the caller (see
-            update()), so only the coordinate axis needs adjusting here.
+            u = a0 + a1*x + a2*y
+            v = b0 + b1*x + b2*y,
 
-        Model (normalized image units/s, same scale as mean_flow_*_norm):
-            u(x, y) = a0 + a1*x + a2*y
-            v(x, y) = b0 + b1*x + b2*y
-        Solved by WEIGHTED OLS (shared design matrix). For any affine
-        field, du/dx + dv/dy = a1 + b2 exactly and is constant everywhere, so
-        this is the exact divergence of the best-fit field -- using ALL valid
-        flow vectors in the ROI, not a local difference at each pixel.
+        and returned ``a1 + b2``.  For isotropic fronto-parallel expansion that
+        quantity is the FULL 2-D flow divergence ``2*lambda``.  From this
+        revision onward the estimator fits the physically constrained model
 
-        The OLS slope is invariant to the coordinate origin (shifting x, y by
-        a constant only moves a0/b0), so ROI-local pixel coordinates are used
-        directly -- no need to know the ROI's offset within the full image.
+            u = t_x + lambda*x - r*y
+            v = t_y + r*x + lambda*y,
 
-        WEIGHTING: each pixel is weighted by its reference-frame image
-        gradient magnitude (see _gradient_magnitude), not trusted equally.
-        This is the direct fix for the aperture-problem failure mode this
-        module's docstring already describes for a texture-poor interior --
-        previously handled only by hoping the textured rim was in-frame to
-        out-vote it in an unweighted fit. Once fov_saturated removes the rim
-        entirely (see optical_flow_estimator's downsample_target_px docstring),
-        weighting is what keeps a locally-flat patch of the interior from
-        being averaged in on equal footing with a high-gradient patch,
-        instead of relying on the rim being there to swamp it. Falls back to
-        uniform weighting if no gradient map is supplied.
+        whose four unknowns are ``[t_x, t_y, lambda, r]``.  ``lambda`` is then
+        returned directly.  The legacy FlowResult field remains named
+        ``divergence`` only for API/log compatibility.
 
-        One robust trim-and-refit pass on top keeps the best
-        `affine_inlier_quantile` fraction by (weighted) residual and refits --
-        a complementary, different heuristic from the gradient weighting
-        above: this catches vectors that mismatch the fitted model despite
-        reasonable local texture (e.g. a genuine outlier), not vectors that
-        were never trustworthy to begin with.
+        The solve is intentionally performed in ORIGINAL PIXEL coordinates:
+        ``flow_px_s`` has already been amplitude-corrected by the caller after
+        ROI downsampling, and adjacent samples represent ``1/pixel_scale``
+        original pixels (times the fit stride).  Using pixel coordinates makes
+        the common expansion/rotation model exact for square image pixels and
+        avoids any aspect-ratio artefact from separately normalising x/y by
+        image width/height.  Translation absorbs the arbitrary ROI-local origin.
 
-        Falls back to the old field-median method if too few finite flow
-        vectors remain (degenerate ROI) -- a safety net, not the normal path;
-        fit_quality is reported as 0.0 there since no fit was actually made.
-
-        Returns (divergence, n_points_used, fit_quality). fit_quality is a
-        weighted R^2 over the combined u,v residuals: 1.0 means the affine
-        model explains the (weighted) flow variance essentially exactly, 0.0
-        means it does no better than reporting the weighted mean flow
-        everywhere, and negative means worse than that -- a plausible-looking
-        divergence number can still carry a low/negative fit_quality when
-        the ROI has become mostly noise, which is exactly the case this was
-        added to catch (see this file's usage note: diagnosis-only for now,
-        not yet read by control_law.py or mission_routine.py).
+        Weighting, spatial decimation, robust residual trimming and fit_quality
+        keep the same semantics as before.  The degenerate fallback uses the
+        finite-difference field, which already returns half of the full 2-D
+        divergence and therefore has the same physical ``lambda`` convention.
         """
         fit_wall_start = time.perf_counter()
         if timing is None:
@@ -657,11 +624,9 @@ class OpticalFlowEstimator:
         roi_height, roi_width = flow_px_s.shape[:2]
         timing["input_points"] = int(roi_height * roi_width)
 
-        # Fit-only spatial decimation. We deliberately do not resize or average
-        # the flow here: regular slicing preserves the measured vector values and
-        # samples the full ROI uniformly. Coordinate spacing is increased below by
-        # the same stride, so the fitted slopes and divergence remain in exactly
-        # the same normalized-image units per second.
+        # Fit-only spatial decimation. No averaging/resizing is introduced here:
+        # regular slicing keeps the measured vector values while the coordinate
+        # spacing below is widened by the exact same stride.
         fit_stride = max(1, int(self._affine_fit_stride))
         if fit_stride > 1:
             flow_fit = flow_px_s[::fit_stride, ::fit_stride]
@@ -690,18 +655,17 @@ class OpticalFlowEstimator:
             })
             return 0.0, 0, 0.0
 
-        u = flow_fit[:, :, 0] / max(0.5 * image_width, 1.0)
-        v = flow_fit[:, :, 1] / max(0.5 * image_height, 1.0)
+        # Keep the fit in original-pixel units. The caller has already divided
+        # the downsampled Farneback vectors by ``pixel_scale``, so their values
+        # are original px/s. Only the spatial coordinate spacing must be widened.
+        u_flat = flow_fit[:, :, 0].ravel().astype(np.float64)
+        v_flat = flow_fit[:, :, 1].ravel().astype(np.float64)
 
         s = max(1e-6, float(pixel_scale))
-        dx_norm = fit_stride * (2.0 / max(image_width - 1, 1)) / s
-        dy_norm = fit_stride * (2.0 / max(image_height - 1, 1)) / s
-
+        spacing_px = fit_stride / s
         rows, cols = np.mgrid[0:fit_height, 0:fit_width]
-        x = (cols * dx_norm).ravel().astype(np.float64)
-        y = (rows * dy_norm).ravel().astype(np.float64)
-        u_flat = u.ravel().astype(np.float64)
-        v_flat = v.ravel().astype(np.float64)
+        x = (cols * spacing_px).ravel().astype(np.float64)
+        y = (rows * spacing_px).ravel().astype(np.float64)
 
         if gradient_fit is not None and gradient_fit.shape == (fit_height, fit_width):
             weight_flat = gradient_fit.ravel().astype(np.float64)
@@ -727,12 +691,11 @@ class OpticalFlowEstimator:
         x, y, u_flat, v_flat, weight_flat = (
             x[finite], y[finite], u_flat[finite], v_flat[finite], weight_flat[finite]
         )
-        design = np.column_stack([np.ones_like(x), x, y])
         timing["setup_ms"] = 1000.0 * (time.perf_counter() - fit_wall_start)
 
         stage_start = time.perf_counter()
-        coeffs, divergence, fit_quality = self._weighted_affine_least_squares(
-            design, u_flat, v_flat, weight_flat
+        coeffs, expansion_rate, fit_quality = self._weighted_affine_least_squares(
+            x, y, u_flat, v_flat, weight_flat
         )
         timing["initial_solve_ms"] = 1000.0 * (time.perf_counter() - stage_start)
 
@@ -740,13 +703,13 @@ class OpticalFlowEstimator:
             timing["residual_quantile_ms"] = 0.0
             timing["refit_ms"] = 0.0
             timing["used_points"] = n_finite
-            return float(divergence), n_finite, float(fit_quality)
+            return float(expansion_rate), n_finite, float(fit_quality)
 
         stage_start = time.perf_counter()
-        residual = (
-            (u_flat - design @ coeffs[0]) ** 2
-            + (v_flat - design @ coeffs[1]) ** 2
-        )
+        tx, ty, lam, rot = coeffs
+        u_pred = tx + lam * x - rot * y
+        v_pred = ty + rot * x + lam * y
+        residual = (u_flat - u_pred) ** 2 + (v_flat - v_pred) ** 2
         threshold = np.quantile(residual, self._affine_inlier_quantile)
         inliers = residual <= threshold
         timing["residual_quantile_ms"] = 1000.0 * (
@@ -756,8 +719,9 @@ class OpticalFlowEstimator:
         stage_start = time.perf_counter()
         n_inliers = int(np.count_nonzero(inliers))
         if n_inliers >= self._min_points_for_affine_fit:
-            _, divergence, fit_quality = self._weighted_affine_least_squares(
-                design[inliers], u_flat[inliers], v_flat[inliers], weight_flat[inliers]
+            _, expansion_rate, fit_quality = self._weighted_affine_least_squares(
+                x[inliers], y[inliers], u_flat[inliers], v_flat[inliers],
+                weight_flat[inliers]
             )
             n_used = n_inliers
         else:
@@ -765,73 +729,90 @@ class OpticalFlowEstimator:
         timing["refit_ms"] = 1000.0 * (time.perf_counter() - stage_start)
         timing["used_points"] = n_used
 
-        return float(divergence), n_used, float(fit_quality)
+        return float(expansion_rate), n_used, float(fit_quality)
 
     @staticmethod
     def _weighted_affine_least_squares(
-        design: np.ndarray, u: np.ndarray, v: np.ndarray, weight: np.ndarray
-    ) -> Tuple[Tuple[np.ndarray, np.ndarray], float, float]:
-        """Gradient-magnitude-weighted OLS via the standard sqrt(w) rescaling
-        (minimizing sum(w*(y-Xb)^2) is exactly OLS in sqrt(w)-rescaled
-        variables, so this stays a single cheap linear solve, not an
-        iterative reweighting scheme). Weight is normalized to a mean of 1
-        first so its absolute scale never changes the solve's conditioning,
-        only the RELATIVE trust between pixels; an all-zero/degenerate weight
-        map falls back to uniform (equivalent to the old unweighted fit).
+        x: np.ndarray,
+        y: np.ndarray,
+        u: np.ndarray,
+        v: np.ndarray,
+        weight: np.ndarray,
+    ) -> Tuple[np.ndarray, float, float]:
+        """Weighted 4x4 physical flow solve.
 
-        Solved via the NORMAL EQUATIONS (design_w.T @ design_w, a 3x3 system
-        -- constant/x/y are the only unknowns), not np.linalg.lstsq. lstsq is
-        a general SVD-based solver sized for the case where the number of
-        unknowns isn't known/fixed; here it always is (3), so forming the
-        3x3 system directly and calling np.linalg.solve on THAT instead is
-        mathematically the same least-squares solution (verified: matches
-        lstsq's coefficients to ~3e-5 on synthetic data) at roughly 5-6x less
-        wall-clock cost, since the O(n) cost of building the 3x3 system is
-        far cheaper than lstsq's own O(n) SVD setup, and the fixed-size 3x3
-        solve is then nearly free either way. Falls back to lstsq only if the
-        normal equations turn out singular (a genuinely degenerate ROI --
-        e.g. every point sharing the same x or y -- which min_points_for_
-        affine_fit already guards against in the normal case).
+        Unknown vector::
 
-        Also returns a weighted R^2 (see _fit_divergence_affine's docstring
-        for interpretation) as a fit-quality proxy, computed in the same
-        rescaled space so it stays consistent with what was actually
-        minimized.
+            p = [t_x, t_y, lambda, r]^T
+
+        with
+
+            u = t_x + lambda*x - r*y
+            v = t_y + r*x + lambda*y.
+
+        Rather than building a ``(2N)x4`` matrix, the 4x4 normal equations are
+        formed from weighted scalar sums. This keeps the solve cheaper than the
+        previous pair of 3x3 affine solves and avoids allocating a stacked design
+        matrix on every frame. ``lambda`` and ``r`` both have units 1/s when x/y
+        are pixels and u/v are px/s.
         """
-        w = np.clip(weight, 0.0, None)
+        w = np.clip(weight, 0.0, None).astype(np.float64, copy=False)
         w_mean = float(np.mean(w)) if np.any(w > 0.0) else 0.0
         if w_mean <= 1e-12:
             w = np.ones_like(w)
             w_mean = 1.0
         w = w / w_mean
 
-        sw = np.sqrt(w)
-        design_w = design * sw[:, None]
-        u_w = u * sw
-        v_w = v * sw
+        # Weighted sums for X^T W X and X^T W b. The lambda/rotation cross-term
+        # cancels identically: x*(-y) + y*x == 0 for every flow vector.
+        s0 = float(np.sum(w))
+        sx = float(np.sum(w * x))
+        sy = float(np.sum(w * y))
+        srr = float(np.sum(w * (x * x + y * y)))
 
-        AtA = design_w.T @ design_w
-        Atu = design_w.T @ u_w
-        Atv = design_w.T @ v_w
+        su = float(np.sum(w * u))
+        sv = float(np.sum(w * v))
+        slam = float(np.sum(w * (x * u + y * v)))
+        srot = float(np.sum(w * (-y * u + x * v)))
+
+        AtA = np.array([
+            [s0, 0.0, sx, -sy],
+            [0.0, s0, sy, sx],
+            [sx, sy, srr, 0.0],
+            [-sy, sx, 0.0, srr],
+        ], dtype=np.float64)
+        Atb = np.array([su, sv, slam, srot], dtype=np.float64)
+
         try:
-            coeffs_u = np.linalg.solve(AtA, Atu)
-            coeffs_v = np.linalg.solve(AtA, Atv)
+            coeffs = np.linalg.solve(AtA, Atb)
         except np.linalg.LinAlgError:
-            coeffs_u, *_ = np.linalg.lstsq(design_w, u_w, rcond=None)
-            coeffs_v, *_ = np.linalg.lstsq(design_w, v_w, rcond=None)
-        divergence = float(coeffs_u[1] + coeffs_v[2])
+            # Rare degenerate fallback: build the explicit weighted system only
+            # when the compact normal equations cannot be solved.
+            zeros = np.zeros_like(x)
+            ones = np.ones_like(x)
+            design_u = np.column_stack([ones, zeros, x, -y])
+            design_v = np.column_stack([zeros, ones, y, x])
+            sw = np.sqrt(w)
+            design = np.vstack([design_u * sw[:, None], design_v * sw[:, None]])
+            target = np.concatenate([u * sw, v * sw])
+            coeffs, *_ = np.linalg.lstsq(design, target, rcond=None)
 
-        resid_u = u_w - design_w @ coeffs_u
-        resid_v = v_w - design_w @ coeffs_v
-        ss_res = float(np.sum(resid_u ** 2) + np.sum(resid_v ** 2))
+        tx, ty, lam, rot = coeffs
+        pred_u = tx + lam * x - rot * y
+        pred_v = ty + rot * x + lam * y
+        resid_u = u - pred_u
+        resid_v = v - pred_v
+        ss_res = float(np.sum(w * (resid_u ** 2 + resid_v ** 2)))
 
         u_mean_w = float(np.sum(w * u) / np.sum(w))
         v_mean_w = float(np.sum(w * v) / np.sum(w))
-        ss_tot = float(np.sum(w * (u - u_mean_w) ** 2) + np.sum(w * (v - v_mean_w) ** 2))
-
+        ss_tot = float(
+            np.sum(w * (u - u_mean_w) ** 2)
+            + np.sum(w * (v - v_mean_w) ** 2)
+        )
         fit_quality = (1.0 - ss_res / ss_tot) if ss_tot > 1e-12 else 0.0
 
-        return (coeffs_u, coeffs_v), divergence, float(fit_quality)
+        return coeffs, float(lam), float(fit_quality)
 
     @staticmethod
     def _gradient_magnitude(gray_roi: np.ndarray) -> np.ndarray:
@@ -929,25 +910,26 @@ class OpticalFlowEstimator:
         image_height: int,
         pixel_scale: float = 1.0,
     ) -> np.ndarray:
+        """Per-pixel fallback/debug estimate of physical ``lambda`` [1/s].
+
+        Work directly in original-pixel units, matching the constrained 4x4
+        fit. ``flow_px_s`` is already amplitude-corrected to original px/s;
+        adjacent working-grid samples are ``1/pixel_scale`` original pixels
+        apart. For isotropic expansion, ``du/dx = dv/dy = lambda``, hence the
+        half-trace below returns ``lambda`` exactly rather than the full 2-D
+        divergence ``2*lambda``.
+        """
         roi_height, roi_width = flow_px_s.shape[:2]
 
         if roi_width < 3 or roi_height < 3:
             return np.zeros((roi_height, roi_width), dtype=np.float32)
 
-        # Convert pixel flow to normalized image-coordinate velocity.
-        # Normalization uses the full image size, not the ROI size, so the
-        # divergence scale remains consistent as the target box changes.
-        u_norm_s = flow_px_s[:, :, 0] / (0.5 * image_width)
-        v_norm_s = flow_px_s[:, :, 1] / (0.5 * image_height)
-
         s = max(1e-6, float(pixel_scale))
-        dx_norm = (2.0 / max(image_width - 1, 1)) / s
-        dy_norm = (2.0 / max(image_height - 1, 1)) / s
+        spacing_px = 1.0 / s
+        du_dx = np.gradient(flow_px_s[:, :, 0], spacing_px, axis=1)
+        dv_dy = np.gradient(flow_px_s[:, :, 1], spacing_px, axis=0)
 
-        du_dx = np.gradient(u_norm_s, dx_norm, axis=1)
-        dv_dy = np.gradient(v_norm_s, dy_norm, axis=0)
-
-        return du_dx + dv_dy
+        return 0.5 * (du_dx + dv_dy)
 
     @staticmethod
     def _scalar_from_divergence_field(divergence_field: np.ndarray) -> float:

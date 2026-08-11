@@ -21,10 +21,9 @@ from ..types import INFEASIBLE, MissionControl, PhaseSpec
 
 
 def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
-    # This phase is time-invariant: it holds the same command indefinitely,
-    # so it reads nothing off `inputs`. The signature stays uniform with every
-    # other phase so the registry can dispatch them identically.
-    del inputs
+    # The verdict is already latched, but keep chi alive for diagnosis while
+    # the vehicle visually hovers at the probe gain.
+    routine._update_visual_mismatch(inputs)
 
     reasons = routine._gate_failure_reasons()
     reason = "; ".join(reasons) if reasons else "unknown feasibility failure"

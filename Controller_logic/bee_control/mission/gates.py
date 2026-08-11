@@ -1,10 +1,15 @@
-"""Feasibility gates: does a usable gain window exist at landing-gear height?
+"""Feasibility gates: may this landing proceed?
+
+Two independent questions, and they fail for different reasons.
 
 Vertical feasibility compares the Herisse disturbance-rejection floor with the
 safety-scaled de Croon ceiling. Roll and pitch use the acceleration-domain
 lateral bound
 
     K_min = c_max / kappa + peak_accel / omega_adm
+
+The tracking gate at the bottom asks something the three gain gates cannot:
+not "do I have the authority?" but "am I keeping up?". See its docstring.
 
 No online height estimate is used anywhere in this module.
 """
@@ -247,3 +252,81 @@ def compute_gate(
         start_above_floor=bool(start_above_floor),
     )
 
+
+
+# ---------------------------------------------------------------------------
+# Synchronisation / tracking gate
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class TrackingGateResult:
+    """One-time FINAL_PROBE verdict on visual synchronisation.
+
+    This is a rejection test only. It does not create a new gain floor and it
+    does not run a recovery controller. The three authority/stability gates say
+    whether an admissible gain window exists; this gate says whether the vehicle
+    is actually keeping up with the deck while flying the admissible near-field
+    probe gain.
+
+    Once DESCENT is committed the verdict is frozen. chi keeps being measured
+    for diagnosis, but this gate no longer owns a phase transition.
+    """
+
+    chi_peak: float = 0.0          # robust FINAL_PROBE |chi| envelope [1/s^2]
+    chi_limit: float = 0.0         # accepted upper bound [1/s^2]
+    synchronized: bool = True
+    ready: bool = False            # enough FINAL_PROBE-hold evidence to judge
+    enabled: bool = False
+    feasible: bool = True          # synchronized OR not yet ready OR disabled
+    reason: str = ""
+
+
+def compute_tracking_gate(
+    chi_peak: float,
+    *,
+    chi_limit: float,
+    ready: bool,
+    enabled: bool = True,
+) -> TrackingGateResult:
+    """Decide whether FINAL_PROBE visual mismatch is inside the bandwidth limit.
+
+    The observable is
+
+        chi = Ddot - D^2 = -hddot / h.
+
+    It is already height-free and needs no divergence reference or commanded
+    D*. The robust probe supplies ``chi_peak`` as a rolling-percentile/leaky-max
+    envelope of |chi| during the stationary FINAL_PROBE hold.
+
+    ``ready`` is deliberately separate from ``enabled``. An unready probe never
+    rejects: absence of enough evidence must not be interpreted as evidence of
+    desynchronisation.
+    """
+    chi_peak = abs(float(chi_peak))
+    limit = max(0.0, float(chi_limit))
+    synchronized = chi_peak <= limit
+
+    feasible = True
+    reason = ""
+    if not enabled:
+        reason = "tracking gate disabled (advisory only)"
+    elif not ready:
+        reason = "tracking probe not ready"
+    elif not synchronized:
+        feasible = False
+        reason = (
+            f"visual mismatch chi_peak={chi_peak:.3f} 1/s^2 > "
+            f"chi_limit={limit:.3f} 1/s^2: platform motion is outside the "
+            "validated tracking bandwidth"
+        )
+
+    return TrackingGateResult(
+        chi_peak=chi_peak,
+        chi_limit=limit,
+        synchronized=bool(synchronized),
+        ready=bool(ready),
+        enabled=bool(enabled),
+        feasible=bool(feasible),
+        reason=reason,
+    )

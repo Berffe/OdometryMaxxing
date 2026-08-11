@@ -40,6 +40,7 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
     if routine._final_probe_entry_ramp > 1e-9 and entry_elapsed < routine._final_probe_entry_ramp:
         frac = raised_cosine01(entry_elapsed / routine._final_probe_entry_ramp)
         d_cmd = routine._approach_d_star * (1.0 - frac)
+        routine._update_visual_mismatch(inputs)
         routine._update_probes(
             last_thrust_cmd, last_vertical_accel_cmd,
             last_roll_accel_cmd, last_pitch_accel_cmd, dt,
@@ -69,7 +70,12 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
         routine.roll_peak_accel_at_handoff = routine._roll_probe.peak_accel
         routine.pitch_peak_accel_at_handoff = routine._pitch_probe.peak_accel
         routine._retune_probes()
+        # FINAL_PROBE is the one operating point that decides bandwidth. Keep
+        # the causal Ddot history warm, but start a fresh robust |chi| envelope
+        # and observation clock so APPROACH/ramp transients cannot veto landing.
+        routine._begin_tracking_gate_window()
 
+    routine._update_visual_mismatch(inputs)
     routine._update_probes(
         last_thrust_cmd, last_vertical_accel_cmd,
         last_roll_accel_cmd, last_pitch_accel_cmd, dt,
@@ -97,17 +103,23 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
         )
         routine._compute_lateral_gates()
 
-        if routine._probe_only:
-            routine._substate = PROBE_HOLD
-            return probe_hold.run(routine, inputs, just_entered=True)
-
         vertical_probe_ok = routine.vertical_feasible
         roll_probe_ok = routine.roll_feasible
         pitch_probe_ok = routine.pitch_feasible
+        # Fourth, independent question: authority is not bandwidth. FINAL_PROBE
+        # is stationary (D*=0, k=k_probe), so its robust height-free |chi|
+        # envelope is the actual pre-commit synchronisation decision.
+        routine._refresh_tracking_gate()
+        tracking_ok = routine.tracking_feasible
+
+        if routine._probe_only:
+            routine._substate = PROBE_HOLD
+            return probe_hold.run(routine, inputs, just_entered=True)
         if (
             vertical_probe_ok
             and roll_probe_ok
             and pitch_probe_ok
+            and tracking_ok
             and routine._enable_descent
         ):
             routine._substate = DESCEND
