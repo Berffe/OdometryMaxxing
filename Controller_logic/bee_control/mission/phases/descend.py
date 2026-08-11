@@ -1,0 +1,149 @@
+"""DESCENT phase.
+
+Scheduled-gain descent riding the safety-derated ceiling.
+
+Phase contract
+--------------
+``run(routine, inputs, just_entered=False)`` returns the ``MissionControl`` for
+one tick, and may latch ``routine._substate`` when it hands off. ``SPEC`` is
+what the registry in ``mission/routine.py`` picks up.
+
+Adding a phase means writing a file shaped like this one and listing it in
+``phases/__init__.py``. Nothing outside ``mission/`` changes -- not the node,
+not the diagnostics writer, not the log schema.
+
+The body is unchanged from the single-file revision apart from the mechanical
+``self`` -> ``routine`` rename that comes with being a free function.
+"""
+from __future__ import annotations
+
+from ..math_utils import raised_cosine01
+from ..schedule import critical_time, predicted_height, scheduled_gain_at_time
+from ..types import ControlEffect, DESCEND, MissionControl, PhaseSpec
+
+
+def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
+    t = inputs.t
+
+    elapsed = t - (routine._t_descend_start if routine._t_descend_start is not None else t)
+
+    # Each translational axis now follows the same exponential trajectory but
+    # keeps its own independently probed disturbance floor.
+    k = scheduled_gain_at_time(
+        elapsed_sec=elapsed,
+        descent_divergence_setpoint=routine._d_star,
+        k_floor=routine.gate.k_floor,
+        k_explore=routine.gate.k_descend_start,
+        d_star_ramp_in_sec=routine._d_star_ramp_in,
+    )
+    roll_k = scheduled_gain_at_time(
+        elapsed_sec=elapsed,
+        descent_divergence_setpoint=routine._d_star,
+        k_floor=routine.roll_gate.k_floor,
+        k_explore=routine.roll_gate.k_descend_start,
+        d_star_ramp_in_sec=routine._d_star_ramp_in,
+    )
+    pitch_k = scheduled_gain_at_time(
+        elapsed_sec=elapsed,
+        descent_divergence_setpoint=routine._d_star,
+        k_floor=routine.pitch_gate.k_floor,
+        k_explore=routine.pitch_gate.k_descend_start,
+        d_star_ramp_in_sec=routine._d_star_ramp_in,
+    )
+
+    roll_ratio = (
+        roll_k / routine.roll_gate.k_descend_start
+        if routine.roll_gate.k_descend_start > 1e-9 else 1.0
+    )
+    pitch_ratio = (
+        pitch_k / routine.pitch_gate.k_descend_start
+        if routine.pitch_gate.k_descend_start > 1e-9 else 1.0
+    )
+    roll_p_scale = routine._probe_lateral_p_scale * roll_ratio
+    roll_d_scale = routine._probe_lateral_d_scale * roll_ratio
+    pitch_p_scale = routine._probe_lateral_p_scale * pitch_ratio
+    pitch_d_scale = routine._probe_lateral_d_scale * pitch_ratio
+
+    # Legacy shared fields remain populated for compatibility and represent the
+    # most demanding active lateral axis. ControlLaw receives the specific
+    # per-axis fields below.
+    lateral_p_scale = max(roll_p_scale, pitch_p_scale)
+    lateral_d_scale = max(roll_d_scale, pitch_d_scale)
+    h_pred = predicted_height(routine._h0, routine._d_star, elapsed, routine._d_star_ramp_in)
+
+    if routine._d_star_ramp_in <= 1e-9:
+        linear_frac = 1.0
+    else:
+        linear_frac = min(1.0, elapsed / routine._d_star_ramp_in)
+
+    ramp_frac = raised_cosine01(linear_frac)
+    d_star_cmd = routine._d_star * ramp_frac
+
+    return MissionControl(
+        divergence_setpoint=d_star_cmd,
+        thrust_gain_override=k,
+        lateral_p_scale=lateral_p_scale,
+        lateral_d_scale=lateral_d_scale,
+        roll_p_scale=roll_p_scale,
+        roll_d_scale=roll_d_scale,
+        pitch_p_scale=pitch_p_scale,
+        pitch_d_scale=pitch_d_scale,
+        enable_integral=False,
+        substate=DESCEND,
+        # DESCEND starts with no inherited vertical bias, and further integral
+        # accumulation is disabled above, so the contribution stays exactly zero
+        # thereafter. Only the entry tick carries the effect.
+        effects=(
+            (ControlEffect.RESET_DIVERGENCE_INTEGRAL,) if just_entered else ()
+        ),
+        info={
+            "just_entered": just_entered,
+            "event": "descent_start" if just_entered else "",
+            "h_pred": h_pred,
+            "k": k,
+            "k_min": routine.gate.k_min,
+            "k_floor": routine.gate.k_floor,
+            "k_target": routine.gate.k_target,
+            "k_ceiling_leg": routine.gate.k_ceiling_leg,
+            "k_explore": routine.gate.k_explore,
+            "k_descend_start": routine.gate.k_descend_start,
+            "h_crit": routine.gate.h_crit,
+            "vertical_accel_capacity_floor": routine.gate.accel_capacity_floor,
+            "vertical_accel_capacity_ceiling": routine.gate.accel_capacity_ceiling,
+            "roll_k": roll_k,
+            "roll_k_floor": routine.roll_gate.k_floor,
+            "roll_k_target": routine.roll_gate.k_target,
+            "roll_k_ceiling_leg": routine.roll_gate.k_ceiling_leg,
+            "roll_accel_capacity_floor": routine.roll_gate.accel_capacity_floor,
+            "roll_accel_capacity_ceiling": routine.roll_gate.accel_capacity_ceiling,
+            "pitch_k": pitch_k,
+            "pitch_k_floor": routine.pitch_gate.k_floor,
+            "pitch_k_target": routine.pitch_gate.k_target,
+            "pitch_k_ceiling_leg": routine.pitch_gate.k_ceiling_leg,
+            "pitch_accel_capacity_floor": routine.pitch_gate.accel_capacity_floor,
+            "pitch_accel_capacity_ceiling": routine.pitch_gate.accel_capacity_ceiling,
+            "roll_p_scale": roll_p_scale,
+            "roll_d_scale": roll_d_scale,
+            "pitch_p_scale": pitch_p_scale,
+            "pitch_d_scale": pitch_d_scale,
+            "elapsed_sec": elapsed,
+            "t_crit_sec": critical_time(
+                routine._h0,
+                routine._d_star,
+                routine.gate.h_crit,
+                routine._d_star_ramp_in,
+            ),
+            "d_star_ramp_frac": ramp_frac,
+            "d_star_ramp_linear_frac": linear_frac,
+            "d_star_target": routine._d_star,
+        },
+    )
+
+
+SPEC = PhaseSpec(
+    name=DESCEND,
+    display_name="DESCENT",
+    description="Scheduled-gain descent riding the safety-derated ceiling.",
+    terminal=False,
+    handler=run,
+)

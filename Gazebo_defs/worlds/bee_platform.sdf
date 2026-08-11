@@ -187,8 +187,8 @@
 			<component><amplitude>0.06</amplitude><frequency>0.310</frequency><phase>2.1</phase></component>
 		</axis_y>
 		<axis_z>
-			<component><amplitude>0.40</amplitude><frequency>0.150</frequency><phase>0.7</phase></component>
-			<component><amplitude>0.25</amplitude><frequency>0.310</frequency><phase>4.0</phase></component>
+			<component><amplitude>0.40</amplitude><frequency>0.250</frequency><phase>0.7</phase></component>
+			<component><amplitude>0.25</amplitude><frequency>0.510</frequency><phase>4.0</phase></component>
 		</axis_z>
 
 		<position_gain>20.0</position_gain>

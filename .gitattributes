@@ -1,0 +1,22 @@
+# Windows-edit / WSL-run workflow: normalise line endings in the repo so a file
+# touched on Windows does not land in WSL as a whole-file diff.
+#
+# `text=auto eol=lf` stores LF in git and checks out LF. Combined with the
+# .editorconfig (end_of_line = lf), an editor that honours EditorConfig will
+# also SAVE as LF, so nothing ever converts.
+* text=auto eol=lf
+
+*.py    text eol=lf
+*.toml  text eol=lf
+*.xml   text eol=lf
+*.md    text eol=lf
+
+# PowerShell helpers stay CRLF: they only ever run on the Windows side.
+*.ps1   text eol=crlf
+
+# Never touch binaries.
+*.png   binary
+*.jpg   binary
+*.zip   binary
+*.bag   binary
+*.db3   binary

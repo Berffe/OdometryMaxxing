@@ -19,8 +19,6 @@ cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Gazebo_defs/* ~/PX4-
 
 cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/bridge.sh ~/PX4-Autopilot/BEE_LAND/
 
-cp -r ~/PX4-Autopilot/BEE_LAND/logs/* /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/OpenLoop_Test/logs
-
 cp -r ~/PX4-Autopilot/BEE_LAND/logs/* /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Flight_Analysis/logs
 
 cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Gazebo_defs/worlds/* ~/PX4-Autopilot/BEE_LAND/worlds/
@@ -31,7 +29,7 @@ cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Gazebo_defs/plugins/
 
 cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Controller_logic/*.py ~/PX4-Autopilot/BEE_LAND/controller/
 
-cp -r ~/PX4-Autopilot/BEE_LAND/logs/* /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Flight_Analysis/logs/valid
+cp -r ~/PX4-Autopilot/BEE_LAND/controller/logs/* /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Flight_Analysis/logs/valid
 ```
 
 Sometimes the environment needs to be rebuilt:
@@ -146,13 +144,7 @@ cd ~/PX4-Autopilot/BEE_LAND
 
 ros_bee # Defined in ~/.bashrc
 
-python3 -m controller.bee_node
-```
-
-For open-loop calibration instead:
-
-```bash
-python3 -m openloop.calibration_node
+python3 -m bee_control.bee_node
 ```
 
 The node currently:
