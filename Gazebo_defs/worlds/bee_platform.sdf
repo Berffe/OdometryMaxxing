@@ -54,13 +54,13 @@
 		<material>
 			<ambient>0.5 0.5 0.5 1</ambient>
 			<diffuse>0.5 0.5 0.5 1</diffuse>
-			<specular>0.1 0.1 0.1 1</specular>
+			<specular>0.0 0.0 0.0 1</specular>
 			<pbr>
 			<metal>
 				<albedo_map>materials/textures/ground_grey.png</albedo_map>
-				<normal_map>materials/textures/ground_grey_normal.png</normal_map>
+				<!-- NO normal map -->
 				<metalness>0.0</metalness>
-				<roughness>0.85</roughness>
+				<roughness>1</roughness>
 			</metal>
 			</pbr>
 		</material>

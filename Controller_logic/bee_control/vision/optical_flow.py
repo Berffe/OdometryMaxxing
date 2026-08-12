@@ -100,6 +100,8 @@ class OpticalFlowEstimator:
         "affine_residual_quantile_ms", "affine_refit_ms",
         "affine_input_points", "affine_sampled_points", "affine_fit_stride",
         "affine_finite_points", "affine_used_points",
+        "affine_border_exclusion_px", "affine_border_excluded_points",
+        "affine_border_fraction", "affine_border_min_px", "affine_border_max_px",
         "affine_points_used", "affine_fit_quality",
         # Static algorithm configuration, echoed per frame so a log is
         # self-describing without needing the source revision.
@@ -113,7 +115,7 @@ class OpticalFlowEstimator:
         pyr_scale: float = 0.5,
         levels: int = 3,
         winsize: int = 21,
-        iterations: int = 3,
+        iterations: int = 5,
         poly_n: int = 5,
         poly_sigma: float = 1.2,
         # --- ROI-adaptive downsampling (replaces the old binary close-range
@@ -196,6 +198,18 @@ class OpticalFlowEstimator:
         min_points_for_affine_fit: int = 30,
         affine_inlier_quantile: float = 0.85,
         affine_fit_stride: int = 2,
+        # Adaptive Farneback-border exclusion for the physical 4x4 fit only.
+        # Farneback itself still runs on the complete working ROI. The border
+        # is computed in WORKING-grid pixels from the smaller working dimension:
+        #
+        #   b = clip(round(fraction * min(W_work, H_work)), min_px, max_px)
+        #
+        # Defaults give b=5 at 32 px and b=15 at 96 px, preserving roughly the
+        # same central-area fraction across the operating range. Set fraction=0
+        # and min_px=0 to recover the no-exclusion baseline.
+        affine_border_fraction: float = 5.0 / 32.0,
+        affine_border_min_px: int = 5,
+        affine_border_max_px: int = 15,
         store_debug: bool = False,
         # Optional ego-rotation removal. Pass a derotation.Derotator to enable
         # it; leave None for the legacy (no de-rotation) behavior. When set,
@@ -247,6 +261,13 @@ class OpticalFlowEstimator:
         # of 2 samples one vector from each 2x2 block, retaining full-ROI
         # coverage while reducing the robust fit workload by about 4x.
         self._affine_fit_stride = max(1, int(affine_fit_stride))
+        # Adaptive exclusion is expressed in the WORKING Farneback grid and
+        # applied before affine-fit stride/weighting/robust trimming.
+        self._affine_border_fraction = max(0.0, float(affine_border_fraction))
+        self._affine_border_min_px = max(0, int(affine_border_min_px))
+        self._affine_border_max_px = max(
+            self._affine_border_min_px, int(affine_border_max_px)
+        )
 
         self._store_debug = bool(store_debug)
         self._last_debug = {}
@@ -613,7 +634,13 @@ class OpticalFlowEstimator:
         image width/height.  Translation absorbs the arbitrary ROI-local origin.
 
         Weighting, spatial decimation, robust residual trimming and fit_quality
-        keep the same semantics as before.  The degenerate fallback uses the
+        keep the same semantics as before. An adaptive border ring is
+        removed from the WORKING Farneback grid
+        before spatial decimation; this tests whether boundary vectors with
+        incomplete Farneback support are responsible for lambda attenuation.
+        Setting ``affine_border_fraction=0`` and
+        ``affine_border_min_px=0`` restores the previous fit
+        selection exactly. The degenerate fallback uses the
         finite-difference field, which already returns half of the full 2-D
         divergence and therefore has the same physical ``lambda`` convention.
         """
@@ -624,22 +651,73 @@ class OpticalFlowEstimator:
         roi_height, roi_width = flow_px_s.shape[:2]
         timing["input_points"] = int(roi_height * roi_width)
 
+        # ------------------------------------------------------------------
+        # Adaptive Farneback-border exclusion.
+        #
+        # Farneback still sees and estimates the COMPLETE working ROI. We only
+        # discard the outer ring when selecting vectors for the 4x4 lambda fit.
+        # The border is defined in WORKING-grid pixels and scales with the
+        # smaller working dimension so far-field ROIs retain enough vectors
+        # while near-field/full-frame ROIs reject a wider unreliable boundary.
+        # The exclusion is applied before the existing affine-fit stride.
+        working_min_dim = min(roi_height, roi_width)
+        requested_border = int(round(
+            self._affine_border_fraction * float(working_min_dim)
+        ))
+        requested_border = max(
+            self._affine_border_min_px,
+            min(self._affine_border_max_px, requested_border),
+        )
+        max_safe_border = max(0, (working_min_dim - 3) // 2)
+        border = min(requested_border, max_safe_border)
+
+        if border > 0:
+            flow_for_fit = flow_px_s[
+                border:roi_height - border,
+                border:roi_width - border,
+            ]
+            if (
+                gradient_magnitude is not None
+                and gradient_magnitude.shape == (roi_height, roi_width)
+            ):
+                gradient_for_fit = gradient_magnitude[
+                    border:roi_height - border,
+                    border:roi_width - border,
+                ]
+            else:
+                gradient_for_fit = None
+        else:
+            flow_for_fit = flow_px_s
+            gradient_for_fit = (
+                gradient_magnitude
+                if gradient_magnitude is not None
+                and gradient_magnitude.shape == (roi_height, roi_width)
+                else None
+            )
+
+        cropped_height, cropped_width = flow_for_fit.shape[:2]
+        timing["border_exclusion_px"] = int(border)
+        timing["border_excluded_points"] = int(
+            roi_height * roi_width - cropped_height * cropped_width
+        )
+        timing["border_fraction"] = float(self._affine_border_fraction)
+        timing["border_min_px"] = int(self._affine_border_min_px)
+        timing["border_max_px"] = int(self._affine_border_max_px)
+
         # Fit-only spatial decimation. No averaging/resizing is introduced here:
         # regular slicing keeps the measured vector values while the coordinate
         # spacing below is widened by the exact same stride.
         fit_stride = max(1, int(self._affine_fit_stride))
         if fit_stride > 1:
-            flow_fit = flow_px_s[::fit_stride, ::fit_stride]
-            if (
-                gradient_magnitude is not None
-                and gradient_magnitude.shape == (roi_height, roi_width)
-            ):
-                gradient_fit = gradient_magnitude[::fit_stride, ::fit_stride]
-            else:
-                gradient_fit = None
+            flow_fit = flow_for_fit[::fit_stride, ::fit_stride]
+            gradient_fit = (
+                gradient_for_fit[::fit_stride, ::fit_stride]
+                if gradient_for_fit is not None
+                else None
+            )
         else:
-            flow_fit = flow_px_s
-            gradient_fit = gradient_magnitude
+            flow_fit = flow_for_fit
+            gradient_fit = gradient_for_fit
 
         fit_height, fit_width = flow_fit.shape[:2]
         timing["fit_stride"] = fit_stride
