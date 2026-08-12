@@ -4,6 +4,10 @@ Standalone target-acquisition debug visualization.
 This file is intentionally separate from target_acquisition.py so the
 production detector stays small and readable.
 
+Shows the SIX stages the detector actually runs. There is deliberately no Canny
+panel: Canny is not part of the production candidate mask, and a permanently
+black tile implied a pipeline stage that does not exist.
+
 Run through target_acquisition.py, from the repo root:
 
 	python -m bee_control.vision.target_acquisition
@@ -216,11 +220,51 @@ def _label_tile(image: np.ndarray, label: str) -> np.ndarray:
 	return labeled
 
 
+def _draw_contour_only(frame_bgr, contour):
+	"""The winning contour on a dimmed frame.
+
+	Replaces the old Canny tile. Canny showed an input the detector no longer
+	uses; this shows the actual output of contour SELECTION, which is where a
+	bad detection is normally traceable to -- a distractor winning the score, or
+	the flower fragmenting into several small blobs.
+	"""
+	if frame_bgr is None:
+		return None
+
+	dimmed = (0.35 * frame_bgr.astype(np.float32)).astype(np.uint8)
+
+	if contour is not None:
+		cv2.drawContours(dimmed, [contour], -1, (0, 255, 255), 2)
+		area = float(cv2.contourArea(contour))
+		# y=70 at source resolution, so the text still clears the 28 px label
+		# bar after the tile is resized down to 280 px tall.
+		cv2.putText(
+			dimmed, f"area={area:.0f}px", (14, 70),
+			cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2, cv2.LINE_AA,
+		)
+	else:
+		cv2.putText(
+			dimmed, "no contour selected", (14, 70),
+			cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2, cv2.LINE_AA,
+		)
+
+	return dimmed
+
+
 def _make_debug_canvas(debug: dict) -> np.ndarray:
+	"""Four panels: the production pipeline, and nothing that is not in it.
+
+	The Canny panel that used to sit between the HSV mask and the cleanup was
+	removed because Canny is no longer part of the candidate mask. Target
+	identity is COLORFULNESS, not generic image structure -- a strong edge with
+	no flower-like saturation must not be able to become a competing contour.
+	``_build_masks`` still returns an ``edges`` entry, but it is an all-zero
+	array, so the panel was a permanently black tile implying a pipeline stage
+	that does not exist.
+	"""
 	frame = debug["frame"]
 	blurred = debug["blurred"]
 	hsv_mask = debug["hsv_mask"]
-	edges = debug["edges"]
 	clean_mask = debug["clean_mask"]
 	contour = debug["contour"]
 	target = debug["target"]
@@ -230,9 +274,9 @@ def _make_debug_canvas(debug: dict) -> np.ndarray:
 	tiles = [
 		("1 BGR frame", _to_bgr_for_display(frame)),
 		("2 Gaussian blur", _to_bgr_for_display(blurred)),
-		("3 HSV saliency mask", _to_bgr_for_display(hsv_mask)),
-		("4 Canny contrast cue", _to_bgr_for_display(edges)),
-		("5 Morphological cleanup", _to_bgr_for_display(clean_mask)),
+		("3 HSV colorfulness mask", _to_bgr_for_display(hsv_mask)),
+		("4 Morphological cleanup", _to_bgr_for_display(clean_mask)),
+		("5 Selected contour", _to_bgr_for_display(_draw_contour_only(frame, contour))),
 		("6 Detection result", _to_bgr_for_display(final_debug)),
 	]
 
@@ -307,16 +351,19 @@ def test():
 			f"close_range={'ON' if close_range_mode else 'OFF'}"
 		)
 
+		footer = np.zeros((30, canvas.shape[1], 3), dtype=np.uint8)
 		cv2.putText(
-			canvas,
-			mode_text,
-			(20, canvas.shape[0] - 18),
+			footer,
+			f"{mode_text} | n: target | d: distractors | c: close range | "
+			f"s: save | q/Esc: quit",
+			(16, 20),
 			cv2.FONT_HERSHEY_SIMPLEX,
-			0.65,
+			0.52,
 			(255, 255, 255),
-			2,
+			1,
 			cv2.LINE_AA,
 		)
+		canvas = np.vstack([canvas, footer])
 
 		cv2.imshow(window_name, canvas)
 		last_canvas = canvas

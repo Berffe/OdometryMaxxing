@@ -1,18 +1,26 @@
 """
 Standalone optical-flow debug visualization.
 
-This file compares two divergence-estimation methods:
+WHAT CHANGED AND WHY
+--------------------
+This harness used to pit Farneback ROI divergence against a box-size
+(apparent-growth) estimator. That comparison is settled: dense flow won, the box
+estimator never reached the controller, and keeping a decided experiment on
+screen costs attention every time the file is opened. Both are gone.
 
-	1. Farneback ROI divergence:
-		Dense optical flow is computed inside the target ROI, then
-		divergence is estimated from the local flow field.
+The question this file now answers is the one that is still open:
 
-	2. Box-size divergence:
-		Apparent target growth is estimated directly from the target
-		box width and height.
+    given ONE Farneback flow field, which reduction recovers lambda best?
 
-This debug file does not change the controller. It only helps compare
-candidate optical-flow / divergence strategies.
+The estimators live in ``_divergence_estimators.py`` so this harness and
+``_optFlow_targetAcqu_debug.py`` cannot drift apart. The production 4-parameter
+constrained fit is read back from the FlowResult rather than recomputed, so the
+panel can never disagree with what the vehicle would have flown.
+
+Because the scene is synthetic, ground truth is known ANALYTICALLY: the frame at
+step k is the base scene scaled about the image centre by s(k), so the flow
+between consecutive frames is an exact scaling by r = s(k)/s(k-1) and the
+lambda the fit should return is (r - 1) / dt.
 
 Run through optical_flow.py, from the repo root:
 
@@ -21,6 +29,13 @@ Run through optical_flow.py, from the repo root:
 or directly:
 
 	python -m bee_control.tests._optical_flow_debug
+
+Keyboard:
+
+	q or Esc  -> quit
+	m         -> cycle motion mode (zoom / translate / combined)
+	r         -> reset estimator and statistics
+	s         -> save the current preview
 """
 
 from typing import Optional
@@ -31,152 +46,12 @@ import numpy as np
 from bee_control.core.state import TargetEstimate
 from bee_control.vision.optical_flow import OpticalFlowEstimator
 
-
-class BoxSizeDivergenceEstimator:
-	"""
-	Debug-only apparent-size divergence estimator.
-
-	This estimates divergence from apparent growth of the detected target box:
-
-		D_width  = (w_k - w_{k-1}) / (w_{k-1} * dt)
-		D_height = (h_k - h_{k-1}) / (h_{k-1} * dt)
-
-		D_box = 0.5 * (D_width + D_height)
-
-	Positive D_box means the target appears larger in the image, which
-	corresponds to approaching the target.
-
-	This is not dense optical flow. It is a visual expansion estimator.
-	"""
-
-	def __init__(
-		self,
-		smoothing: float = 0.6,
-		min_box_size_px: float = 3.0,
-	):
-		self._smoothing = float(smoothing)
-		self._min_box_size_px = float(min_box_size_px)
-
-		self._prev_width = None
-		self._prev_height = None
-		self._prev_timestamp = None
-
-		self._filtered_divergence = 0.0
-		self._has_filtered_divergence = False
-
-	def reset(self):
-		self._prev_width = None
-		self._prev_height = None
-		self._prev_timestamp = None
-
-		self._filtered_divergence = 0.0
-		self._has_filtered_divergence = False
-
-	def update(self, target: TargetEstimate) -> dict:
-		if target is None or not target.found:
-			self.reset()
-
-			return {
-				"valid": False,
-				"raw_divergence": 0.0,
-				"filtered_divergence": 0.0,
-				"width_divergence": 0.0,
-				"height_divergence": 0.0,
-				"width": 0.0,
-				"height": 0.0,
-				"message": "No valid target",
-			}
-
-		width = float(target.detection_width)
-		height = float(target.detection_height)
-		timestamp = float(target.timestamp)
-
-		if width <= self._min_box_size_px or height <= self._min_box_size_px:
-			self.reset()
-
-			return {
-				"valid": False,
-				"raw_divergence": 0.0,
-				"filtered_divergence": 0.0,
-				"width_divergence": 0.0,
-				"height_divergence": 0.0,
-				"width": width,
-				"height": height,
-				"message": "Target box too small",
-			}
-
-		if (
-			self._prev_width is None
-			or self._prev_height is None
-			or self._prev_timestamp is None
-		):
-			self._prev_width = width
-			self._prev_height = height
-			self._prev_timestamp = timestamp
-
-			return {
-				"valid": False,
-				"raw_divergence": 0.0,
-				"filtered_divergence": 0.0,
-				"width_divergence": 0.0,
-				"height_divergence": 0.0,
-				"width": width,
-				"height": height,
-				"message": "Waiting for previous target box",
-			}
-
-		dt = timestamp - self._prev_timestamp
-
-		if dt <= 1e-6:
-			self._prev_width = width
-			self._prev_height = height
-			self._prev_timestamp = timestamp
-
-			return {
-				"valid": False,
-				"raw_divergence": 0.0,
-				"filtered_divergence": 0.0,
-				"width_divergence": 0.0,
-				"height_divergence": 0.0,
-				"width": width,
-				"height": height,
-				"message": "Invalid dt",
-			}
-
-		width_divergence = (width - self._prev_width) / (self._prev_width * dt)
-		height_divergence = (height - self._prev_height) / (self._prev_height * dt)
-
-		raw_divergence = 0.5 * (width_divergence + height_divergence)
-		filtered_divergence = self._filter(raw_divergence)
-
-		self._prev_width = width
-		self._prev_height = height
-		self._prev_timestamp = timestamp
-
-		return {
-			"valid": True,
-			"raw_divergence": float(raw_divergence),
-			"filtered_divergence": float(filtered_divergence),
-			"width_divergence": float(width_divergence),
-			"height_divergence": float(height_divergence),
-			"width": width,
-			"height": height,
-			"message": "",
-		}
-
-	def _filter(self, value: float) -> float:
-		alpha = max(0.0, min(1.0, self._smoothing))
-
-		if not self._has_filtered_divergence:
-			self._filtered_divergence = float(value)
-			self._has_filtered_divergence = True
-		else:
-			self._filtered_divergence = (
-				alpha * self._filtered_divergence
-				+ (1.0 - alpha) * float(value)
-			)
-
-		return self._filtered_divergence
+from ._divergence_estimators import (
+	EstimatorComparison,
+	evaluate_estimators,
+	make_comparison_plot,
+	make_comparison_table,
+)
 
 
 def _motion_parameters(step: int, mode: str):
@@ -189,8 +64,16 @@ def _motion_parameters(step: int, mode: str):
 	"""
 	if mode == "translate":
 		scale = 1.0
-		dx = 70.0 * np.sin(0.35 * step)
-		dy = 45.0 * np.cos(0.30 * step)
+		# Amplitude and rate are chosen so the per-frame displacement stays
+		# around 2 px. The original 70 px / 0.35 rad-per-step gave ~24 px per
+		# frame, which is past what Farneback resolves at this downsample: the
+		# fit then reported lambda swinging over several 1/s with fit_quality
+		# collapsing to ~0.05. That measured TRACKING FAILURE, not reduction
+		# bias, and it made translate mode useless as the zero-lambda test it
+		# is meant to be. Raise these again only alongside a Farneback winsize
+		# or pyramid-level change.
+		dx = 20.0 * np.sin(0.10 * step)
+		dy = 14.0 * np.cos(0.08 * step)
 
 	elif mode == "zoom":
 		scale = 1.0 + 0.25 * np.sin(0.09 * step)
@@ -234,17 +117,40 @@ def _draw_flow_arrows(
 	Draw sparse arrows on top of the current frame.
 
 	If roi is provided, flow_px_s is assumed to be local to the ROI.
+
+	COORDINATE SCALING -- do not remove
+	-----------------------------------
+	``flow_px_s`` is the WORKING grid, which is the ROI after downsampling, so
+	its indices are NOT full-frame pixels. The ROI rectangle, by contrast, is in
+	full-frame pixels. Adding a working-grid index straight to the ROI origin
+	therefore squeezes every arrow into the top-left ``scale`` fraction of the
+	box -- 50% x 50% once the ROI is large enough for the downsampler to clamp
+	at 0.5, which is precisely the near-field regime the arrows matter most in.
+
+	The step is recovered from the two shapes rather than passed in, so the
+	renderer stays correct if the downsample policy changes.
+
+	Only the sample POSITIONS need this. The vectors themselves are already
+	amplitude-corrected to original px/s by the estimator, so direction and
+	length are in full-frame units and must not be rescaled again.
 	"""
 	vis = frame_bgr.copy()
+
+	grid_height, grid_width = flow_px_s.shape[:2]
 
 	if roi is None:
 		x_offset = 0
 		y_offset = 0
+		x_step = 1.0
+		y_step = 1.0
 	else:
 		x_offset, y_offset, x1, y1 = roi
 		cv2.rectangle(vis, (x_offset, y_offset), (x1, y1), (0, 255, 0), 2)
 
-	roi_height, roi_width = flow_px_s.shape[:2]
+		x_step = (x1 - x_offset) / max(1, grid_width)
+		y_step = (y1 - y_offset) / max(1, grid_height)
+
+	roi_height, roi_width = grid_height, grid_width
 
 	u = flow_px_s[:, :, 0]
 	v = flow_px_s[:, :, 1]
@@ -253,8 +159,15 @@ def _draw_flow_arrows(
 	mag_ref = float(np.percentile(magnitude, 95))
 	mag_ref = max(mag_ref, min_flow_magnitude)
 
-	for y in range(grid_step // 2, roi_height, grid_step):
-		for x in range(grid_step // 2, roi_width, grid_step):
+	# Centre the sample lattice. `range(grid_step // 2, n, grid_step)` leaves
+	# whatever does not divide evenly unsampled at the far edge, which pushes
+	# the arrow cloud toward the top-left of the ROI -- a smaller version of the
+	# coordinate bug above, and just as misleading to look at.
+	x_origin = ((roi_width - 1) % grid_step) // 2
+	y_origin = ((roi_height - 1) % grid_step) // 2
+
+	for y in range(y_origin, roi_height, grid_step):
+		for x in range(x_origin, roi_width, grid_step):
 			u_xy = float(flow_px_s[y, x, 0])
 			v_xy = float(flow_px_s[y, x, 1])
 
@@ -269,8 +182,8 @@ def _draw_flow_arrows(
 			length = max_arrow_length * min(1.0, mag / mag_ref)
 			length = max(min_arrow_length, length)
 
-			x_start = int(x_offset + x)
-			y_start = int(y_offset + y)
+			x_start = int(round(x_offset + x * x_step))
+			y_start = int(round(y_offset + y * y_step))
 
 			x_end = int(round(x_start + length * dir_x))
 			y_end = int(round(y_start + length * dir_y))
@@ -577,7 +490,8 @@ def _label_tile(image: np.ndarray, label: str) -> np.ndarray:
 	return labeled
 
 
-def _make_farneback_panel(flow_debug: dict) -> np.ndarray:
+def _make_flow_result_panel(flow_debug: dict, mode: str, truth: float) -> np.ndarray:
+	"""The FlowResult as the controller would receive it, plus the scene truth."""
 	panel_width = 420
 	panel_height = 280
 
@@ -587,168 +501,182 @@ def _make_farneback_panel(flow_debug: dict) -> np.ndarray:
 	roi = flow_debug.get("roi", None)
 	message = flow_debug.get("message", "")
 
-	lines = [
-		"Farneback ROI divergence:",
-		"",
-	]
+	lines = ["FlowResult as delivered:", ""]
 
 	if flow is None:
-		lines += [
-			"no FlowResult object",
-		]
+		lines += ["no FlowResult object"]
 	else:
 		lines += [
 			f"valid: {flow.valid}",
 			f"mean_flow_x: {flow.mean_flow_x:+.2f} px/s",
 			f"mean_flow_y: {flow.mean_flow_y:+.2f} px/s",
-			f"filtered divergence: {flow.divergence:+.4f} 1/s",
-			f"raw divergence: {flow_debug.get('raw_divergence', 0.0):+.4f} 1/s",
-			f"roi: {roi}",
+			f"divergence (filtered): {flow.divergence:+.4f}",
+			f"raw_divergence: {flow.raw_divergence:+.4f}",
+			f"fit_quality: {flow.fit_quality:.3f}",
 			f"timestamp: {flow.timestamp:.3f} s",
 		]
 
-	if message:
-		lines += [
-			"",
-			f"message: {message}",
-		]
-
-	y = 40
-	for line in lines:
-		cv2.putText(
-			panel,
-			line,
-			(18, y),
-			cv2.FONT_HERSHEY_SIMPLEX,
-			0.56,
-			(255, 255, 255),
-			1,
-			cv2.LINE_AA,
-		)
-		y += 27
-
-	return _label_tile(panel, "5 Farneback FlowResult")
-
-
-def _make_box_size_panel(box_debug: dict) -> np.ndarray:
-	panel_width = 420
-	panel_height = 280
-
-	panel = np.zeros((panel_height, panel_width, 3), dtype=np.uint8)
-
-	message = box_debug.get("message", "")
-
-	lines = [
-		"Box-size divergence:",
+	lines += [
 		"",
-		f"valid: {box_debug.get('valid', False)}",
-		f"filtered D_box: {box_debug.get('filtered_divergence', 0.0):+.4f} 1/s",
-		f"raw D_box: {box_debug.get('raw_divergence', 0.0):+.4f} 1/s",
-		f"D_width: {box_debug.get('width_divergence', 0.0):+.4f} 1/s",
-		f"D_height: {box_debug.get('height_divergence', 0.0):+.4f} 1/s",
-		f"box width: {box_debug.get('width', 0.0):.1f} px",
-		f"box height: {box_debug.get('height', 0.0):.1f} px",
+		f"mode: {mode}",
+		f"truth lambda: {truth:+.4f} 1/s" if np.isfinite(truth) else "truth lambda: n/a",
 	]
 
-	if message:
-		lines += [
-			"",
-			f"message: {message}",
-		]
+	if roi is not None:
+		lines += [f"roi: {roi}"]
 
-	y = 40
+	if message:
+		lines += ["", f"message: {message}"]
+
+	y = 34
 	for line in lines:
 		cv2.putText(
 			panel,
 			line,
-			(18, y),
+			(16, y),
 			cv2.FONT_HERSHEY_SIMPLEX,
-			0.56,
+			0.46,
 			(255, 255, 255),
 			1,
 			cv2.LINE_AA,
 		)
-		y += 27
+		y += 21
 
-	return _label_tile(panel, "6 Box-size D_box")
+	return _label_tile(panel, "4 FlowResult")
+
+
+def _ground_truth_lambda(step: int, mode: str, dt: float) -> float:
+	"""The lambda the fit SHOULD return for the frame pair (step-1, step).
+
+	The frame at step k is the base scene scaled about the image centre by
+	s(k), so the flow between consecutive frames is exactly a scaling by
+	r = s(k) / s(k-1) about that centre:
+
+	    u(x) = (r - 1) * x / dt
+
+	The constrained model fits ``u = t_x + lambda*x - r_rot*y``, hence the
+	value it should recover is ``(r - 1) / dt``. The discrete ratio is used
+	rather than the continuous derivative of s so that ground truth matches
+	what a one-frame displacement measurement can actually see.
+
+	Pure translation contributes only to t_x/t_y, so translate mode has
+	lambda = 0 exactly -- which makes it the bias test: any estimator reporting
+	non-zero lambda there is leaking translation into expansion.
+	"""
+	if step <= 0:
+		return float("nan")
+
+	scale_now, _, _ = _motion_parameters(step, mode)
+	scale_prev, _, _ = _motion_parameters(step - 1, mode)
+
+	if abs(scale_prev) < 1e-9 or dt <= 0.0:
+		return float("nan")
+
+	return (scale_now / scale_prev - 1.0) / dt
 
 
 def _make_debug_canvas(
 	flow_debug: dict,
-	box_debug: dict,
+	comparison: EstimatorComparison,
 	target: TargetEstimate,
 	mode: str,
-	frame: np.ndarray,
+	truth: float,
 ) -> np.ndarray:
-	previous_frame = flow_debug.get("previous_frame")
+	"""Top row: what the estimator saw. Bottom row: what each reduction made of it."""
 	current_frame = flow_debug.get("current_frame")
 	flow_px_s = flow_debug.get("flow_px_s")
 	divergence_field = flow_debug.get("divergence_field")
 	roi = flow_debug.get("roi")
 
-	current_with_box = _draw_target_box(current_frame, target) if current_frame is not None else None
+	current_with_box = (
+		_draw_target_box(current_frame, target)
+		if current_frame is not None
+		else None
+	)
 
 	if current_frame is not None and flow_px_s is not None:
 		flow_arrows = _draw_flow_arrows(current_frame, flow_px_s, roi=roi)
 	else:
 		flow_arrows = current_frame.copy() if current_frame is not None else None
 
-	if divergence_field is not None:
-		divergence_heatmap = _divergence_to_heatmap(divergence_field)
-	else:
-		divergence_heatmap = None
-
-	farneback_panel = _make_farneback_panel(flow_debug)
-	box_panel = _make_box_size_panel(box_debug)
-
-	tiles = [
-		("1 Previous frame", _to_bgr_for_display(previous_frame)),
-		("2 Current frame + target box", _to_bgr_for_display(current_with_box)),
-		("3 ROI flow arrows", _to_bgr_for_display(flow_arrows)),
-		("4 ROI divergence heatmap", _to_bgr_for_display(divergence_heatmap)),
-		("5 Farneback FlowResult", farneback_panel),
-		("6 Box-size D_box", box_panel),
-	]
+	divergence_heatmap = (
+		_divergence_to_heatmap(divergence_field)
+		if divergence_field is not None
+		else None
+	)
 
 	tile_width = 420
 	tile_height = 280
 
-	resized_tiles = [
-		_label_tile(_resize_for_tile(image, tile_width, tile_height), label)
-		for label, image in tiles
+	top_tiles = [
+		("1 Current frame + target box", _to_bgr_for_display(current_with_box)),
+		("2 ROI flow arrows", _to_bgr_for_display(flow_arrows)),
+		("3 ROI lambda field", _to_bgr_for_display(divergence_heatmap)),
 	]
 
-	row_1 = np.hstack(resized_tiles[:3])
-	row_2 = np.hstack(resized_tiles[3:])
+	row_1 = np.hstack([
+		_label_tile(_resize_for_tile(image, tile_width, tile_height), label)
+		for label, image in top_tiles
+	])
+
+	total_width = row_1.shape[1]
+
+	# The table and the plot carry their own titles, so they are NOT passed
+	# through _label_tile -- its black header bar would sit on top of them.
+	table_width = total_width // 2
+	plot_width = total_width - table_width
+
+	flow = flow_debug.get("result")
+	subtitle = (
+		f"mode: {mode}   valid: {getattr(flow, 'valid', False)}   "
+		f"raw: {getattr(flow, 'raw_divergence', float('nan')):+.4f}   "
+		f"filtered: {getattr(flow, 'divergence', float('nan')):+.4f}"
+	)
+
+	table = make_comparison_table(
+		comparison,
+		width=table_width,
+		height=tile_height,
+		subtitle=subtitle,
+	)
+	plot = make_comparison_plot(comparison, width=plot_width, height=tile_height)
+
+	row_2 = np.hstack([table, plot])
 
 	canvas = np.vstack([row_1, row_2])
 
-	mode_text = f"mode: {mode} | m: switch mode | r: reset | s: save | q/Esc: quit"
-
+	# Footer is its own strip. Drawing it over the panels clipped the last row
+	# of whichever panel it landed on.
+	footer = np.zeros((30, canvas.shape[1], 3), dtype=np.uint8)
 	cv2.putText(
-		canvas,
-		mode_text,
-		(20, canvas.shape[0] - 18),
+		footer,
+		f"mode: {mode} | m: switch mode (zoom/translate/combined) | "
+		f"r: reset | s: save | q/Esc: quit",
+		(16, 20),
 		cv2.FONT_HERSHEY_SIMPLEX,
-		0.65,
+		0.52,
 		(255, 255, 255),
-		2,
+		1,
 		cv2.LINE_AA,
 	)
+
+	canvas = np.vstack([canvas, footer])
 
 	return canvas
 
 
 def test():
-	"""
-	Standalone visual test for comparing divergence estimators.
+	"""Compare every lambda reduction on one synthetic scene with known truth.
 
-	Keyboard controls:
+	Modes:
 
-		q or Esc  -> quit
-		m         -> change synthetic motion mode
-		r         -> reset estimators
-		s         -> save current preview image
+	``zoom``       pure expansion about the image centre. The accuracy test.
+	``translate``  pure translation, lambda = 0 exactly. The BIAS test: a
+	               reduction that leaks translation into expansion shows up
+	               here and nowhere else.
+	``combined``   expansion plus translation, which is the realistic case and
+	               the one where the constrained model earns its keep -- it has
+	               explicit translation terms to absorb the lateral motion.
 	"""
 	width = 640
 	height = 480
@@ -764,26 +692,26 @@ def test():
 		store_debug=True,
 	)
 
-	box_estimator = BoxSizeDivergenceEstimator(
-		smoothing=0.6,
-		min_box_size_px=3.0,
-	)
+	comparison = EstimatorComparison(history_length=240)
 
-	modes = ["translate", "zoom", "combined"]
-	mode_index = 1
+	modes = ["zoom", "translate", "combined"]
+	mode_index = 0
 
 	step = 0
 	last_canvas = None
 
-	window_name = "Optical flow divergence comparison"
+	window_name = "Divergence reduction comparison"
 	cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
 	print("")
-	print("Optical flow divergence comparison")
-	print("----------------------------------")
+	print("Divergence reduction comparison")
+	print("-------------------------------")
+	print("One Farneback field per frame, reduced to lambda seven ways.")
+	print("Ground truth is analytic; bias and RMS accumulate until reset.")
+	print("")
 	print("q or Esc  -> quit")
-	print("m         -> change synthetic motion mode")
-	print("r         -> reset estimators")
+	print("m         -> change synthetic motion mode (zoom/translate/combined)")
+	print("r         -> reset estimator and statistics")
 	print("s         -> save current preview image")
 	print("")
 
@@ -806,21 +734,23 @@ def test():
 
 		timestamp = step * dt
 
-		flow_estimator.update(
-			frame,
-			timestamp,
-			target=target,
-		)
-
-		box_debug = box_estimator.update(target)
+		flow_result = flow_estimator.update(frame, timestamp, target=target)
 		flow_debug = flow_estimator.last_debug_data()
+
+		truth = _ground_truth_lambda(step, mode, dt)
+
+		# Only score frames the estimator itself considered valid; a warm-up
+		# frame with no predecessor would otherwise pollute every bias figure.
+		if flow_result is not None and flow_result.valid:
+			values = evaluate_estimators(flow_estimator, flow_result, flow_debug)
+			comparison.update(values, truth, flow_result.fit_quality)
 
 		canvas = _make_debug_canvas(
 			flow_debug=flow_debug,
-			box_debug=box_debug,
+			comparison=comparison,
 			target=target,
 			mode=mode,
-			frame=frame,
+			truth=truth,
 		)
 
 		cv2.imshow(window_name, canvas)
@@ -834,23 +764,42 @@ def test():
 		if key == ord("m"):
 			mode_index = (mode_index + 1) % len(modes)
 			flow_estimator.reset()
-			box_estimator.reset()
+			comparison.reset()
 			step = 0
 			continue
 
 		if key == ord("r"):
 			flow_estimator.reset()
-			box_estimator.reset()
+			comparison.reset()
 			step = 0
 			continue
 
 		if key == ord("s") and last_canvas is not None:
-			cv2.imwrite("optical_flow_divergence_comparison.png", last_canvas)
-			print("Saved: optical_flow_divergence_comparison.png")
+			cv2.imwrite("divergence_reduction_comparison.png", last_canvas)
+			print("Saved: divergence_reduction_comparison.png")
 
 		step += 1
 
 	cv2.destroyAllWindows()
+
+	_print_summary(comparison, modes[mode_index])
+
+
+def _print_summary(comparison: EstimatorComparison, mode: str):
+	"""Console summary, so a headless run still yields the numbers."""
+	from ._divergence_estimators import ESTIMATORS
+
+	print("")
+	print(f"Reduction comparison summary (mode: {mode})")
+	print(f"{'estimator':32} {'bias':>10} {'rms':>10} {'n':>6}")
+	print("-" * 62)
+
+	for key, label, _, _ in ESTIMATORS:
+		print(
+			f"{label:32} {comparison.bias(key):>+10.5f} "
+			f"{comparison.rms(key):>10.5f} {comparison.samples(key):>6d}"
+		)
+	print("")
 
 
 if __name__ == "__main__":
