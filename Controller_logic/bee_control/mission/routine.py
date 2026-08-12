@@ -187,17 +187,46 @@ class MissionRoutine:
         self._near_probe_decay_tau = float(cfg.near_probe_decay_tau_sec)
         self._near_probe_highpass_tau = float(cfg.near_probe_highpass_tau_sec)
 
-        # Visual synchronisation probe. Fed the FILTERED divergence the
-        # controller actually acts on, so chi describes the loop being flown
-        # rather than an idealised one. Ddot is a causal least-squares slope over
-        # recent samples spaced by the real camera/Gazebo SIM dt values.
+        # Three visual synchronisation probes. The vertical channel keeps the
+        # original chi_z = omega_z_dot - omega_z^2 definition. The lateral
+        # channels use chi_i = omega_i_dot - omega_i*omega_z, so the range-rate
+        # coupling that infiltrates lateral optical flow is removed explicitly.
+        # All derivatives are causal least-squares slopes over the real
+        # camera/Gazebo-SIM sample spacings.
         self._chi_probe = VisualMismatchProbe(
             percentile_window_sec=cfg.far_probe_window_sec,
             peak_decay_tau_sec=cfg.far_probe_decay_tau_sec,
             derivative_window_sec=cfg.tracking_derivative_window_sec,
         )
+        self._chi_x_probe = VisualMismatchProbe(
+            percentile_window_sec=cfg.far_probe_window_sec,
+            peak_decay_tau_sec=cfg.far_probe_decay_tau_sec,
+            derivative_window_sec=cfg.tracking_derivative_window_sec,
+        )
+        self._chi_y_probe = VisualMismatchProbe(
+            percentile_window_sec=cfg.far_probe_window_sec,
+            peak_decay_tau_sec=cfg.far_probe_decay_tau_sec,
+            derivative_window_sec=cfg.tracking_derivative_window_sec,
+        )
         self._enable_tracking_gate = bool(cfg.enable_tracking_gate)
-        self._tracking_chi_limit = max(0.0, float(cfg.tracking_chi_limit_1_s2))
+        # Separate rejection limits per visual axis.  ``tracking_chi_limit_1_s2``
+        # remains the vertical/z name for backward compatibility; x/y fall back
+        # to it when an older MissionConfig is used.
+        self._tracking_z_chi_limit = max(
+            0.0, float(cfg.tracking_chi_limit_1_s2)
+        )
+        self._tracking_x_chi_limit = max(
+            0.0, float(getattr(
+                cfg, "tracking_x_chi_limit_1_s2", self._tracking_z_chi_limit
+            ))
+        )
+        self._tracking_y_chi_limit = max(
+            0.0, float(getattr(
+                cfg, "tracking_y_chi_limit_1_s2", self._tracking_z_chi_limit
+            ))
+        )
+        # Legacy internal alias: every old vertical call keeps the same meaning.
+        self._tracking_chi_limit = self._tracking_z_chi_limit
         self._tracking_min_observation_sec = max(
             0.0, float(cfg.tracking_min_observation_sec)
         )
@@ -206,11 +235,15 @@ class MissionRoutine:
         # phase for diagnosis.
         self._chi_gate_window_active = False
         self._chi_observed_sec = 0.0
+        self._chi_x_observed_sec = 0.0
+        self._chi_y_observed_sec = 0.0
 
         self.gate = GateResult()
         self.roll_gate = LateralGateResult()
         self.pitch_gate = LateralGateResult()
         self.tracking_gate = TrackingGateResult()
+        self.tracking_x_gate = TrackingGateResult()
+        self.tracking_y_gate = TrackingGateResult()
         self.probe_result = ProbeResult()
         self.roll_probe_result = ProbeResult()
         self.pitch_probe_result = ProbeResult()
@@ -277,13 +310,18 @@ class MissionRoutine:
                 percentile_window_sec=self._far_probe_window,
                 peak_decay_tau_sec=self._far_probe_decay_tau,
             )
-        self._chi_probe.reset()
+        for probe in (self._chi_probe, self._chi_x_probe, self._chi_y_probe):
+            probe.reset()
         self._chi_gate_window_active = False
         self._chi_observed_sec = 0.0
+        self._chi_x_observed_sec = 0.0
+        self._chi_y_observed_sec = 0.0
         self.gate = GateResult()
         self.roll_gate = LateralGateResult()
         self.pitch_gate = LateralGateResult()
         self.tracking_gate = TrackingGateResult()
+        self.tracking_x_gate = TrackingGateResult()
+        self.tracking_y_gate = TrackingGateResult()
         self.probe_result = ProbeResult()
         self.roll_probe_result = ProbeResult()
         self.pitch_probe_result = ProbeResult()
@@ -348,8 +386,20 @@ class MissionRoutine:
         # Feasibility gate inputs and outputs.
         "peak_accel_m_s2", "roll_peak_accel_m_s2", "pitch_peak_accel_m_s2",
         "k_min", "k_explore", "k_probe", "k_floor", "k_ceiling_leg",
-        "h_crit_m", "h_pred_m",
+        "k_ceiling_probe", "h_crit_m", "h_pred_m",
         "vertical_feasible", "roll_feasible", "pitch_feasible", "feasible",
+        # Explicit three-question verdict per controlled axis:
+        # upper bound -> stable?, lower bound -> enough authority?,
+        # visual mismatch -> enough tracking bandwidth?
+        "vertical_stability_ok", "vertical_authority_ok",
+        "vertical_gain_margin_exists", "vertical_tracking_ok",
+        "vertical_landing_feasible",
+        "roll_stability_ok", "roll_authority_ok",
+        "roll_gain_margin_exists", "roll_tracking_ok",
+        "roll_landing_feasible",
+        "pitch_stability_ok", "pitch_authority_ok",
+        "pitch_gain_margin_exists", "pitch_tracking_ok",
+        "pitch_landing_feasible",
         "roll_k_min", "pitch_k_min", "roll_k_probe", "pitch_k_probe",
         "roll_k_applied", "pitch_k_applied",
         "roll_k_target", "pitch_k_target",
@@ -364,8 +414,11 @@ class MissionRoutine:
         "pitch_accel_capacity_floor_m_s2",
         "pitch_accel_capacity_ceiling_m_s2",
         "vertical_window_exists", "roll_window_exists", "pitch_window_exists",
-        "roll_probe_within_ceiling", "pitch_probe_within_ceiling",
-        "infeasible_reason",
+        "vertical_probe_within_ceiling", "roll_probe_within_ceiling",
+        "pitch_probe_within_ceiling",
+        "vertical_floor_within_ceiling", "roll_floor_within_ceiling",
+        "pitch_floor_within_ceiling",
+        "infeasible_axes", "infeasible_criteria", "infeasible_reason",
         # Live probe state.
         "probe_phase", "probe_active",
         "probe_accel_m_s2", "probe_mean_accel_m_s2",
@@ -379,11 +432,26 @@ class MissionRoutine:
         "pitch_probe_residual_accel_m_s2", "pitch_probe_percentile_accel_m_s2",
         "pitch_probe_peak_accel_m_s2", "pitch_probe_peak_accel_at_handoff_m_s2",
         "near_field_height_m",
-        # Visual synchronisation gate.
+        # Visual synchronisation gates. Legacy unqualified ``chi`` fields remain
+        # the vertical (z) channel; x/y are added explicitly.
         "chi", "chi_abs_1_s2", "chi_divergence_rate_1_s2",
         "chi_percentile_1_s2", "chi_peak_1_s2", "chi_limit_1_s2",
         "chi_observed_sec", "chi_derivative_ready",
         "tracking_decision_chi_peak_1_s2",
+        # Explicit z aliases make the tracking schema parallel to x/y while
+        # preserving every legacy unqualified vertical column above.
+        "tracking_z_decision_chi_peak_1_s2",
+        "tracking_z_ready", "tracking_z_synchronized", "tracking_z_feasible",
+        "chi_x", "chi_x_abs_1_s2", "chi_x_rate_1_s2",
+        "chi_x_percentile_1_s2", "chi_x_peak_1_s2", "chi_x_limit_1_s2",
+        "chi_x_observed_sec", "chi_x_derivative_ready",
+        "tracking_x_decision_chi_peak_1_s2",
+        "tracking_x_ready", "tracking_x_synchronized", "tracking_x_feasible",
+        "chi_y", "chi_y_abs_1_s2", "chi_y_rate_1_s2",
+        "chi_y_percentile_1_s2", "chi_y_peak_1_s2", "chi_y_limit_1_s2",
+        "chi_y_observed_sec", "chi_y_derivative_ready",
+        "tracking_y_decision_chi_peak_1_s2",
+        "tracking_y_ready", "tracking_y_synchronized", "tracking_y_feasible",
         "tracking_ready", "tracking_synchronized",
         "tracking_enabled", "tracking_feasible",
     )
@@ -445,13 +513,32 @@ class MissionRoutine:
             "k_probe": self.probe_gain,
             "k_floor": gate.k_floor,
             "k_ceiling_leg": gate.k_ceiling_leg,
+            "k_ceiling_probe": gate.k_ceiling_probe,
             "h_crit_m": gate.h_crit,
             "h_pred_m": _blank(info.get("h_pred")),
 
+            # Legacy gain-gate verdicts. These deliberately remain gain-only.
             "vertical_feasible": int(bool(gate.feasible)),
             "roll_feasible": int(bool(roll_gate.feasible)),
             "pitch_feasible": int(bool(pitch_gate.feasible)),
             "feasible": int(bool(self.feasible)),
+
+            # Parallel per-axis interpretation used by the INFEASIBLE report.
+            "vertical_stability_ok": int(bool(self.vertical_stability_ok)),
+            "vertical_authority_ok": int(bool(self.vertical_authority_ok)),
+            "vertical_gain_margin_exists": int(bool(self.vertical_gain_margin_exists)),
+            "vertical_tracking_ok": int(bool(self.vertical_tracking_ok)),
+            "vertical_landing_feasible": int(bool(self.vertical_landing_feasible)),
+            "roll_stability_ok": int(bool(self.roll_stability_ok)),
+            "roll_authority_ok": int(bool(self.roll_authority_ok)),
+            "roll_gain_margin_exists": int(bool(self.roll_gain_margin_exists)),
+            "roll_tracking_ok": int(bool(self.roll_tracking_ok)),
+            "roll_landing_feasible": int(bool(self.roll_landing_feasible)),
+            "pitch_stability_ok": int(bool(self.pitch_stability_ok)),
+            "pitch_authority_ok": int(bool(self.pitch_authority_ok)),
+            "pitch_gain_margin_exists": int(bool(self.pitch_gain_margin_exists)),
+            "pitch_tracking_ok": int(bool(self.pitch_tracking_ok)),
+            "pitch_landing_feasible": int(bool(self.pitch_landing_feasible)),
 
             "roll_k_min": roll_gate.k_min,
             "pitch_k_min": pitch_gate.k_min,
@@ -480,28 +567,73 @@ class MissionRoutine:
             "vertical_window_exists": int(bool(gate.window_exists)),
             "roll_window_exists": int(bool(roll_gate.window_exists)),
             "pitch_window_exists": int(bool(pitch_gate.window_exists)),
+            "vertical_probe_within_ceiling": int(bool(gate.probe_within_ceiling)),
             "roll_probe_within_ceiling": int(bool(roll_gate.probe_within_ceiling)),
             "pitch_probe_within_ceiling": int(bool(pitch_gate.probe_within_ceiling)),
+            "vertical_floor_within_ceiling": int(bool(gate.floor_within_ceiling)),
+            "roll_floor_within_ceiling": int(bool(roll_gate.floor_within_ceiling)),
+            "pitch_floor_within_ceiling": int(bool(pitch_gate.floor_within_ceiling)),
+            "infeasible_axes": _blank(info.get("infeasible_axes")),
+            "infeasible_criteria": _blank(info.get("infeasible_criteria")),
             "infeasible_reason": _blank(info.get("infeasible_reason")),
         }
 
         tracking = self.tracking_gate
+        tracking_x = self.tracking_x_gate
+        tracking_y = self.tracking_y_gate
         row.update({
             "chi": self._chi_probe.chi,
             "chi_abs_1_s2": self._chi_probe.abs_chi,
             "chi_divergence_rate_1_s2": self._chi_probe.divergence_rate,
             "chi_percentile_1_s2": self._chi_probe.percentile_chi,
             "chi_peak_1_s2": self._chi_probe.peak_chi,
-            "chi_limit_1_s2": self._tracking_chi_limit,
+            "chi_limit_1_s2": self._tracking_z_chi_limit,
             "chi_observed_sec": self._chi_observed_sec,
             "chi_derivative_ready": int(bool(self._chi_probe.derivative_ready)),
             # Frozen value used by the one-time FINAL_PROBE decision. The live
             # chi_peak above is free to keep evolving during DESCENT diagnostics.
             "tracking_decision_chi_peak_1_s2": tracking.chi_peak,
-            "tracking_ready": int(bool(tracking.ready)),
-            "tracking_synchronized": int(bool(tracking.synchronized)),
+            "tracking_z_decision_chi_peak_1_s2": tracking.chi_peak,
+            "tracking_z_ready": int(bool(tracking.ready)),
+            "tracking_z_synchronized": int(bool(tracking.synchronized)),
+            "tracking_z_feasible": int(bool(tracking.feasible)),
+            "chi_x": self._chi_x_probe.chi,
+            "chi_x_abs_1_s2": self._chi_x_probe.abs_chi,
+            "chi_x_rate_1_s2": self._chi_x_probe.signal_rate,
+            "chi_x_percentile_1_s2": self._chi_x_probe.percentile_chi,
+            "chi_x_peak_1_s2": self._chi_x_probe.peak_chi,
+            "chi_x_limit_1_s2": self._tracking_x_chi_limit,
+            "chi_x_observed_sec": self._chi_x_observed_sec,
+            "chi_x_derivative_ready": int(bool(self._chi_x_probe.derivative_ready)),
+            "tracking_x_decision_chi_peak_1_s2": tracking_x.chi_peak,
+            "tracking_x_ready": int(bool(tracking_x.ready)),
+            "tracking_x_synchronized": int(bool(tracking_x.synchronized)),
+            "tracking_x_feasible": int(bool(tracking_x.feasible)),
+            "chi_y": self._chi_y_probe.chi,
+            "chi_y_abs_1_s2": self._chi_y_probe.abs_chi,
+            "chi_y_rate_1_s2": self._chi_y_probe.signal_rate,
+            "chi_y_percentile_1_s2": self._chi_y_probe.percentile_chi,
+            "chi_y_peak_1_s2": self._chi_y_probe.peak_chi,
+            "chi_y_limit_1_s2": self._tracking_y_chi_limit,
+            "chi_y_observed_sec": self._chi_y_observed_sec,
+            "chi_y_derivative_ready": int(bool(self._chi_y_probe.derivative_ready)),
+            "tracking_y_decision_chi_peak_1_s2": tracking_y.chi_peak,
+            "tracking_y_ready": int(bool(tracking_y.ready)),
+            "tracking_y_synchronized": int(bool(tracking_y.synchronized)),
+            "tracking_y_feasible": int(bool(tracking_y.feasible)),
+            # Aggregate status across z, x and y. The legacy per-axis decision
+            # peak above remains vertical so existing analyses do not change
+            # meaning silently.
+            "tracking_ready": int(bool(
+                tracking.ready and tracking_x.ready and tracking_y.ready
+            )),
+            "tracking_synchronized": int(bool(
+                tracking.synchronized
+                and tracking_x.synchronized
+                and tracking_y.synchronized
+            )),
             "tracking_enabled": int(bool(tracking.enabled)),
-            "tracking_feasible": int(bool(tracking.feasible)),
+            "tracking_feasible": int(bool(self.tracking_feasible)),
         })
 
         probe = self.probe_telemetry()
@@ -592,18 +724,36 @@ class MissionRoutine:
 
     @property
     def feasible(self) -> bool:
-        """All four pre-commit gates. The tracking verdict is frozen at the
-        FINAL_PROBE decision and is diagnostic-only after DESCENT begins."""
-        return (
-            self.gate.feasible
-            and self.roll_gate.feasible
-            and self.pitch_gate.feasible
-            and self.tracking_gate.feasible
+        """All authority gates plus all three visual tracking checks.
+
+        The z/x/y tracking verdicts are frozen at the FINAL_PROBE decision and
+        become diagnostic-only after DESCENT begins.
+        """
+        return bool(
+            self.vertical_landing_feasible
+            and self.roll_landing_feasible
+            and self.pitch_landing_feasible
         )
 
     @property
     def tracking_feasible(self) -> bool:
+        return bool(
+            self.tracking_gate.feasible
+            and self.tracking_x_gate.feasible
+            and self.tracking_y_gate.feasible
+        )
+
+    @property
+    def tracking_z_feasible(self) -> bool:
         return bool(self.tracking_gate.feasible)
+
+    @property
+    def tracking_x_feasible(self) -> bool:
+        return bool(self.tracking_x_gate.feasible)
+
+    @property
+    def tracking_y_feasible(self) -> bool:
+        return bool(self.tracking_y_gate.feasible)
 
     @property
     def vertical_feasible(self) -> bool:
@@ -616,6 +766,81 @@ class MissionRoutine:
     @property
     def pitch_feasible(self) -> bool:
         return bool(self.pitch_gate.feasible)
+
+    # ------------------------------------------------------------------
+    # Explicit per-axis feasibility interpretation.  The legacy *_feasible
+    # properties above remain gain-window verdicts; these properties expose the
+    # three questions independently and then combine them with visual tracking.
+    @property
+    def vertical_stability_ok(self) -> bool:
+        return bool(
+            self.gate.probe_within_ceiling
+            and self.gate.floor_within_ceiling
+        )
+
+    @property
+    def vertical_authority_ok(self) -> bool:
+        return bool(self.gate.start_above_floor)
+
+    @property
+    def vertical_gain_margin_exists(self) -> bool:
+        return bool(self.gate.window_exists)
+
+    @property
+    def vertical_tracking_ok(self) -> bool:
+        return bool(self.tracking_z_feasible)
+
+    @property
+    def vertical_landing_feasible(self) -> bool:
+        return bool(self.gate.feasible and self.vertical_tracking_ok)
+
+    @property
+    def roll_stability_ok(self) -> bool:
+        return bool(
+            self.roll_gate.probe_within_ceiling
+            and self.roll_gate.floor_within_ceiling
+        )
+
+    @property
+    def roll_authority_ok(self) -> bool:
+        return bool(self.roll_gate.start_above_floor)
+
+    @property
+    def roll_gain_margin_exists(self) -> bool:
+        return bool(self.roll_gate.window_exists)
+
+    @property
+    def roll_tracking_ok(self) -> bool:
+        # image-x optical flow is the roll-controlled lateral channel
+        return bool(self.tracking_x_feasible)
+
+    @property
+    def roll_landing_feasible(self) -> bool:
+        return bool(self.roll_gate.feasible and self.roll_tracking_ok)
+
+    @property
+    def pitch_stability_ok(self) -> bool:
+        return bool(
+            self.pitch_gate.probe_within_ceiling
+            and self.pitch_gate.floor_within_ceiling
+        )
+
+    @property
+    def pitch_authority_ok(self) -> bool:
+        return bool(self.pitch_gate.start_above_floor)
+
+    @property
+    def pitch_gain_margin_exists(self) -> bool:
+        return bool(self.pitch_gate.window_exists)
+
+    @property
+    def pitch_tracking_ok(self) -> bool:
+        # image-y optical flow is the pitch-controlled lateral channel
+        return bool(self.tracking_y_feasible)
+
+    @property
+    def pitch_landing_feasible(self) -> bool:
+        return bool(self.pitch_gate.feasible and self.pitch_tracking_ok)
 
     def update(self, inputs: MissionInputs) -> MissionControl:
         """Advance the mission by one controlled frame.
@@ -650,45 +875,78 @@ class MissionRoutine:
     def _update_visual_mismatch(self, inputs: MissionInputs) -> None:
         """Fold one visual sample into the height-free bandwidth diagnostic.
 
-        chi is updated in every active visual phase from the FILTERED divergence
-        the controller actually sees. The mission's ``inputs.dt`` already comes
-        from consecutive fresh camera/Gazebo SIM timestamps, so the regression
-        preserves the real temporal spacing without introducing another clock.
+        chi_z is updated from vertical divergence as before. chi_x and chi_y use
+
+            chi_i = domega_i/dt - omega_i*omega_z,
+
+        where omega_z is the simultaneous vertical divergence. The mission's
+        ``inputs.dt`` already comes from consecutive fresh camera/Gazebo-SIM
+        timestamps, so all three regressions preserve the same true spacing.
 
         Only the stationary FINAL_PROBE hold activates the gate clock/envelope;
-        DESCENT continues updating chi for diagnosis but cannot revoke commitment.
+        DESCENT continues updating all chi channels for diagnosis but cannot
+        revoke commitment.
         """
         if not inputs.flow_valid:
             return
-        self._chi_probe.update(
-            float(getattr(inputs.flow, "divergence", 0.0)),
-            inputs.dt,
-        )
+        omega_z = float(getattr(inputs.flow, "divergence", 0.0))
+        omega_x = inputs.flow_x_norm_s
+        omega_y = inputs.flow_y_norm_s
+
+        self._chi_probe.update(omega_z, inputs.dt)
+        self._chi_x_probe.update(omega_x, inputs.dt, coupling=omega_z)
+        self._chi_y_probe.update(omega_y, inputs.dt, coupling=omega_z)
+
         if self._chi_gate_window_active and self._chi_probe.derivative_ready:
             self._chi_observed_sec += inputs.dt
+        if self._chi_gate_window_active and self._chi_x_probe.derivative_ready:
+            self._chi_x_observed_sec += inputs.dt
+        if self._chi_gate_window_active and self._chi_y_probe.derivative_ready:
+            self._chi_y_observed_sec += inputs.dt
 
     def _begin_tracking_gate_window(self) -> None:
-        """Start the FINAL_PROBE decision window without cooling Ddot history."""
-        self._chi_probe.retune(
-            percentile_window_sec=self._near_probe_window,
-            peak_decay_tau_sec=self._near_probe_decay_tau,
-        )
-        self._chi_probe.reset_envelope()
+        """Start FINAL_PROBE envelopes without cooling any derivative history."""
+        for probe in (self._chi_probe, self._chi_x_probe, self._chi_y_probe):
+            probe.retune(
+                percentile_window_sec=self._near_probe_window,
+                peak_decay_tau_sec=self._near_probe_decay_tau,
+            )
+            probe.reset_envelope()
         self._chi_observed_sec = 0.0
+        self._chi_x_observed_sec = 0.0
+        self._chi_y_observed_sec = 0.0
         self._chi_gate_window_active = True
         self.tracking_gate = TrackingGateResult()
+        self.tracking_x_gate = TrackingGateResult()
+        self.tracking_y_gate = TrackingGateResult()
 
     def _refresh_tracking_gate(self) -> TrackingGateResult:
-        probe_ready = self._chi_probe.result(
+        z_ready = self._chi_probe.result(
             min_duration_sec=self._tracking_min_observation_sec
-        ).ready
+        ).ready and self._chi_observed_sec >= self._tracking_min_observation_sec
+        x_ready = self._chi_x_probe.result(
+            min_duration_sec=self._tracking_min_observation_sec
+        ).ready and self._chi_x_observed_sec >= self._tracking_min_observation_sec
+        y_ready = self._chi_y_probe.result(
+            min_duration_sec=self._tracking_min_observation_sec
+        ).ready and self._chi_y_observed_sec >= self._tracking_min_observation_sec
+
         self.tracking_gate = compute_tracking_gate(
             chi_peak=self._chi_probe.peak_chi,
-            chi_limit=self._tracking_chi_limit,
-            ready=(
-                probe_ready
-                and self._chi_observed_sec >= self._tracking_min_observation_sec
-            ),
+            chi_limit=self._tracking_z_chi_limit,
+            ready=z_ready,
+            enabled=self._enable_tracking_gate,
+        )
+        self.tracking_x_gate = compute_tracking_gate(
+            chi_peak=self._chi_x_probe.peak_chi,
+            chi_limit=self._tracking_x_chi_limit,
+            ready=x_ready,
+            enabled=self._enable_tracking_gate,
+        )
+        self.tracking_y_gate = compute_tracking_gate(
+            chi_peak=self._chi_y_probe.peak_chi,
+            chi_limit=self._tracking_y_chi_limit,
+            ready=y_ready,
             enabled=self._enable_tracking_gate,
         )
         return self.tracking_gate
@@ -757,55 +1015,89 @@ class MissionRoutine:
             ceiling_margin=self._ceiling_margin,
         )
 
-    def _gate_failure_reasons(self) -> list[str]:
-        """Return concise, axis-specific reasons for an INFEASIBLE decision."""
-        reasons: list[str] = []
+    def _feasibility_failures(self) -> list[tuple[str, str, str]]:
+        """Structured FINAL_PROBE rejection reasons.
 
-        if not self.gate.window_exists:
-            reasons.append(
-                "VERTICAL no gain window: "
-                f"K_min={self.gate.k_min:.3f} > "
-                f"K_ceiling_leg={self.gate.k_ceiling_leg:.3f}"
-            )
-        elif not self.gate.start_above_floor:
-            reasons.append(
-                "VERTICAL FINAL_PROBE gain below floor: "
-                f"K_probe={self.gate.k_descend_start:.3f} < "
-                f"K_min={self.gate.k_min:.3f}"
-            )
+        Each entry is ``(axis, criterion, detail)``.  The axis names follow the
+        controller channels (VERTICAL/ROLL/PITCH); the visual observables are
+        mapped as z->VERTICAL, x->ROLL and y->PITCH.  Keeping the criterion
+        explicit makes the eventual report read exactly like the theory:
 
-        for label, gate in (("ROLL", self.roll_gate), ("PITCH", self.pitch_gate)):
+        * STABILITY_UPPER_BOUND -- is the commanded gain below the ceiling?
+        * GAIN_MARGIN -- do the lower and upper bounds overlap?
+        * AUTHORITY_LOWER_BOUND -- does the flown gain reach the required floor?
+        * VISUAL_MISMATCH -- is the closed loop actually fast enough to track?
+        """
+        failures: list[tuple[str, str, str]] = []
+
+        def gain_failures(axis: str, gate) -> None:
             if not gate.probe_within_ceiling:
-                reasons.append(
-                    f"{label} probe gain above near-field ceiling: "
-                    f"K_probe={gate.k_probe:.3f} > "
-                    f"K_ceiling_probe={gate.k_ceiling_probe:.3f}"
-                )
+                failures.append((
+                    axis, "STABILITY_UPPER_BOUND",
+                    f"FINAL_PROBE gain above near-field ceiling: "
+                    f"K_probe={gate.k_descend_start:.3f} > "
+                    f"K_ceiling_probe={gate.k_ceiling_probe:.3f}",
+                ))
             if not gate.window_exists:
-                reasons.append(
-                    f"{label} no gain window: "
-                    f"K_min={gate.k_min:.3f} > "
-                    f"K_ceiling_leg={gate.k_ceiling_leg:.3f}"
-                )
+                failures.append((
+                    axis, "GAIN_MARGIN",
+                    f"no admissible gain window: K_min={gate.k_min:.3f} > "
+                    f"K_ceiling_leg={gate.k_ceiling_leg:.3f}",
+                ))
             elif not gate.start_above_floor:
-                reasons.append(
-                    f"{label} FINAL_PROBE gain below floor: "
-                    f"K_probe={gate.k_probe:.3f} < K_min={gate.k_min:.3f}"
-                )
-            elif not gate.floor_within_ceiling:
-                reasons.append(
-                    f"{label} scheduled floor above touchdown ceiling: "
+                failures.append((
+                    axis, "AUTHORITY_LOWER_BOUND",
+                    f"FINAL_PROBE gain below disturbance-rejection floor: "
+                    f"K_probe={gate.k_descend_start:.3f} < K_min={gate.k_min:.3f}",
+                ))
+            if gate.window_exists and not gate.floor_within_ceiling:
+                failures.append((
+                    axis, "STABILITY_UPPER_BOUND",
+                    f"scheduled touchdown floor above ceiling: "
                     f"K_floor={gate.k_floor:.3f} > "
-                    f"K_ceiling_leg={gate.k_ceiling_leg:.3f}"
-                )
+                    f"K_ceiling_leg={gate.k_ceiling_leg:.3f}",
+                ))
 
-        if not self.tracking_gate.feasible and self.tracking_gate.reason:
-            reasons.append(self.tracking_gate.reason)
+        gain_failures("VERTICAL", self.gate)
+        gain_failures("ROLL", self.roll_gate)
+        gain_failures("PITCH", self.pitch_gate)
+
+        for axis, tracking in (
+            ("VERTICAL", self.tracking_gate),
+            ("ROLL", self.tracking_x_gate),   # image x -> roll channel
+            ("PITCH", self.tracking_y_gate),  # image y -> pitch channel
+        ):
+            if not tracking.feasible and tracking.reason:
+                failures.append((axis, "VISUAL_MISMATCH", tracking.reason))
 
         if not self._enable_descent:
-            reasons.append("DESCENT disabled by configuration")
+            failures.append((
+                "MISSION", "DESCENT_DISABLED",
+                "DESCENT disabled by configuration",
+            ))
 
-        return reasons
+        return failures
+
+    def _gate_failure_reasons(self) -> list[str]:
+        """Human-readable axis + criterion strings for console/CSV logging."""
+        return [
+            f"{axis} [{criterion}] {detail}"
+            for axis, criterion, detail in self._feasibility_failures()
+        ]
+
+    def _failed_axes(self) -> str:
+        axes: list[str] = []
+        for axis, _criterion, _detail in self._feasibility_failures():
+            if axis not in axes:
+                axes.append(axis)
+        return "|".join(axes)
+
+    def _failed_criteria(self) -> str:
+        criteria: list[str] = []
+        for _axis, criterion, _detail in self._feasibility_failures():
+            if criterion not in criteria:
+                criteria.append(criterion)
+        return "|".join(criteria)
 
     def _is_centered(self, offset_x: float, offset_y: float, target_found: bool) -> bool:
         return (
@@ -880,18 +1172,21 @@ class MissionRoutine:
                 f"k_min={self.gate.k_min:.2f} k_floor={self.gate.k_floor:.2f} "
                 f"k_ceiling_leg={self.gate.k_ceiling_leg:.2f} "
                 f"h_crit={self.gate.h_crit:.2f}m "
-                f"flags z/r/p/chi={int(self.vertical_feasible)}/"
-                f"{int(self.roll_feasible)}/{int(self.pitch_feasible)}/"
-                f"{int(self.tracking_feasible)} "
+                f"gain z/r/p={int(self.vertical_feasible)}/"
+                f"{int(self.roll_feasible)}/{int(self.pitch_feasible)} "
+                f"track z/x/y={int(self.tracking_z_feasible)}/"
+                f"{int(self.tracking_x_feasible)}/{int(self.tracking_y_feasible)} "
                 f"vs leg={self._leg_clearance:.2f}m -> {verdict} (hovering, no descent)"
             )
 
         if self._substate == INFEASIBLE:
             reasons = "; ".join(self._gate_failure_reasons())
             return (
-                f"[infeasible] flags z/r/p/chi={int(self.vertical_feasible)}/"
-                f"{int(self.roll_feasible)}/{int(self.pitch_feasible)}/"
-                f"{int(self.tracking_feasible)}: {reasons}"
+                f"[infeasible] landing z/r/p={int(self.vertical_landing_feasible)}/"
+                f"{int(self.roll_landing_feasible)}/{int(self.pitch_landing_feasible)} "
+                f"gain={int(self.vertical_feasible)}/{int(self.roll_feasible)}/"
+                f"{int(self.pitch_feasible)} track={int(self.tracking_z_feasible)}/"
+                f"{int(self.tracking_x_feasible)}/{int(self.tracking_y_feasible)}: {reasons}"
             )
 
         return (

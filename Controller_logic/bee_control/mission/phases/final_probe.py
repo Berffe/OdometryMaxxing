@@ -71,8 +71,9 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
         routine.pitch_peak_accel_at_handoff = routine._pitch_probe.peak_accel
         routine._retune_probes()
         # FINAL_PROBE is the one operating point that decides bandwidth. Keep
-        # the causal Ddot history warm, but start a fresh robust |chi| envelope
-        # and observation clock so APPROACH/ramp transients cannot veto landing.
+        # the three causal derivative histories warm, but start fresh robust
+        # |chi_z|/|chi_x|/|chi_y| envelopes and observation clocks so
+        # APPROACH/ramp transients cannot veto landing.
         routine._begin_tracking_gate_window()
 
     routine._update_visual_mismatch(inputs)
@@ -100,26 +101,26 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
             ceiling_safety_factor=routine._safety,
             ceiling_margin=routine._ceiling_margin,
             descend_start_gain=routine._compute_probe_gain(),
+            near_field_height_m=routine._near_field_height,
         )
         routine._compute_lateral_gates()
 
-        vertical_probe_ok = routine.vertical_feasible
-        roll_probe_ok = routine.roll_feasible
-        pitch_probe_ok = routine.pitch_feasible
-        # Fourth, independent question: authority is not bandwidth. FINAL_PROBE
-        # is stationary (D*=0, k=k_probe), so its robust height-free |chi|
-        # envelope is the actual pre-commit synchronisation decision.
+        # Independent question: gain margin is not bandwidth. FINAL_PROBE is
+        # stationary (D*=0, k=k_probe), so the robust height-free |chi_z|,
+        # |chi_x| and |chi_y| envelopes form the pre-commit synchronisation test.
+        # x maps to the roll-controlled image axis; y maps to pitch.
         routine._refresh_tracking_gate()
-        tracking_ok = routine.tracking_feasible
+        vertical_ok = routine.vertical_landing_feasible
+        roll_ok = routine.roll_landing_feasible
+        pitch_ok = routine.pitch_landing_feasible
 
         if routine._probe_only:
             routine._substate = PROBE_HOLD
             return probe_hold.run(routine, inputs, just_entered=True)
         if (
-            vertical_probe_ok
-            and roll_probe_ok
-            and pitch_probe_ok
-            and tracking_ok
+            vertical_ok
+            and roll_ok
+            and pitch_ok
             and routine._enable_descent
         ):
             routine._substate = DESCEND

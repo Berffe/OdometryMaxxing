@@ -1,6 +1,7 @@
 """INFEASIBLE phase.
 
-Active visual hover at probe gains; no gain window exists.
+Active visual hover at probe gains after any feasibility rejection: stability
+ceiling, disturbance-authority floor/gain margin, or visual mismatch bandwidth.
 
 Phase contract
 --------------
@@ -27,6 +28,8 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
 
     reasons = routine._gate_failure_reasons()
     reason = "; ".join(reasons) if reasons else "unknown feasibility failure"
+    failed_axes = routine._failed_axes()
+    failed_criteria = routine._failed_criteria()
     return MissionControl(
         divergence_setpoint=0.0,
         thrust_gain_override=routine._compute_probe_gain(),
@@ -38,6 +41,8 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
             "just_entered": just_entered,
             "reason": reason,
             "infeasible_reason": reason,
+            "infeasible_axes": failed_axes,
+            "infeasible_criteria": failed_criteria,
             "h_crit": routine.gate.h_crit,
             "leg_clearance_m": routine._leg_clearance,
             "k_min": routine.gate.k_min,
@@ -57,6 +62,12 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
             "vertical_feasible": routine.vertical_feasible,
             "roll_feasible": routine.roll_feasible,
             "pitch_feasible": routine.pitch_feasible,
+            "vertical_landing_feasible": routine.vertical_landing_feasible,
+            "roll_landing_feasible": routine.roll_landing_feasible,
+            "pitch_landing_feasible": routine.pitch_landing_feasible,
+            "vertical_tracking_ok": routine.vertical_tracking_ok,
+            "roll_tracking_ok": routine.roll_tracking_ok,
+            "pitch_tracking_ok": routine.pitch_tracking_ok,
         },
     )
 
@@ -64,7 +75,10 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
 SPEC = PhaseSpec(
     name=INFEASIBLE,
     display_name="INFEASIBLE",
-    description="Active visual hover at probe gains; no gain window exists.",
+    description=(
+        "Active visual hover after stability, authority/margin, or visual "
+        "tracking-bandwidth rejection."
+    ),
     terminal=False,
     handler=run,
 )

@@ -1,20 +1,21 @@
-"""Visual tracking mismatch: chi(t) = Ddot(t) - D(t)^2.
+"""Height-free visual tracking mismatch on the vertical and lateral axes.
 
 What chi measures
 -----------------
-Let ``h`` be the camera-to-deck distance along the optical axis and ``D`` the
-observed divergence, with the usual sign convention ``D = -hdot / h`` (positive
-while closing). Differentiating,
+Let ``omega_z`` be the observed vertical divergence, with the usual convention
+``omega_z = -hdot / h`` (positive while closing). Then
 
-    Ddot = -hddot/h + (hdot/h)^2 = -hddot/h + D^2
+    chi_z = domega_z/dt - omega_z^2 = -hddot / h.
 
-so
+For either lateral normalized optical-flow component ``omega_i`` (i = x, y),
+the corresponding height-free mismatch is
 
-    chi = Ddot - D^2 = -hddot / h
+    chi_i = domega_i/dt - omega_i * omega_z.
 
-which is the RELATIVE vertical acceleration between vehicle and deck, scaled by
-range. No height, platform state, or divergence setpoint is needed: chi is built
-entirely from the visual divergence history.
+The second term is the vertical-motion coupling: range change infiltrates the
+lateral optical flow even when the lateral image velocity itself is unchanged.
+Thus all three chi signals remain purely visual and require no height, platform
+state, or setpoint.
 
 Why this is a bandwidth test
 ----------------------------
@@ -45,7 +46,8 @@ be learned away as a bias. The gate therefore uses
 
 The derivative history and the robust envelope are separate. FINAL_PROBE can
 restart only the decision envelope while keeping the derivative warm from the
-preceding visual samples.
+preceding visual samples. The same estimator class is used for z, x and y; only
+the coupling term supplied to :meth:`update` changes.
 """
 from __future__ import annotations
 
@@ -66,7 +68,12 @@ class VisualMismatchResult:
 
 
 class VisualMismatchProbe:
-    """Causal robust envelope of ``chi = Ddot - D^2`` [1/s^2]."""
+    """Causal robust envelope of a visual mismatch ``chi`` [1/s^2].
+
+    ``update(signal, dt)`` keeps the historical vertical behaviour
+    ``chi = signal_dot - signal^2``. Supplying ``coupling=omega_z`` gives the
+    lateral form ``chi_i = omega_i_dot - omega_i*omega_z``.
+    """
 
     def __init__(
         self,
@@ -140,9 +147,14 @@ class VisualMismatchProbe:
 
     # ------------------------------------------------------------- properties
     @property
-    def divergence_rate(self) -> float:
-        """Causal regression estimate of dD/dt [1/s^2]."""
+    def signal_rate(self) -> float:
+        """Causal regression estimate of the observed signal derivative [1/s^2]."""
         return float(self._divergence_rate)
+
+    @property
+    def divergence_rate(self) -> float:
+        """Backward-compatible alias for :attr:`signal_rate`."""
+        return self.signal_rate
 
     @property
     def derivative_ready(self) -> bool:
@@ -226,18 +238,34 @@ class VisualMismatchProbe:
         return (1.0 - weight) * values[lo] + weight * values[hi]
 
     # ------------------------------------------------------------------ update
-    def update(self, divergence: float, dt: float) -> None:
-        """Fold one FILTERED visual-divergence sample into the estimator.
+    def update(
+        self,
+        signal: float,
+        dt: float,
+        *,
+        coupling: float | None = None,
+    ) -> None:
+        """Fold one filtered visual sample into the estimator.
 
-        ``dt`` is the elapsed Gazebo-SIM time since the previous fresh controlled
-        visual result. The mission/node already derive it from consecutive camera
-        source timestamps; this estimator simply preserves those true spacings in
-        its causal regression history.
+        Parameters
+        ----------
+        signal:
+            ``omega_z`` for the vertical probe, or ``omega_x`` / ``omega_y`` for
+            a lateral probe.
+        dt:
+            Elapsed Gazebo-SIM time since the previous fresh controlled visual
+            result. The true camera spacing is preserved in the regression.
+        coupling:
+            Multiplicative optical-flow coupling. If omitted, ``signal`` is used
+            so existing vertical calls retain ``chi_z = omega_z_dot - omega_z^2``.
+            For a lateral probe pass the simultaneous vertical divergence
+            ``omega_z``, yielding ``chi_i = omega_i_dot - omega_i*omega_z``.
         """
         dt = max(1e-3, float(dt))
-        divergence = float(divergence)
+        signal = float(signal)
+        coupling_value = signal if coupling is None else float(coupling)
         self._time += dt
-        self._history.append((self._time, divergence))
+        self._history.append((self._time, signal))
         self._trim_derivative_history()
 
         rate, ready = self._fit_divergence_rate()
@@ -246,7 +274,7 @@ class VisualMismatchProbe:
             return
 
         self._divergence_rate = float(rate)
-        self._last_chi = self._divergence_rate - divergence * divergence
+        self._last_chi = self._divergence_rate - signal * coupling_value
         self._last_abs_chi = abs(self._last_chi)
 
         self._envelope_elapsed += dt

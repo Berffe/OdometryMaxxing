@@ -1,6 +1,8 @@
 """Feasibility gates: may this landing proceed?
 
-Two independent questions, and they fail for different reasons.
+Three independent questions are kept separate because they fail for different
+reasons: upper-bound stability, lower-bound disturbance authority, and visual
+tracking bandwidth.
 
 Vertical feasibility compares the Herisse disturbance-rejection floor with the
 safety-scaled de Croon ceiling. Roll and pitch use the acceleration-domain
@@ -26,7 +28,7 @@ class GateResult:
     k_min: float = 0.0          # Herisse floor: peak_accel / D*
     h_crit: float = 0.0         # height at which the safety-scaled ceiling == k_min
     k_explore: float = 0.0      # hand-tuned exploration gain (schedule's start value)
-    feasible: bool = False      # landing window exists and FINAL_PROBE gain reaches k_min
+    feasible: bool = False      # upper/lower bounds admissible at probe and touchdown
 
     # --- Ceiling-riding descent target (see module docstring). ---
     k_ceiling_leg: float = 0.0    # de Croon safety-scaled ceiling AT LEG HEIGHT
@@ -39,8 +41,11 @@ class GateResult:
                                   # far-field value.
     accel_capacity_floor: float = 0.0
     accel_capacity_ceiling: float = 0.0
+    k_ceiling_probe: float = 0.0
+    probe_within_ceiling: bool = True
     window_exists: bool = False
     start_above_floor: bool = False
+    floor_within_ceiling: bool = False
 
 
 @dataclass
@@ -196,6 +201,7 @@ def compute_gate(
     min_divergence_setpoint: float = 0.01,
     ceiling_margin: float = 0.8,
     descend_start_gain: Optional[float] = None,
+    near_field_height_m: Optional[float] = None,
 ) -> GateResult:
     """Turn a probed peak_accel into the descent gain window.
 
@@ -226,15 +232,30 @@ def compute_gate(
     # from the far-field k_explore -- the gain has already been walked down the
     # ceiling during the approach and must not step back up.
     k_start = float(k_explore if descend_start_gain is None else descend_start_gain)
+    if near_field_height_m is None:
+        k_ceiling_probe = float("inf")
+        probe_within_ceiling = True
+    else:
+        k_ceiling_probe = ceiling_gain_at_height(
+            near_field_height_m, control_period_sec, s
+        )
+        probe_within_ceiling = k_start <= k_ceiling_probe
+
     window_exists = h_crit <= float(leg_clearance_m)
     start_above_floor = k_start >= k_min
-    feasible = window_exists and start_above_floor
 
     # Never below the Herisse floor, and never above the gain the schedule starts
     # from (it only ever decays -- a k_floor above the start would turn the
     # "decay" into a step up, which is not what the trajectory means).
     k_floor = max(float(k_min), float(k_target))
     k_floor = min(k_floor, k_start) if k_start > 0.0 else k_floor
+    floor_within_ceiling = k_floor <= k_ceiling_leg
+    feasible = (
+        probe_within_ceiling
+        and window_exists
+        and start_above_floor
+        and floor_within_ceiling
+    )
 
     return GateResult(
         k_min=float(k_min),
@@ -248,8 +269,11 @@ def compute_gate(
         k_descend_start=k_start,
         accel_capacity_floor=float(d_star * k_floor),
         accel_capacity_ceiling=float(d_star * k_ceiling_leg),
+        k_ceiling_probe=float(k_ceiling_probe),
+        probe_within_ceiling=bool(probe_within_ceiling),
         window_exists=bool(window_exists),
         start_above_floor=bool(start_above_floor),
+        floor_within_ceiling=bool(floor_within_ceiling),
     )
 
 
@@ -261,7 +285,7 @@ def compute_gate(
 
 @dataclass
 class TrackingGateResult:
-    """One-time FINAL_PROBE verdict on visual synchronisation.
+    """One-axis FINAL_PROBE verdict on visual synchronisation.
 
     This is a rejection test only. It does not create a new gain floor and it
     does not run a recovery controller. The three authority/stability gates say
@@ -269,8 +293,9 @@ class TrackingGateResult:
     is actually keeping up with the deck while flying the admissible near-field
     probe gain.
 
-    Once DESCENT is committed the verdict is frozen. chi keeps being measured
-    for diagnosis, but this gate no longer owns a phase transition.
+    The same result type is used independently for z, x and y. Once DESCENT is
+    committed the verdicts are frozen. chi keeps being measured for diagnosis,
+    but the gates no longer own a phase transition.
     """
 
     chi_peak: float = 0.0          # robust FINAL_PROBE |chi| envelope [1/s^2]
@@ -289,15 +314,19 @@ def compute_tracking_gate(
     ready: bool,
     enabled: bool = True,
 ) -> TrackingGateResult:
-    """Decide whether FINAL_PROBE visual mismatch is inside the bandwidth limit.
+    """Decide whether one FINAL_PROBE visual mismatch is inside its limit.
 
-    The observable is
+    The vertical observable is
 
-        chi = Ddot - D^2 = -hddot / h.
+        chi_z = domega_z/dt - omega_z^2 = -hddot / h,
 
-    It is already height-free and needs no divergence reference or commanded
-    D*. The robust probe supplies ``chi_peak`` as a rolling-percentile/leaky-max
-    envelope of |chi| during the stationary FINAL_PROBE hold.
+    while the lateral observables are
+
+        chi_i = domega_i/dt - omega_i*omega_z,  i in {x, y}.
+
+    All are height-free and need no visual reference or commanded setpoint. The
+    robust probe supplies ``chi_peak`` as a rolling-percentile/leaky-max envelope
+    of |chi| during the stationary FINAL_PROBE hold.
 
     ``ready`` is deliberately separate from ``enabled``. An unready probe never
     rejects: absence of enough evidence must not be interpreted as evidence of
