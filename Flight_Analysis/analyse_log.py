@@ -1149,6 +1149,32 @@ def plot_lateral_control(data: AnalysisData, out: Path) -> None:
 	_finish_figure(fig, axes, data, out / "lateral_control.png")
 
 
+def plot_lateral_optical_flow(data: AnalysisData, out: Path) -> None:
+	c = data.control
+	if c.empty:
+		return
+	t = _relative_time(c["_sim_time"], data.t0)
+
+	fig, axes = plt.subplots(2, 1, figsize=(13, 7), sharex=True)
+
+	for ax, column, axis_name, channel_label in [
+		(axes[0], "flow_mean_x_norm_s", "x", "Image X / roll channel"),
+		(axes[1], "flow_mean_y_norm_s", "y", "Image Y / pitch channel"),
+	]:
+		values = _num(c, column)
+		ax.plot(
+			t, values, linewidth=1.8,
+			label=fr"{channel_label}: $\omega_{{{axis_name}}}$",
+		)
+		ax.axhline(0.0, linewidth=1.0, linestyle="--")
+		ax.set_ylabel(rf"$\omega_{{{axis_name}}}$ [1/s]")
+		_legend(ax)
+
+	axes[0].set_title("Lateral optical-flow evolution")
+	axes[1].set_xlabel("Time since common log start [s SIM]")
+	_finish_figure(fig, axes, data, out / "lateral_optical_flow.png")
+
+
 def _plot_probe_axis(
 	data: AnalysisData,
 	out: Path,
@@ -2084,6 +2110,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 		plot_drone_platform_position,
 		plot_gain_schedule,
 		plot_lateral_control,
+		plot_lateral_optical_flow,
 		plot_probe_vertical,
 		plot_probe_roll,
 		plot_probe_pitch,
