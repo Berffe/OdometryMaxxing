@@ -294,7 +294,9 @@ class MissionConfig:
     # Provisional empirical limit separating the validated low-frequency run
     # from the rejected high-frequency case. Keep this explicit until a larger
     # validation set turns it into a formal safety margin.
-    tracking_chi_limit_1_s2: float = 2.0
+    tracking_chi_limit_1_s2: float = 0.8
+    tracking_chi_x_limit_1_s2: float = 1.0
+    tracking_chi_y_limit_1_s2: float = 1.0
     # Ddot is the slope of a causal least-squares fit through this much recent
     # FILTERED divergence history. The actual camera/Gazebo SIM dt values are
     # preserved in the regression, so irregular frame spacing is handled

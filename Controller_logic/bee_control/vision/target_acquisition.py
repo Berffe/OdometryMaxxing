@@ -21,8 +21,9 @@ borders: the target's true size meets or exceeds the camera's field of
 view, not just fills it. Past that point area_fraction/detection_width/
 height are a frame-size artifact, not a measurement -- see state.py.
 
-Run `python target_acquisition.py` (or `-m bee_control.target_acquisition`) to
-launch the visual debug test.
+Run `python -m bee_control.vision.target_acquisition` from the repo root to
+launch the visual debug test; the harness lives in
+bee_control/tests/_target_acquisition_debug.py.
 """
 
 from typing import Optional, Sequence, Tuple
@@ -449,9 +450,16 @@ class TargetAcquisition:
 
 
 if __name__ == "__main__":
-    try:
-        from ._target_acquisition_debug import test
-    except ImportError:
-        from _target_acquisition_debug import test
+    # The debug harness lives in bee_control/tests/, not beside this module.
+    #
+    # Run it with `python -m bee_control.vision.target_acquisition` from the
+    # repo root. A bare `python target_acquisition.py` cannot work and never
+    # could: this module's own top-level `from bee_control.core.state import
+    # ...` already requires the package to be importable, and that runs long
+    # before this block. -m is the supported invocation.
+    #
+    # NOTE: setup.py excludes tests/ from the installed package, so this is a
+    # run-from-source tool only.
+    from bee_control.tests._target_acquisition_debug import test
 
     test()

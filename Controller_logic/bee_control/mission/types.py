@@ -26,7 +26,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Optional
 
 from bee_control.core.state import FlowResult, TargetEstimate
 # --------------------------------------------------------------------------
@@ -47,9 +47,6 @@ LANDED = "landed"
 #: Terminal, latched by the node via ``MissionRoutine.mark_aborted``. Exists so
 #: that ``mission_substate`` never has to be overwritten at write time.
 ABORTED = "aborted"
-
-# Retained for backwards compatibility with older imports.
-PROBE = "probe"
 
 
 class ControlEffect(Enum):
@@ -222,8 +219,3 @@ class PhaseSpec:
     handler: Callable[[Any, MissionInputs], MissionControl]
     terminal: bool = False
     description: str = ""
-
-
-def phase_display_name(phases: Mapping[str, PhaseSpec], substate: str) -> str:
-    spec = phases.get(substate)
-    return spec.display_name if spec is not None else str(substate).upper()

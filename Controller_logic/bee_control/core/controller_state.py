@@ -19,8 +19,9 @@ from __future__ import annotations
 
 from typing import Any, ClassVar, Mapping, Optional, Sequence
 
-from bee_control.vision.optical_flow import OpticalFlowEstimator
 from bee_control.core.state import AttitudeSetpoint, ContactState, FlowResult, TargetEstimate
+
+
 def _blank(value):
     """None -> empty CSV cell. A blank is a gap; 0.0 would be a fiction."""
     return "" if value is None else value
@@ -122,6 +123,13 @@ class VisionTelemetry:
 
     @classmethod
     def telemetry_fields(cls) -> Sequence[str]:
+        # Imported HERE, not at module scope, so ``core`` keeps its rule of
+        # importing nothing else in the package (see bee_control/__init__.py).
+        # The dependency is real but it is a HEADER-TIME one: the estimator owns
+        # its stage-timing names, and this is the only place they are needed.
+        # Deferring it also keeps ``core`` free of cv2/numpy at import time.
+        from bee_control.vision.optical_flow import OpticalFlowEstimator
+
         return tuple(cls.TRANSPORT_FIELDS) + tuple(
             f"optical_flow_{name}" for name in OpticalFlowEstimator.TIMING_FIELDS
         )

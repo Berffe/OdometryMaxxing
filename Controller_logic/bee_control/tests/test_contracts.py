@@ -279,7 +279,7 @@ def test_chi_regression_uses_old_values_and_real_dt_spacing():
         probe.update(d, dt)
 
     assert probe.derivative_ready
-    assert abs(probe.divergence_rate - slope) < 1e-10
+    assert abs(probe.signal_rate - slope) < 1e-10
     expected_chi = slope - (intercept + slope * t) ** 2
     assert abs(probe.chi - expected_chi) < 1e-10
 
@@ -297,7 +297,7 @@ def test_constant_divergence_keeps_physical_chi_in_envelope():
         probe.update(d, dt)
 
     expected = d * d
-    assert abs(probe.divergence_rate) < 1e-12
+    assert abs(probe.signal_rate) < 1e-12
     assert abs(probe.chi + expected) < 1e-12
     assert abs(probe.abs_chi - expected) < 1e-12
     assert abs(probe.percentile_chi - expected) < 1e-12
@@ -315,7 +315,7 @@ def test_final_probe_envelope_reset_keeps_derivative_warm():
     for i in range(60):
         probe.update(0.2 + 0.4 * i * dt, dt)
     assert probe.derivative_ready
-    rate_before = probe.divergence_rate
+    rate_before = probe.signal_rate
     assert probe.peak_chi > 0.0
 
     probe.reset_envelope()
@@ -323,7 +323,7 @@ def test_final_probe_envelope_reset_keeps_derivative_warm():
     assert probe.peak_chi == 0.0
     probe.update(0.2 + 0.4 * 60 * dt, dt)
     assert probe.derivative_ready
-    assert abs(probe.divergence_rate - rate_before) < 1e-10
+    assert abs(probe.signal_rate - rate_before) < 1e-10
     assert probe.peak_chi > 0.0
 
 

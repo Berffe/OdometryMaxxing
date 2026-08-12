@@ -22,14 +22,10 @@ def raised_cosine01(x: float) -> float:
     return 0.5 * (1.0 - math.cos(math.pi * x))
 
 
-def _blank(value):
+def blank(value):
     """None -> empty CSV cell.
 
     A blank is a gap in the plot, which is the truth when a quantity is not
     being measured. 0.0 would draw a flat line that looks like a measurement.
     """
     return "" if value is None else value
-
-
-# Public alias: the phases and the routine both blank unmeasured quantities.
-blank = _blank

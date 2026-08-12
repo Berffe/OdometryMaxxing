@@ -45,16 +45,12 @@ estimate can be told apart from a well-supported one. As of this writing
 it is DIAGNOSIS-ONLY: logged (diagnostics_writer.py's flow_fit_quality
 column) but not yet read by control_law.py or mission_routine.py.
 
-Debug path:
+Debug path (from the repo root):
 
-    python -m bee_control.optical_flow
+    python -m bee_control.vision.optical_flow
 
-or:
-
-    python optical_flow.py
-
-When run as a script, this file imports optical_flow_debug.py and starts
-the visual debug test. The dense flow field is still not part of FlowResult.
+That imports bee_control/tests/_optical_flow_debug.py and starts the visual
+debug test. The dense flow field is still not part of FlowResult.
 """
 
 from typing import Optional, Tuple
@@ -1060,9 +1056,16 @@ class OpticalFlowEstimator:
 
 
 if __name__ == "__main__":
-    try:
-        from ._optical_flow_debug import test
-    except ImportError:
-        from _optical_flow_debug import test
+    # The debug harness lives in bee_control/tests/, not beside this module.
+    #
+    # Run it with `python -m bee_control.vision.optical_flow` from the repo
+    # root. A bare `python optical_flow.py` cannot work and never could: this
+    # module's own top-level `from bee_control.core.state import ...` already
+    # requires the package to be importable, and that runs long before this
+    # block. -m is the supported invocation.
+    #
+    # NOTE: setup.py excludes tests/ from the installed package, so this is a
+    # run-from-source tool only.
+    from bee_control.tests._optical_flow_debug import test
 
     test()

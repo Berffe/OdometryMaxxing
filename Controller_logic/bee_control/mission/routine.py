@@ -57,8 +57,8 @@ from .gates import (
     ceiling_gain_at_height,
     compute_lateral_gate,
 )
-from .math_utils import blank as _blank, clamp
-from .phases import PHASES
+from .math_utils import blank, clamp
+from .phases import PHASES, TERMINAL_SUBSTATES
 from .probe import PlatformProbe, ProbeResult, ThrustModel
 from .visual_mismatch import VisualMismatchProbe
 from .types import (
@@ -209,24 +209,18 @@ class MissionRoutine:
             derivative_window_sec=cfg.tracking_derivative_window_sec,
         )
         self._enable_tracking_gate = bool(cfg.enable_tracking_gate)
-        # Separate rejection limits per visual axis.  ``tracking_chi_limit_1_s2``
-        # remains the vertical/z name for backward compatibility; x/y fall back
-        # to it when an older MissionConfig is used.
+        # Separate rejection limits per visual axis. ``tracking_chi_limit_1_s2``
+        # keeps the unqualified name for the vertical/z channel because the CSV
+        # column of that name is the vertical one; x/y are explicit.
         self._tracking_z_chi_limit = max(
             0.0, float(cfg.tracking_chi_limit_1_s2)
         )
         self._tracking_x_chi_limit = max(
-            0.0, float(getattr(
-                cfg, "tracking_x_chi_limit_1_s2", self._tracking_z_chi_limit
-            ))
+            0.0, float(cfg.tracking_chi_x_limit_1_s2)
         )
         self._tracking_y_chi_limit = max(
-            0.0, float(getattr(
-                cfg, "tracking_y_chi_limit_1_s2", self._tracking_z_chi_limit
-            ))
+            0.0, float(cfg.tracking_chi_y_limit_1_s2)
         )
-        # Legacy internal alias: every old vertical call keeps the same meaning.
-        self._tracking_chi_limit = self._tracking_z_chi_limit
         self._tracking_min_observation_sec = max(
             0.0, float(cfg.tracking_min_observation_sec)
         )
@@ -368,7 +362,9 @@ class MissionRoutine:
 
         Idempotent: the first call wins.
         """
-        if self._substate in (LANDED, ABORTED):
+        # Derived from the registry (spec.terminal), so a future terminal phase
+        # is covered by adding it to phases/, not by editing this tuple.
+        if self._substate in TERMINAL_SUBSTATES:
             return
         self._substate = ABORTED
         self._t_aborted = float(t)
@@ -495,13 +491,13 @@ class MissionRoutine:
         row: dict = {
             "substate": self._substate,
             "divergence_setpoint_1_s": mc.divergence_setpoint,
-            "thrust_gain_k": _blank(mc.thrust_gain_override),
+            "thrust_gain_k": blank(mc.thrust_gain_override),
             "lateral_p_scale": mc.lateral_p_scale,
             "lateral_d_scale": mc.lateral_d_scale,
-            "roll_p_scale": _blank(mc.roll_p_scale),
-            "roll_d_scale": _blank(mc.roll_d_scale),
-            "pitch_p_scale": _blank(mc.pitch_p_scale),
-            "pitch_d_scale": _blank(mc.pitch_d_scale),
+            "roll_p_scale": blank(mc.roll_p_scale),
+            "roll_d_scale": blank(mc.roll_d_scale),
+            "pitch_p_scale": blank(mc.pitch_p_scale),
+            "pitch_d_scale": blank(mc.pitch_d_scale),
             "enable_integral": int(bool(mc.enable_integral)),
 
             "peak_accel_m_s2": self.probe_result.peak_accel,
@@ -515,7 +511,7 @@ class MissionRoutine:
             "k_ceiling_leg": gate.k_ceiling_leg,
             "k_ceiling_probe": gate.k_ceiling_probe,
             "h_crit_m": gate.h_crit,
-            "h_pred_m": _blank(info.get("h_pred")),
+            "h_pred_m": blank(info.get("h_pred")),
 
             # Legacy gain-gate verdicts. These deliberately remain gain-only.
             "vertical_feasible": int(bool(gate.feasible)),
@@ -544,8 +540,8 @@ class MissionRoutine:
             "pitch_k_min": pitch_gate.k_min,
             "roll_k_probe": roll_gate.k_probe,
             "pitch_k_probe": pitch_gate.k_probe,
-            "roll_k_applied": _blank(info.get("roll_k")),
-            "pitch_k_applied": _blank(info.get("pitch_k")),
+            "roll_k_applied": blank(info.get("roll_k")),
+            "pitch_k_applied": blank(info.get("pitch_k")),
             "roll_k_target": roll_gate.k_target,
             "pitch_k_target": pitch_gate.k_target,
             "roll_k_floor": roll_gate.k_floor,
@@ -573,9 +569,9 @@ class MissionRoutine:
             "vertical_floor_within_ceiling": int(bool(gate.floor_within_ceiling)),
             "roll_floor_within_ceiling": int(bool(roll_gate.floor_within_ceiling)),
             "pitch_floor_within_ceiling": int(bool(pitch_gate.floor_within_ceiling)),
-            "infeasible_axes": _blank(info.get("infeasible_axes")),
-            "infeasible_criteria": _blank(info.get("infeasible_criteria")),
-            "infeasible_reason": _blank(info.get("infeasible_reason")),
+            "infeasible_axes": blank(info.get("infeasible_axes")),
+            "infeasible_criteria": blank(info.get("infeasible_criteria")),
+            "infeasible_reason": blank(info.get("infeasible_reason")),
         }
 
         tracking = self.tracking_gate
@@ -584,7 +580,7 @@ class MissionRoutine:
         row.update({
             "chi": self._chi_probe.chi,
             "chi_abs_1_s2": self._chi_probe.abs_chi,
-            "chi_divergence_rate_1_s2": self._chi_probe.divergence_rate,
+            "chi_divergence_rate_1_s2": self._chi_probe.signal_rate,
             "chi_percentile_1_s2": self._chi_probe.percentile_chi,
             "chi_peak_1_s2": self._chi_probe.peak_chi,
             "chi_limit_1_s2": self._tracking_z_chi_limit,
@@ -642,7 +638,7 @@ class MissionRoutine:
                 value = probe[key]
                 if isinstance(value, bool):
                     value = int(value)
-                row[column] = _blank(value)
+                row[column] = blank(value)
         return row
 
     def probe_telemetry(self) -> dict:
@@ -1120,82 +1116,6 @@ class MissionRoutine:
         # diagnostic but does not drive the phase transition.
         visually_close = float(area_fraction) >= self._fov_near_area_fraction
         return centered and visually_close
-
-    def status_line(self) -> str:
-        if self._substate == LANDED:
-            since = (
-                f"{(self._t_landed):.1f}s"
-                if self._t_landed is not None else "--"
-            )
-            return f"[landed] touchdown latched at t={since}; mission complete"
-
-        if self._substate == CENTER:
-            return (
-                f"[center] waiting for target within +/-{self._center_offset_thr:.2f} "
-                f"for {self._center_dwell:.1f}s (timeout {self._center_timeout:.0f}s)"
-            )
-
-        if self._substate == APPROACH_PROBE:
-            return (
-                f"[approach_probe] D*_approach={self._approach_d_star:.2f} "
-                f"probe={self.probe_result.total_duration_sec:.1f}/{self._probe_min:.1f}s "
-                f"peaks z/r/p={self.probe_result.peak_accel:.3f}/"
-                f"{self.roll_probe_result.peak_accel:.3f}/"
-                f"{self.pitch_probe_result.peak_accel:.3f} m/s^2 "
-                f"near_area_thr={self._fov_near_area_fraction:.2f}"
-            )
-
-        if self._substate == FINAL_PROBE:
-            handoff = (
-                f"{self.peak_accel_at_handoff:.3f}"
-                if self.peak_accel_at_handoff is not None else "--"
-            )
-            return (
-                f"[final_probe] hold={self.probe_result.duration_sec:.1f}/"
-                f"{self._final_probe_duration:.1f}s "
-                f"total={self.probe_result.total_duration_sec:.1f}/{self._probe_min:.1f}s "
-                f"peaks z/r/p={self.probe_result.peak_accel:.3f}/"
-                f"{self.roll_probe_result.peak_accel:.3f}/"
-                f"{self.pitch_probe_result.peak_accel:.3f} m/s^2 "
-                f"(at handoff {handoff})"
-            )
-
-        if self._substate == PROBE_HOLD:
-            verdict = "WOULD-LAND" if self.feasible else "WOULD-ABORT"
-            handoff = (
-                f"{self.peak_accel_at_handoff:.3f}"
-                if self.peak_accel_at_handoff is not None else "--"
-            )
-            return (
-                f"[probe_hold] peak_accel={self.probe_result.peak_accel:.3f} m/s^2 "
-                f"(at handoff {handoff}) "
-                f"k_min={self.gate.k_min:.2f} k_floor={self.gate.k_floor:.2f} "
-                f"k_ceiling_leg={self.gate.k_ceiling_leg:.2f} "
-                f"h_crit={self.gate.h_crit:.2f}m "
-                f"gain z/r/p={int(self.vertical_feasible)}/"
-                f"{int(self.roll_feasible)}/{int(self.pitch_feasible)} "
-                f"track z/x/y={int(self.tracking_z_feasible)}/"
-                f"{int(self.tracking_x_feasible)}/{int(self.tracking_y_feasible)} "
-                f"vs leg={self._leg_clearance:.2f}m -> {verdict} (hovering, no descent)"
-            )
-
-        if self._substate == INFEASIBLE:
-            reasons = "; ".join(self._gate_failure_reasons())
-            return (
-                f"[infeasible] landing z/r/p={int(self.vertical_landing_feasible)}/"
-                f"{int(self.roll_landing_feasible)}/{int(self.pitch_landing_feasible)} "
-                f"gain={int(self.vertical_feasible)}/{int(self.roll_feasible)}/"
-                f"{int(self.pitch_feasible)} track={int(self.tracking_z_feasible)}/"
-                f"{int(self.tracking_x_feasible)}/{int(self.tracking_y_feasible)}: {reasons}"
-            )
-
-        return (
-            f"[descend] h_crit={self.gate.h_crit:.2f}m "
-            f"k: {self.gate.k_descend_start:.2f} (probe) -> {self.gate.k_floor:.2f} "
-            f"(floor = max(k_min {self.gate.k_min:.2f}, "
-            f"{self.gate.ceiling_margin:.2f} x k_ceiling_leg "
-            f"{self.gate.k_ceiling_leg:.2f}))"
-        )
 
     #: Phase table, imported from ``mission/phases/``. Kept as a class
     #: attribute so existing callers (``bee_node``, tests) can still reach it

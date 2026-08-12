@@ -55,6 +55,7 @@ from bee_control.vision.derotation import AngularRateBuffer
 from bee_control.diagnostics.diagnostics_writer import DiagnosticsWriter
 from bee_control.interfaces.flight_sequencer import FlightSequencer, SequencerPorts, SetpointPolicy
 from bee_control.interfaces.mavsdk_worker import MavsdkWorker
+from bee_control.mission import display_name as mission_display_name
 from bee_control.mission.routine import MissionRoutine
 from bee_control.mission.types import ActuationFeedback, ControlEffect, MissionInputs
 from bee_control.interfaces.px4_interface import PX4Interface
@@ -555,8 +556,9 @@ class BeeLandNode(Node):
         previous = self._last_mission_substate or "none"
         self._last_mission_substate = substate
 
-        spec = self.mission.PHASES.get(substate)
-        display = spec.display_name if spec is not None else substate.upper()
+        # The registry owns the display name AND the unknown-substate fallback;
+        # the node must not keep its own copy of either.
+        display = mission_display_name(substate)
 
         detail = f"{previous} -> {substate}; {mc.summary()}"
         reason = (mc.info or {}).get("infeasible_reason")

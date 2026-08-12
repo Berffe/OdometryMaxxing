@@ -53,14 +53,20 @@ _PHASE_MODULES = (
 PHASES = {module.SPEC.name: module.SPEC for module in _PHASE_MODULES}
 
 #: Substates from which the mission never advances on its own.
-TERMINAL_PHASES = tuple(
+#:
+#: Named SUBSTATES, not PHASES, to keep it distinct from
+#: ``flight_sequencer.TERMINAL_PHASES``, which is the same idea in the OUTER
+#: controller vocabulary. The two state machines are deliberately separate and
+#: their terminal sets are not interchangeable.
+TERMINAL_SUBSTATES = tuple(
     spec.name for spec in PHASES.values() if spec.terminal
 )
 
 
 def display_name(substate: str) -> str:
+    """Human-readable name for a substate; the registry is the only source."""
     spec = PHASES.get(substate)
     return spec.display_name if spec is not None else str(substate).upper()
 
 
-__all__ = ["PHASES", "TERMINAL_PHASES", "display_name"]
+__all__ = ["PHASES", "TERMINAL_SUBSTATES", "display_name"]

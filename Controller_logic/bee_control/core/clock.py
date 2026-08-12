@@ -134,11 +134,6 @@ class TimeManager:
         return self._steady.wall_sec() if self._use_steady else time.time()
 
     @staticmethod
-    def system_wall_sec() -> float:
-        """The raw system clock. Only for diagnosing the host."""
-        return time.time()
-
-    @staticmethod
     def monotonic_sec() -> float:
         return time.monotonic()
 

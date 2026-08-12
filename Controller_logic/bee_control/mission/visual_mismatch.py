@@ -148,13 +148,13 @@ class VisualMismatchProbe:
     # ------------------------------------------------------------- properties
     @property
     def signal_rate(self) -> float:
-        """Causal regression estimate of the observed signal derivative [1/s^2]."""
-        return float(self._divergence_rate)
+        """Causal regression estimate of the observed signal derivative [1/s^2].
 
-    @property
-    def divergence_rate(self) -> float:
-        """Backward-compatible alias for :attr:`signal_rate`."""
-        return self.signal_rate
+        For the vertical probe the observed signal IS the divergence, which is
+        why the CSV column is still ``chi_divergence_rate_1_s2``. The estimator
+        itself is axis-agnostic, so the property is not.
+        """
+        return float(self._divergence_rate)
 
     @property
     def derivative_ready(self) -> bool:
