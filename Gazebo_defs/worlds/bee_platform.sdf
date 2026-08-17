@@ -6,6 +6,20 @@
 	</physics>
 	<magnetic_field>5.5645e-06 2.28758e-05 -4.23884e-05</magnetic_field>
 
+	<!-- =======================================================================
+	     SIMPLE WIND TEST CASE
+
+	     World frame is ENU:
+	       +X = East, +Y = North, +Z = Up
+
+	     Mean wind: 0.5 m/s toward +X (East).
+	     WindEffects below adds deterministic oscillations in horizontal
+	     magnitude and direction. No stochastic noise is used in this first test.
+	     ======================================================================= -->
+	<wind>
+		<linear_velocity>0.5 0.0 0.0</linear_velocity>
+	</wind>
+
 	<plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
 	<plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
 	<plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
@@ -15,6 +29,38 @@
 	<plugin filename="gz-sim-air-pressure-system" name="gz::sim::systems::AirPressure"/>
 	<plugin filename="gz-sim-magnetometer-system" name="gz::sim::systems::Magnetometer"/>
 	<plugin filename="gz-sim-navsat-system" name="gz::sim::systems::NavSat"/>
+
+	<!-- Gazebo world-level wind force model.
+	     Horizontal magnitude: 2.0 m/s mean with +/-25% sinusoidal variation
+	                           (1.5 to 2.5 m/s), period 8 s.
+	     Horizontal direction: mean +X, oscillating +/-15 deg, period 12 s.
+	     Rise time: 1 s.
+	     No random noise in this first deterministic test. -->
+	<plugin filename="gz-sim-wind-effects-system" name="gz::sim::systems::WindEffects">
+		<force_approximation_scaling_factor>1.0</force_approximation_scaling_factor>
+
+		<horizontal>
+			<magnitude>
+				<time_for_rise>1.0</time_for_rise>
+				<sin>
+					<amplitude_percent>0.25</amplitude_percent>
+					<period>8.0</period>
+				</sin>
+			</magnitude>
+
+			<direction>
+				<time_for_rise>1.0</time_for_rise>
+				<sin>
+					<amplitude>15.0</amplitude>
+					<period>12.0</period>
+				</sin>
+			</direction>
+		</horizontal>
+
+		<vertical>
+			<time_for_rise>1.0</time_for_rise>
+		</vertical>
+	</plugin>
 	
 	<spherical_coordinates>
 	<surface_model>EARTH_WGS84</surface_model>
@@ -179,16 +225,16 @@
 		<link_name>platform_link</link_name>
 
 		<axis_x>
-			<component><amplitude>0.20</amplitude><frequency>0.180</frequency><phase>1.5</phase></component>
-			<component><amplitude>0.05</amplitude><frequency>0.320</frequency><phase>0.0</phase></component>
+			<component><amplitude>0.30</amplitude><frequency>0.070</frequency><phase>3.5</phase></component>
+			<component><amplitude>0.06</amplitude><frequency>0.150</frequency><phase>1.0</phase></component>
 		</axis_x>
 		<axis_y>
-			<component><amplitude>0.30</amplitude><frequency>0.100</frequency><phase>0.0</phase></component>
-			<component><amplitude>0.06</amplitude><frequency>0.310</frequency><phase>2.1</phase></component>
+			<component><amplitude>0.20</amplitude><frequency>0.050</frequency><phase>0.5</phase></component>
+			<component><amplitude>0.08</amplitude><frequency>0.190</frequency><phase>1.1</phase></component>
 		</axis_y>
 		<axis_z>
-			<component><amplitude>0.40</amplitude><frequency>0.150</frequency><phase>0.7</phase></component>
-			<component><amplitude>0.25</amplitude><frequency>0.310</frequency><phase>4.0</phase></component>
+			<component><amplitude>0.40</amplitude><frequency>0.080</frequency><phase>1.7</phase></component>
+			<component><amplitude>0.25</amplitude><frequency>0.190</frequency><phase>3.0</phase></component>
 		</axis_z>
 
 		<position_gain>20.0</position_gain>

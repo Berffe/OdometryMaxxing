@@ -54,7 +54,7 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
     ) * lateral_blend
 
     approach_frac = (
-        1.0 if routine._d_star_ramp_in <= 1e-9 else min(1.0, elapsed / routine._d_star_ramp_in)
+        1.0 if routine._approach_d_star_ramp_in <= 1e-9 else min(1.0, elapsed / routine._approach_d_star_ramp_in)
     )
     approach_blend = raised_cosine01(approach_frac)
     d_approach_cmd = routine._approach_d_star * approach_blend
@@ -71,7 +71,7 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
         descent_divergence_setpoint=routine._approach_d_star,
         k_floor=routine._compute_probe_gain(),
         k_explore=routine._k_explore,
-        d_star_ramp_in_sec=routine._d_star_ramp_in,
+        d_star_ramp_in_sec=routine._approach_d_star_ramp_in,
     )
 
     # FAR-field probing supplies the long observation interval needed to resolve

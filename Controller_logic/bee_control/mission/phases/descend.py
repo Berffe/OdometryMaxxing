@@ -39,21 +39,21 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
         descent_divergence_setpoint=routine._d_star,
         k_floor=routine.gate.k_floor,
         k_explore=routine.gate.k_descend_start,
-        d_star_ramp_in_sec=routine._d_star_ramp_in,
+        d_star_ramp_in_sec=routine._descent_d_star_ramp_in,
     )
     roll_k = scheduled_gain_at_time(
         elapsed_sec=elapsed,
         descent_divergence_setpoint=routine._d_star,
         k_floor=routine.roll_gate.k_floor,
         k_explore=routine.roll_gate.k_descend_start,
-        d_star_ramp_in_sec=routine._d_star_ramp_in,
+        d_star_ramp_in_sec=routine._descent_d_star_ramp_in,
     )
     pitch_k = scheduled_gain_at_time(
         elapsed_sec=elapsed,
         descent_divergence_setpoint=routine._d_star,
         k_floor=routine.pitch_gate.k_floor,
         k_explore=routine.pitch_gate.k_descend_start,
-        d_star_ramp_in_sec=routine._d_star_ramp_in,
+        d_star_ramp_in_sec=routine._descent_d_star_ramp_in,
     )
 
     roll_ratio = (
@@ -74,12 +74,12 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
     # per-axis fields below.
     lateral_p_scale = max(roll_p_scale, pitch_p_scale)
     lateral_d_scale = max(roll_d_scale, pitch_d_scale)
-    h_pred = predicted_height(routine._h0, routine._d_star, elapsed, routine._d_star_ramp_in)
+    h_pred = predicted_height(routine._h0, routine._d_star, elapsed, routine._descent_d_star_ramp_in)
 
-    if routine._d_star_ramp_in <= 1e-9:
+    if routine._descent_d_star_ramp_in <= 1e-9:
         linear_frac = 1.0
     else:
-        linear_frac = min(1.0, elapsed / routine._d_star_ramp_in)
+        linear_frac = min(1.0, elapsed / routine._descent_d_star_ramp_in)
 
     ramp_frac = raised_cosine01(linear_frac)
     d_star_cmd = routine._d_star * ramp_frac
@@ -136,7 +136,7 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
                 routine._h0,
                 routine._d_star,
                 routine.gate.h_crit,
-                routine._d_star_ramp_in,
+                routine._descent_d_star_ramp_in,
             ),
             "d_star_ramp_frac": ramp_frac,
             "d_star_ramp_linear_frac": linear_frac,

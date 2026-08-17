@@ -144,7 +144,8 @@ class MissionRoutine:
         self._center_flow_radius_max = max(0.0, float(cfg.center_flow_radius_max_norm_s))
         self._center_timeout_allows_handoff = bool(cfg.center_timeout_allows_handoff)
 
-        self._d_star_ramp_in = max(0.0, float(cfg.d_star_ramp_in_sec))
+        self._approach_d_star_ramp_in = max(0.0, float(cfg.approach_d_star_ramp_in_sec))
+        self._descent_d_star_ramp_in = max(0.0, float(cfg.descent_d_star_ramp_in_sec))
         self._lateral_ramp = max(0.0, float(cfg.center_to_probe_lateral_ramp_sec))
 
         self._center_lateral_p_scale = max(0.0, float(cfg.center_lateral_p_scale))

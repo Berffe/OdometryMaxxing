@@ -193,9 +193,10 @@ class MissionConfig:
     """
 
     # --- Vertical setpoints ---
-    descent_divergence_setpoint: float = 0.50
     approach_divergence_setpoint: float = 0.08
-    d_star_ramp_in_sec: float = 1.5
+    approach_d_star_ramp_in_sec: float = 3.0
+    descent_divergence_setpoint: float = 0.30
+    descent_d_star_ramp_in_sec: float = 6.0
 
     # --- Phase durations / triggers ---
     final_probe_duration_sec: float = 2.0 * PROBE_DESIGN_PERIOD_SEC
@@ -209,7 +210,7 @@ class MissionConfig:
     # k(t) decays toward max(k_min, ceiling_margin * k_ceiling_leg) rather than
     # toward k_min: settle at 70% of the ALREADY safety-derated ceiling. This
     # is the second of two multiplicative margins, not the only one.
-    ceiling_margin: float = 0.7
+    ceiling_margin: float = 0.6
     # Height at which the near-field trigger actually fires. ANCHOR of the
     # whole gain schedule. A CAMERA-GEOMETRY constant (target diameter vs FOV),
     # calibratable from a log: read relative_z_m at FINAL_PROBE entry.
@@ -273,10 +274,10 @@ class MissionConfig:
 
     # --- Lateral schedule ---
     center_to_probe_lateral_ramp_sec: float = 2.0
-    center_lateral_p_scale: float = 0.30
+    center_lateral_p_scale: float = 1.0
     center_lateral_d_scale: float = 0.70
-    probe_lateral_p_scale: float = 0.30
-    probe_lateral_d_scale: float = 1.0
+    probe_lateral_p_scale: float = 0.75
+    probe_lateral_d_scale: float = 0.7
 
     # --- Visual synchronisation (tracking) gate ---
     # A one-time REJECTION test during the stationary FINAL_PROBE hold on
@@ -294,9 +295,9 @@ class MissionConfig:
     # Provisional empirical limit separating the validated low-frequency run
     # from the rejected high-frequency case. Keep this explicit until a larger
     # validation set turns it into a formal safety margin.
-    tracking_chi_limit_1_s2: float = 0.8
-    tracking_chi_x_limit_1_s2: float = 1.0
-    tracking_chi_y_limit_1_s2: float = 1.0
+    tracking_chi_limit_1_s2: float = 0.5
+    tracking_chi_x_limit_1_s2: float = 0.5
+    tracking_chi_y_limit_1_s2: float = 0.5
     # Ddot is the slope of a causal least-squares fit through this much recent
     # FILTERED divergence history. The actual camera/Gazebo SIM dt values are
     # preserved in the regression, so irregular frame spacing is handled

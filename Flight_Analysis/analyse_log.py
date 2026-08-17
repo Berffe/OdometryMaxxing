@@ -1259,7 +1259,6 @@ def _plot_probe_axis(
 	_legend(axes[0], ncol=2)
 
 	for col, label, style in [
-		(f"mission_{probe_prefix}_mean_accel_m_s2", "Probe mean", "-"),
 		(
 			f"mission_{probe_prefix}_residual_accel_m_s2",
 			"Probe residual magnitude |a_cmd − mean|",
@@ -1283,7 +1282,8 @@ def _plot_probe_axis(
 	if np.isfinite(capacity_ceiling):
 		axes[1].axhline(
 			capacity_ceiling,
-			linestyle=":",
+			linestyle="-",
+			color="r",
 			linewidth=1.8,
 			label=f"Stability-ceiling capacity: {capacity_ceiling:.3f} m/s²",
 		)
