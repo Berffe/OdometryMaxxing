@@ -7,17 +7,14 @@ The per-phase logic lives in ``mission/phases/``; this module owns what the
 phases share: configuration, the three acceleration probes, the feasibility
 gates, phase dispatch, and the log schema.
 
-Three acceleration probes run in parallel from APPROACH_PROBE through
-FINAL_PROBE:
-    - vertical command acceleration;
-    - roll-channel command acceleration;
-    - pitch-channel command acceleration.
-
-Each probe uses the same de-biasing, rolling-percentile and leaky-peak logic. The
-far-field estimates carry into FINAL_PROBE, where all three probes are retuned to
-the near-field time constants without resetting their accumulated envelopes.
-The final transition requires all three probes to be ready and all three gain
-windows to be feasible.
+Three acceleration probes run in parallel on the vertical, roll and pitch
+command accelerations. APPROACH_PROBE uses their far-field envelopes for
+diagnostics only. At the visual-height handoff, FINAL_PROBE freezes those
+diagnostic peaks, resets all three probes, applies the near-field conditioning,
+and collects the only acceleration evidence allowed into the feasibility gates.
+The static lateral feedforward is seeded at that handoff, adapted causally after
+lateral P is removed, and may remain adaptive through DESCENT; post-commit
+adaptation changes commands only and never re-opens a feasibility decision.
 
 Vertical feasibility compares the Herisse disturbance-rejection floor with the
 safety-scaled de Croon ceiling at landing-gear height. Roll and pitch feasibility
@@ -35,6 +32,7 @@ Where to edit what
 ------------------
 ``phases/<name>.py``   one phase's behaviour and transitions
 ``probe.py``           the command-acceleration probe
+``trim.py``            the slow visual-trim (wind equilibrium) estimator
 ``gates.py``           feasibility maths
 ``schedule.py``        the k(t) descent trajectory
 ``types.py``           the contract with the caller
@@ -43,9 +41,10 @@ this file              config plumbing, shared state, dispatch, telemetry
 from __future__ import annotations
 
 from dataclasses import replace as dc_replace
+import math
 from typing import Any, ClassVar, Mapping, Optional, Sequence
 
-from bee_control.core.config import MissionConfig
+from bee_control.core.config import CameraConfig, MissionConfig
 from bee_control.core.state import FlowResult, TargetEstimate
 
 from . import phases
@@ -60,7 +59,9 @@ from .gates import (
 from .math_utils import blank, clamp
 from .phases import PHASES, TERMINAL_SUBSTATES
 from .probe import PlatformProbe, ProbeResult, ThrustModel
+from .trim import VisualTrim
 from .visual_mismatch import VisualMismatchProbe
+from .visual_center_adaptation import VisualCenterAdaptation
 from .types import (
     ABORTED,
     APPROACH_PROBE,
@@ -76,7 +77,27 @@ from .types import (
 )
 
 
+def _trim_row(snapshot: tuple[float, float, float, float]):
+    """``VisualTrim.snapshot()`` -> CSV-safe values, ``inf`` becoming ``None``.
+
+    ``inf`` is the correct in-code sentinel for "no estimate yet" because it can
+    never satisfy a ``<= max`` gate by accident, but it is the wrong thing to
+    write to a log: it plots as a number. A blank cell is a gap, which is true.
+    """
+    mean_x, mean_y, mean_radius, residual_radius = snapshot
+    if not math.isfinite(mean_radius):
+        return None, None, None, None
+    return (
+        mean_x,
+        mean_y,
+        mean_radius,
+        residual_radius if math.isfinite(residual_radius) else None,
+    )
+
+
 class MissionRoutine:
+    PHASES: ClassVar[Mapping[str, Any]] = PHASES
+
     """Shared state and dispatch for the visual landing sequence.
 
     The phases in ``mission/phases/`` receive this object as ``routine`` and
@@ -89,6 +110,7 @@ class MissionRoutine:
         self,
         hover_thrust: float,
         config: Optional[MissionConfig] = None,
+        camera: Optional[CameraConfig] = None,
         **overrides,
     ):
         """Build the routine from a :class:`~config.MissionConfig`.
@@ -104,6 +126,19 @@ class MissionRoutine:
         """
         cfg = (config or MissionConfig()).with_overrides(**overrides)
         self.config = cfg
+        camera_cfg = camera or CameraConfig()
+
+        # Camera geometry is not a mission tuning knob.  The far-field lateral
+        # controller uses the command it produced on the previous visual tick
+        # as a visual-apparatus correction: a tilted nadir camera does not see
+        # the point directly below the vehicle at image centre.  Keep the
+        # geometry here, next to the phase decision that decides WHEN that
+        # correction is meaningful; config.py can expose sign/tuning knobs only
+        # after the behaviour is validated in simulation.
+        self._tan_half_hfov = math.tan(0.5 * camera_cfg.horizontal_fov_rad)
+        self._tan_half_vfov = math.tan(
+            0.5 * math.radians(camera_cfg.vertical_fov_deg)
+        )
 
         self._dt = float(cfg.control_period_sec)
         self._stability_dt = (
@@ -112,11 +147,21 @@ class MissionRoutine:
 
         self._d_star = max(0.0, float(cfg.descent_divergence_setpoint))
         self._approach_d_star = max(0.0, float(cfg.approach_divergence_setpoint))
+        self._approach_hold_area_fraction = clamp(
+            cfg.approach_hold_area_fraction, 1e-6, 1.0
+        )
+        self._approach_visual_p_gain = max(0.0, float(cfg.approach_visual_p_gain_1_s))
+        self._approach_retreat_d_star_limit = max(
+            0.0, float(cfg.approach_retreat_divergence_limit)
+        )
+        self._approach_hold_log_scale_tol = max(
+            0.0, float(cfg.approach_hold_log_scale_tolerance)
+        )
+        self._approach_hold_divergence_tol = max(
+            0.0, float(cfg.approach_hold_divergence_tolerance_1_s)
+        )
+        self._approach_hold_dwell = max(0.0, float(cfg.approach_hold_dwell_sec))
         self._final_probe_duration = max(0.0, float(cfg.final_probe_duration_sec))
-        self._final_probe_entry_ramp = max(0.0, float(cfg.final_probe_entry_ramp_sec))
-        self._fov_near_area_fraction = clamp(cfg.fov_near_area_fraction, 0.0, 1.0)
-
-        self._probe_min = max(0.0, float(cfg.probe_min_duration_sec))
         self._leg_clearance = float(cfg.leg_clearance_m)
         self._enable_descent = bool(cfg.enable_descent)
         self._probe_only = bool(cfg.probe_only)
@@ -144,6 +189,55 @@ class MissionRoutine:
         self._center_flow_radius_max = max(0.0, float(cfg.center_flow_radius_max_norm_s))
         self._center_timeout_allows_handoff = bool(cfg.center_timeout_allows_handoff)
 
+        # Trim-aware CENTER gate. These are declared MissionConfig fields; they
+        # used to be read with getattr() defaults, which silently made them
+        # unsettable because with_overrides() rejects undeclared names.
+        self._center_trim_tau = max(1e-3, float(cfg.center_trim_tau_sec))
+        # None -> derive, preserving the original coupling: the bound inherits
+        # the looser of the modern radial gate and the legacy box threshold, so
+        # tuning either of those still moves the handoff bound with them.
+        self._center_trim_mean_radius_max = max(0.0, float(
+            max(self._center_offset_radius_max, self._center_offset_thr)
+            if cfg.center_trim_mean_radius_max is None
+            else cfg.center_trim_mean_radius_max
+        ))
+        self._center_trim_residual_radius_max = max(
+            0.0, float(cfg.center_trim_residual_radius_max)
+        )
+
+        # Slow outer loop that moves the visual reference until the
+        # geometric-tilt-compensated physical centring error vanishes. It stays
+        # active through CENTER and APPROACH_PROBE, then stops when FINAL_PROBE
+        # removes lateral image-position P authority.
+        self._center_visual_adaptation_tau = max(
+            1e-3, float(cfg.center_visual_adaptation_tau_sec)
+        )
+        self._center_visual_adaptation_max_bias = abs(
+            float(cfg.center_visual_adaptation_max_bias_norm)
+        )
+        self._center_visual_adaptation_flow_scale = max(
+            1e-6, float(cfg.center_visual_adaptation_flow_scale_norm_s)
+        )
+        self._center_visual_adaptation_max_rate = abs(
+            float(cfg.center_visual_adaptation_max_rate_norm_s)
+        )
+
+        # DESCENT handoff trim: averaged over the same window as the probes.
+        self._far_trim_tau = max(1e-3, float(cfg.far_trim_tau_sec))
+        self._near_trim_tau = max(1e-3, float(cfg.near_trim_tau_sec))
+        self._descent_trim_use_probe_mean = bool(cfg.descent_trim_use_probe_mean)
+        self._descent_bias_adaptive = bool(cfg.descent_lateral_bias_adaptive)
+        self._descent_bias_tau = max(1e-3, float(cfg.descent_lateral_bias_tau_sec))
+        self._descent_bias_deviation_limit = abs(
+            float(cfg.descent_lateral_bias_deviation_limit_m_s2)
+        )
+
+        # Re-use the already validated lateral-bias adaptation time scale for
+        # this first FINAL_PROBE implementation.  No new config knob is
+        # introduced yet: config.py is intentionally left untouched until the
+        # new handoff has been flight-validated.
+        self._final_probe_bias_tau = self._descent_bias_tau
+
         self._approach_d_star_ramp_in = max(0.0, float(cfg.approach_d_star_ramp_in_sec))
         self._descent_d_star_ramp_in = max(0.0, float(cfg.descent_d_star_ramp_in_sec))
         self._lateral_ramp = max(0.0, float(cfg.center_to_probe_lateral_ramp_sec))
@@ -155,7 +249,8 @@ class MissionRoutine:
 
         self._tm = ThrustModel(hover_thrust)
 
-        # Three parallel probes share the same far/near timing design.
+        # Three parallel probes use far-field conditioning for APPROACH
+        # diagnostics and are reset into near-field conditioning at FINAL_PROBE.
         self._probe = PlatformProbe(
             self._tm,
             highpass_tau_sec=float(cfg.far_probe_highpass_tau_sec),
@@ -242,9 +337,8 @@ class MissionRoutine:
         self.probe_result = ProbeResult()
         self.roll_probe_result = ProbeResult()
         self.pitch_probe_result = ProbeResult()
-        # peak_accel at the instant of the far->near handoff, frozen for diagnostics:
-        # comparing it against the final peak_accel shows how much the near field
-        # actually revised the far-field estimate (and in which direction).
+        # APPROACH diagnostic envelopes frozen immediately before FINAL_PROBE
+        # resets the three gate probes.
         self.peak_accel_at_handoff: Optional[float] = None
         self.roll_peak_accel_at_handoff: Optional[float] = None
         self.pitch_peak_accel_at_handoff: Optional[float] = None
@@ -256,7 +350,67 @@ class MissionRoutine:
 
         self._centered_since: Optional[float] = None
         self._center_start_t: Optional[float] = None
+
+        # Two VISUAL trim estimators, updated every visual tick by update()
+        # rather than by one phase. CENTER's is fast because it gates a dwell;
+        # the handoff estimator is slow and is reset/retuned with the probes so
+        # the near-field offset equilibrium remains available for diagnostics.
+        # It no longer commands DESCENT: image-position P authority is zero from
+        # FINAL_PROBE onward.
+        self._center_trim = VisualTrim(self._center_trim_tau)
+        # Same time constant, but in the geometric-tilt-compensated frame.
+        # Its mean is the physical lateral mis-centering signal: zero means the
+        # deck centre lies on the world-vertical ray through the camera, even
+        # though a tilted camera sees that point away from image centre.
+        self._center_physical_trim = VisualTrim(self._center_trim_tau)
+        self._handoff_trim = VisualTrim(self._far_trim_tau)
+        self._center_trim_snapshot = self._center_trim.snapshot()
+        self._center_physical_trim_snapshot = self._center_physical_trim.snapshot()
+        self._handoff_trim_snapshot = self._handoff_trim.snapshot()
+
+        # Adaptive physical visual centre.  Unlike the previous two-dwell
+        # calibration, this state evolves continuously in CENTER: the visual
+        # reference moves slowly while the lateral P/D loop remains the fast
+        # controller.  At physical centring the adaptation naturally stops,
+        # leaving exactly the P bias required to reject the steady wind.
+        self._visual_center_adaptation = VisualCenterAdaptation(
+            tau_sec=self._center_visual_adaptation_tau,
+            max_bias_norm=self._center_visual_adaptation_max_bias,
+            flow_scale_norm_s=self._center_visual_adaptation_flow_scale,
+            max_rate_norm_s=self._center_visual_adaptation_max_rate,
+        )
+        self._visual_center_adaptation_snapshot = (
+            self._visual_center_adaptation.snapshot()
+        )
+        self._center_geometric_offset_x = 0.0
+        self._center_geometric_offset_y = 0.0
+
+        # Lateral static-acceleration handoff.
+        #
+        # CENTER / APPROACH_PROBE only MEASURE the steady command through the
+        # existing PlatformProbes; they do not inject a feedforward term.
+        # FINAL_PROBE activates that passive estimate and adapts it while P is
+        # disabled.  DESCENT starts bumplessly from the committed FINAL_PROBE
+        # value and, when configured, keeps the same slow estimator online so
+        # low-frequency wind changes can be absorbed during the short descent.
+        self._descent_lateral_trim_frozen = False
+        self._final_probe_roll_accel_bias = 0.0
+        self._final_probe_pitch_accel_bias = 0.0
+        self._final_probe_roll_bias_initial = 0.0
+        self._final_probe_pitch_bias_initial = 0.0
+        self._descent_roll_accel_bias = 0.0
+        self._descent_pitch_accel_bias = 0.0
+        # DESCENT-entry anchors retained for telemetry.  The live descent bias
+        # may move away from these values when online adaptation is enabled; the
+        # deviation columns then show exactly how much correction was learned
+        # after commitment.
+        self._descent_roll_bias_frozen = 0.0
+        self._descent_pitch_bias_frozen = 0.0
+        self._descent_trim_offset_x = 0.0
+        self._descent_trim_offset_y = 0.0
         self._t_approach_entry: Optional[float] = None
+        self._approach_hold_since: Optional[float] = None
+        self._approach_divergence_integral = 0.0
         self._t_final_probe_entry: Optional[float] = None
         self._t_final_probe_hold_start: Optional[float] = None
         self._t_descend_start: Optional[float] = None
@@ -331,7 +485,35 @@ class MissionRoutine:
 
         self._centered_since = None
         self._center_start_t = None
+        self._center_trim.reset()
+        self._center_trim.retune(self._center_trim_tau)
+        self._center_physical_trim.reset()
+        self._center_physical_trim.retune(self._center_trim_tau)
+        self._handoff_trim.reset()
+        self._handoff_trim.retune(self._far_trim_tau)
+        self._center_trim_snapshot = self._center_trim.snapshot()
+        self._center_physical_trim_snapshot = self._center_physical_trim.snapshot()
+        self._handoff_trim_snapshot = self._handoff_trim.snapshot()
+        self._visual_center_adaptation.reset()
+        self._visual_center_adaptation_snapshot = (
+            self._visual_center_adaptation.snapshot()
+        )
+        self._center_geometric_offset_x = 0.0
+        self._center_geometric_offset_y = 0.0
+        self._descent_lateral_trim_frozen = False
+        self._final_probe_roll_accel_bias = 0.0
+        self._final_probe_pitch_accel_bias = 0.0
+        self._final_probe_roll_bias_initial = 0.0
+        self._final_probe_pitch_bias_initial = 0.0
+        self._descent_roll_accel_bias = 0.0
+        self._descent_pitch_accel_bias = 0.0
+        self._descent_roll_bias_frozen = 0.0
+        self._descent_pitch_bias_frozen = 0.0
+        self._descent_trim_offset_x = 0.0
+        self._descent_trim_offset_y = 0.0
         self._t_approach_entry = None
+        self._approach_hold_since = None
+        self._approach_divergence_integral = 0.0
         self._t_final_probe_entry = None
         self._t_final_probe_hold_start = None
         self._t_descend_start = None
@@ -379,7 +561,41 @@ class MissionRoutine:
         "divergence_setpoint_1_s", "thrust_gain_k",
         "lateral_p_scale", "lateral_d_scale",
         "roll_p_scale", "roll_d_scale", "pitch_p_scale", "pitch_d_scale",
+        "roll_offset_setpoint", "pitch_offset_setpoint",
+        "roll_accel_feedforward_m_s2", "pitch_accel_feedforward_m_s2",
+        "center_trim_mean_x", "center_trim_mean_y",
+        "center_trim_mean_radius", "center_trim_residual_radius",
+        "center_trim_tau_sec", "center_trim_mean_radius_max",
+        "center_trim_residual_radius_max",
+        # Physical-centering diagnostics and the slow adaptive visual reference.
+        "center_geometric_offset_x", "center_geometric_offset_y",
+        "center_physical_mean_x", "center_physical_mean_y",
+        "center_physical_mean_radius", "center_physical_residual_radius",
+        "center_visual_bias_x", "center_visual_bias_y",
+        "center_visual_bias_radius",
+        "center_visual_adaptation_rate_x_norm_s",
+        "center_visual_adaptation_rate_y_norm_s",
+        "center_visual_adaptation_weight", "center_visual_adaptation_active",
+        "center_visual_adaptation_tau_sec",
+        # Slow VISUAL handoff trim, conditioned and reset with the acceleration
+        # probes.  DESCENT retains this image-space value for diagnostics only;
+        # lateral P has zero command authority there.  The center_* columns above
+        # stay the fast CENTER-gate estimator so existing analyses keep meaning.
+        "handoff_trim_mean_x", "handoff_trim_mean_y",
+        "handoff_trim_mean_radius", "handoff_trim_residual_radius",
+        "handoff_trim_tau_sec",
+        "descent_trim_offset_x", "descent_trim_offset_y",
+        "descent_lateral_trim_frozen",
+        # Frozen reference vs live estimate: the difference is how far the wind
+        # has moved since FINAL_PROBE committed.
+        "descent_roll_bias_frozen_m_s2", "descent_pitch_bias_frozen_m_s2",
+        "descent_bias_adaptive", "descent_bias_tau_sec",
+        "descent_bias_deviation_limit_m_s2",
+        "descent_roll_bias_deviation_m_s2", "descent_pitch_bias_deviation_m_s2",
         "enable_integral",
+        "approach_hold_area_fraction", "approach_log_scale_error",
+        "approach_measured_divergence_1_s", "approach_hold_condition",
+        "approach_hold_dwell_sec",
         # Feasibility gate inputs and outputs.
         "peak_accel_m_s2", "roll_peak_accel_m_s2", "pitch_peak_accel_m_s2",
         "k_min", "k_explore", "k_probe", "k_floor", "k_ceiling_leg",
@@ -489,6 +705,19 @@ class MissionRoutine:
         info = mc.info or {}
         gate, roll_gate, pitch_gate = self.gate, self.roll_gate, self.pitch_gate
 
+        # An unseeded estimator reports inf, which would litter the CSV with a
+        # sentinel that reads like a number. Map "no estimate yet" to None here
+        # and let blank() turn it into an empty cell.
+        center_trim_x, center_trim_y, center_trim_radius, center_trim_residual = (
+            _trim_row(self._center_trim_snapshot)
+        )
+        (
+            center_phys_x, center_phys_y, center_phys_radius, center_phys_residual
+        ) = _trim_row(self._center_physical_trim_snapshot)
+        handoff_trim_x, handoff_trim_y, handoff_trim_radius, handoff_trim_residual = (
+            _trim_row(self._handoff_trim_snapshot)
+        )
+
         row: dict = {
             "substate": self._substate,
             "divergence_setpoint_1_s": mc.divergence_setpoint,
@@ -499,7 +728,92 @@ class MissionRoutine:
             "roll_d_scale": blank(mc.roll_d_scale),
             "pitch_p_scale": blank(mc.pitch_p_scale),
             "pitch_d_scale": blank(mc.pitch_d_scale),
+            "roll_offset_setpoint": mc.roll_offset_setpoint,
+            "pitch_offset_setpoint": mc.pitch_offset_setpoint,
+            "roll_accel_feedforward_m_s2": mc.roll_accel_feedforward_m_s2,
+            "pitch_accel_feedforward_m_s2": mc.pitch_accel_feedforward_m_s2,
+            # Read from the estimator, NOT from info: these are properties of
+            # the routine, so every phase logs them without having to remember
+            # to copy four keys into its info dict. Blank only while the mean
+            # is unseeded, which is a real gap rather than a measured zero.
+            "center_trim_mean_x": blank(center_trim_x),
+            "center_trim_mean_y": blank(center_trim_y),
+            "center_trim_mean_radius": blank(center_trim_radius),
+            "center_trim_residual_radius": blank(center_trim_residual),
+            "center_trim_tau_sec": self._center_trim_tau,
+            "center_trim_mean_radius_max": self._center_trim_mean_radius_max,
+            "center_trim_residual_radius_max": self._center_trim_residual_radius_max,
+            "center_geometric_offset_x": self._center_geometric_offset_x,
+            "center_geometric_offset_y": self._center_geometric_offset_y,
+            "center_physical_mean_x": blank(center_phys_x),
+            "center_physical_mean_y": blank(center_phys_y),
+            "center_physical_mean_radius": blank(center_phys_radius),
+            "center_physical_residual_radius": blank(center_phys_residual),
+            "center_visual_bias_x": self._visual_center_adaptation_snapshot.bias_x,
+            "center_visual_bias_y": self._visual_center_adaptation_snapshot.bias_y,
+            "center_visual_bias_radius": (
+                self._visual_center_adaptation_snapshot.bias_radius
+            ),
+            "center_visual_adaptation_rate_x_norm_s": (
+                self._visual_center_adaptation_snapshot.rate_x_norm_s
+            ),
+            "center_visual_adaptation_rate_y_norm_s": (
+                self._visual_center_adaptation_snapshot.rate_y_norm_s
+            ),
+            "center_visual_adaptation_weight": (
+                self._visual_center_adaptation_snapshot.adaptation_weight
+            ),
+            "center_visual_adaptation_active": int(
+                self._visual_center_adaptation_snapshot.active
+            ),
+            "center_visual_adaptation_tau_sec": self._center_visual_adaptation_tau,
+            "handoff_trim_mean_x": blank(handoff_trim_x),
+            "handoff_trim_mean_y": blank(handoff_trim_y),
+            "handoff_trim_mean_radius": blank(handoff_trim_radius),
+            "handoff_trim_residual_radius": blank(handoff_trim_residual),
+            "handoff_trim_tau_sec": self._handoff_trim.tau_sec,
+            # The frozen values are meaningless before commitment, so they stay
+            # blank until DESCENT actually owns them.
+            "descent_trim_offset_x": blank(
+                self._descent_trim_offset_x
+                if self._descent_lateral_trim_frozen else None
+            ),
+            "descent_trim_offset_y": blank(
+                self._descent_trim_offset_y
+                if self._descent_lateral_trim_frozen else None
+            ),
+            "descent_lateral_trim_frozen": int(bool(self._descent_lateral_trim_frozen)),
+            "descent_roll_bias_frozen_m_s2": blank(
+                self._descent_roll_bias_frozen
+                if self._descent_lateral_trim_frozen else None
+            ),
+            "descent_pitch_bias_frozen_m_s2": blank(
+                self._descent_pitch_bias_frozen
+                if self._descent_lateral_trim_frozen else None
+            ),
+            "descent_bias_adaptive": int(
+                bool(self._descent_bias_adaptive and self._substate == DESCEND)
+            ),
+            "descent_bias_tau_sec": self._descent_bias_tau,
+            "descent_bias_deviation_limit_m_s2": self._descent_bias_deviation_limit,
+            # Deviation from the exact FINAL_PROBE value committed at DESCENT
+            # entry.  Zero means no post-commit correction was required.
+            "descent_roll_bias_deviation_m_s2": blank(
+                self._descent_roll_accel_bias - self._descent_roll_bias_frozen
+                if self._descent_lateral_trim_frozen else None
+            ),
+            "descent_pitch_bias_deviation_m_s2": blank(
+                self._descent_pitch_accel_bias - self._descent_pitch_bias_frozen
+                if self._descent_lateral_trim_frozen else None
+            ),
             "enable_integral": int(bool(mc.enable_integral)),
+            "approach_hold_area_fraction": self._approach_hold_area_fraction,
+            "approach_log_scale_error": blank(info.get("approach_log_scale_error")),
+            "approach_measured_divergence_1_s": blank(
+                info.get("approach_measured_divergence")
+            ),
+            "approach_hold_condition": blank(info.get("approach_hold_condition")),
+            "approach_hold_dwell_sec": blank(info.get("approach_hold_dwell_sec")),
 
             "peak_accel_m_s2": self.probe_result.peak_accel,
             "roll_peak_accel_m_s2": self.roll_probe_result.peak_accel,
@@ -653,9 +967,9 @@ class MissionRoutine:
         # measurement but is just a frozen register. None -> blank CSV cell -> a gap
         # in the plot, which is the truth.
         #
-        # The ENVELOPE (probe_peak_accel) and the handoff value are NOT blanked:
-        # they are the gate's inputs and stay meaningful for the whole descent
-        # (k_min = peak/D* is what the schedule's floor was built from).
+        # FINAL_PROBE peak_accel stays available after the probe because it is a
+        # gate input.  peak_accel_at_handoff is the frozen APPROACH diagnostic,
+        # kept separately so the two phases never share evidence.
         return {
             "probe_active": active,
             "probe_phase": ("near" if near else "far") if active else "",
@@ -860,6 +1174,17 @@ class MissionRoutine:
         if self._h0 is None:
             self._h0 = 5.0
 
+        # Static lateral acceleration is absent in CENTER/APPROACH.  It adapts
+        # once lateral P authority is removed in FINAL_PROBE and may keep adapting
+        # through DESCENT to follow slow wind changes.  The update is causal: it
+        # uses the allocator-realized command from the previous control tick.
+        self._update_near_field_lateral_bias(inputs)
+
+        # Shared per-tick trim estimators run BEFORE dispatch, so every phase
+        # reads the same value and none of them owns that measurement update.
+        # The adaptive visual-centre state itself is advanced by CENTER and
+        # APPROACH_PROBE only, where lateral image-position P remains meaningful.
+        self._update_lateral_trim(inputs)
         # An unregistered substate falls through to DESCEND, preserving the
         # previous if-chain's final `return self._do_descend(t)`.
         spec = PHASES.get(self._substate) or PHASES[DESCEND]
@@ -868,6 +1193,166 @@ class MissionRoutine:
         # handing the MissionControl back to the logger.
         self.last_control = control
         return control
+
+    def _update_near_field_lateral_bias(self, inputs: MissionInputs) -> None:
+        """Adapt the static lateral acceleration term after lateral P is removed.
+
+        APPROACH_PROBE passively estimates the steady command through the
+        existing roll/pitch PlatformProbe means.  At the FINAL_PROBE handoff that
+        estimate is activated as feedforward while lateral P authority becomes
+        exactly zero.  The near-field law is then
+
+            a_cmd = a_static + a_D(flow)
+
+        and the causal EMA
+
+            a_static <- a_static + beta * (a_realized - a_static)
+
+        absorbs the slow part of the remaining D correction.  FINAL_PROBE uses
+        ``_final_probe_*_accel_bias``; DESCENT starts from that exact value and,
+        when ``descent_lateral_bias_adaptive`` is enabled, keeps the same
+        estimator running on ``_descent_*_accel_bias``.
+
+        Both phases share ONE safety neighbourhood centred on the passive
+        APPROACH seed.  Continuing adaptation in DESCENT therefore does not buy
+        a second independent deviation allowance after the FINAL_PROBE update.
+        """
+        if self._substate not in (FINAL_PROBE, DESCEND):
+            return
+        if self._substate == DESCEND and not self._descent_bias_adaptive:
+            return
+        if not (inputs.target_found and inputs.flow_valid):
+            return
+
+        beta = 1.0 - math.exp(
+            -max(1e-3, float(inputs.dt)) / max(1e-3, self._final_probe_bias_tau)
+        )
+        limit = self._descent_bias_deviation_limit
+
+        if self._substate == FINAL_PROBE:
+            roll_current = self._final_probe_roll_accel_bias
+            pitch_current = self._final_probe_pitch_accel_bias
+        else:
+            # DESCENT begins only after _commit_descent_lateral_trim(), so these
+            # are the exact FINAL_PROBE values flown on the handoff tick.
+            roll_current = self._descent_roll_accel_bias
+            pitch_current = self._descent_pitch_accel_bias
+
+        roll_bias = roll_current + beta * (
+            float(inputs.actuation.last_roll_accel_cmd) - roll_current
+        )
+        pitch_bias = pitch_current + beta * (
+            float(inputs.actuation.last_pitch_accel_cmd) - pitch_current
+        )
+
+        roll_bias = clamp(
+            roll_bias,
+            self._final_probe_roll_bias_initial - limit,
+            self._final_probe_roll_bias_initial + limit,
+        )
+        pitch_bias = clamp(
+            pitch_bias,
+            self._final_probe_pitch_bias_initial - limit,
+            self._final_probe_pitch_bias_initial + limit,
+        )
+
+        if self._substate == FINAL_PROBE:
+            self._final_probe_roll_accel_bias = roll_bias
+            self._final_probe_pitch_accel_bias = pitch_bias
+        else:
+            self._descent_roll_accel_bias = roll_bias
+            self._descent_pitch_accel_bias = pitch_bias
+
+    @staticmethod
+    def _tilt_to_normalized_offset(angle_rad: float, tan_half_fov: float) -> float:
+        """Exact pinhole projection into the target's [-1, 1] image coordinate."""
+        denom = max(1e-9, abs(float(tan_half_fov)))
+        return math.tan(float(angle_rad)) / denom
+
+    def _far_field_geometric_tilt_offset(
+        self, inputs: MissionInputs
+    ) -> tuple[float, float]:
+        """Image location of the point directly below the camera.
+
+        This is geometry only. It intentionally contains no wind/disturbance
+        compensation. The previous shaped command keeps it causal and matches
+        the attitude actually sent to PX4 closely in the validated wind logs.
+        """
+        roll_geom = -self._tilt_to_normalized_offset(
+            inputs.actuation.last_roll_cmd_rad, self._tan_half_hfov
+        )
+        pitch_geom = -self._tilt_to_normalized_offset(
+            inputs.actuation.last_pitch_cmd_rad, self._tan_half_vfov
+        )
+        roll_geom = clamp(roll_geom, -1.0, 1.0)
+        pitch_geom = clamp(pitch_geom, -1.0, 1.0)
+        self._center_geometric_offset_x = roll_geom
+        self._center_geometric_offset_y = pitch_geom
+        return roll_geom, pitch_geom
+
+    def _far_field_lateral_control_terms(
+        self, inputs: MissionInputs
+    ) -> tuple[float, float, float, float]:
+        """Return the adaptive far-field visual setpoint.
+
+        Let ``e_geom`` be the image location of the world-vertical ray through
+        the tilted camera and ``b`` the slow CENTER adaptation.  The setpoint is
+
+            e_sp = e_geom - b.
+
+        The physical centring error is ``e_phys = e_meas - e_geom``.  CENTER
+        evolves ``b`` slowly from that error; when e_phys -> 0 the bias freezes
+        at the value needed to keep the steady P counter-force.
+
+        CENTER and APPROACH_PROBE both evolve the learned bias online.  The
+        same direct visual-reference law is therefore used in both phases:
+        changing the scheduled P multiplier may temporarily expose a physical
+        centring error, and the slow adaptation is allowed to learn the new
+        equilibrium naturally instead of algebraically rescaling the bias.
+        """
+        roll_geom, pitch_geom = self._far_field_geometric_tilt_offset(inputs)
+
+        snap = self._visual_center_adaptation_snapshot
+        roll_sp = roll_geom - float(snap.bias_x)
+        pitch_sp = pitch_geom - float(snap.bias_y)
+        roll_sp = clamp(roll_sp, -1.0, 1.0)
+        pitch_sp = clamp(pitch_sp, -1.0, 1.0)
+
+        # No acceleration feedforward before FINAL_PROBE.  The adaptive centre
+        # is a moving visual reference, not a second force-command path.
+        return roll_sp, pitch_sp, 0.0, 0.0
+
+    def _update_visual_center_adaptation(self, inputs: MissionInputs) -> None:
+        """Advance the slow visual-centre finder in CENTER and APPROACH_PROBE.
+
+        The physical trim is already based on ``e_meas - e_geom`` and is a
+        one-second EMA, so the adaptive state sees a mean/static displacement
+        rather than frame noise.  Optical flow only modulates adaptation speed;
+        the fast lateral P/D controller remains solely responsible for motion.
+
+        Adaptation deliberately stops at FINAL_PROBE, exactly where lateral
+        image-position P authority is removed.
+        """
+        px, py, _radius, _residual = self._center_physical_trim_snapshot
+        valid = (
+            self._substate in (CENTER, APPROACH_PROBE)
+            and bool(inputs.target_found)
+            and bool(inputs.flow_valid)
+            and not bool(inputs.fov_saturated)
+            and math.isfinite(px)
+            and math.isfinite(py)
+        )
+        self._visual_center_adaptation.update(
+            physical_error_x=float(px) if math.isfinite(px) else 0.0,
+            physical_error_y=float(py) if math.isfinite(py) else 0.0,
+            flow_x_norm_s=float(inputs.flow_x_norm_s),
+            flow_y_norm_s=float(inputs.flow_y_norm_s),
+            valid=valid,
+            dt=inputs.dt,
+        )
+        self._visual_center_adaptation_snapshot = (
+            self._visual_center_adaptation.snapshot()
+        )
 
     def _update_visual_mismatch(self, inputs: MissionInputs) -> None:
         """Fold one visual sample into the height-free bandwidth diagnostic.
@@ -970,19 +1455,64 @@ class MissionRoutine:
                 percentile_window_sec=self._near_probe_window,
                 peak_decay_tau_sec=self._near_probe_decay_tau,
             )
+        # The handoff trim pairs with PlatformProbe.mean_accel, so it follows
+        # the same far -> near conditioning change at the same instant.
+        self._handoff_trim.retune(self._near_trim_tau)
 
-    def _refresh_probe_results(
-        self,
-        min_duration_sec: float,
-        min_total_duration_sec: float,
+    def _refresh_probe_results(self, min_duration_sec: float) -> None:
+        self.probe_result = self._probe.result(min_duration_sec)
+        self.roll_probe_result = self._roll_probe.result(min_duration_sec)
+        self.pitch_probe_result = self._pitch_probe.result(min_duration_sec)
+
+    def _begin_final_probe_measurement(
+        self, t: float, inputs: Optional[MissionInputs] = None
     ) -> None:
-        kwargs = dict(
-            min_duration_sec=min_duration_sec,
-            min_total_duration_sec=min_total_duration_sec,
+        """Activate the passive APPROACH static estimate, then reset gate evidence.
+
+        The acceleration feedforward has had ZERO authority up to this point.
+        The roll/pitch PlatformProbe means therefore provide a passive estimate
+        of the steady lateral command produced by compensated P+D control.  We
+        capture those means before resetting the probes and use them as the
+        initial FINAL_PROBE static term.
+
+        A direct FINAL_PROBE dispatch (tests/state restoration) may have no
+        APPROACH samples.  In that exceptional case the last realized command is
+        the best causal seed available; otherwise the seed is zero.
+        """
+        roll_samples = self._roll_probe.result(0.0).n_samples
+        pitch_samples = self._pitch_probe.result(0.0).n_samples
+        roll_seed = (
+            float(self._roll_probe.mean_accel)
+            if roll_samples > 0
+            else float(inputs.actuation.last_roll_accel_cmd) if inputs is not None else 0.0
         )
-        self.probe_result = self._probe.result(**kwargs)
-        self.roll_probe_result = self._roll_probe.result(**kwargs)
-        self.pitch_probe_result = self._pitch_probe.result(**kwargs)
+        pitch_seed = (
+            float(self._pitch_probe.mean_accel)
+            if pitch_samples > 0
+            else float(inputs.actuation.last_pitch_accel_cmd) if inputs is not None else 0.0
+        )
+        self._final_probe_roll_accel_bias = roll_seed
+        self._final_probe_pitch_accel_bias = pitch_seed
+        self._final_probe_roll_bias_initial = roll_seed
+        self._final_probe_pitch_bias_initial = pitch_seed
+
+        self.peak_accel_at_handoff = self._probe.peak_accel
+        self.roll_peak_accel_at_handoff = self._roll_probe.peak_accel
+        self.pitch_peak_accel_at_handoff = self._pitch_probe.peak_accel
+
+        for probe in (self._probe, self._roll_probe, self._pitch_probe):
+            probe.reset()
+        # Same provenance rule the probes follow: no APPROACH-era sample may
+        # enter the operating point FINAL_PROBE hands to DESCENT.
+        self._handoff_trim.reset()
+        self._retune_probes()
+        self.probe_result = ProbeResult()
+        self.roll_probe_result = ProbeResult()
+        self.pitch_probe_result = ProbeResult()
+
+        self._t_final_probe_entry = float(t)
+        self._t_final_probe_hold_start = float(t)
+        self._begin_tracking_gate_window()
 
     def _compute_lateral_gates(self) -> None:
         roll_probe_gain = self._roll_d_gain * self._probe_lateral_d_scale
@@ -1096,29 +1626,68 @@ class MissionRoutine:
                 criteria.append(criterion)
         return "|".join(criteria)
 
+    def _update_lateral_trim(self, inputs: MissionInputs) -> None:
+        """Advance both visual-trim estimators for one tick.
+
+        Three visual estimates are maintained: raw image trim, the
+        geometric-tilt-compensated physical trim, and the slow handoff trim.
+        These estimators remain passive; CENTER passes the physical-trim mean to
+        the separate VisualCenterAdaptation outer loop, while FINAL_PROBE/DESCENT
+        retain their existing acceleration-trim handoff semantics.
+
+        Called from :meth:`update` rather than from a phase, so the estimate is
+        continuous across the whole visual sequence and its CSV columns are
+        populated in every phase that has a live measurement.
+        """
+        self._center_trim.update(
+            inputs.offset_x, inputs.offset_y, inputs.target_found, inputs.dt
+        )
+        geom_x, geom_y = self._far_field_geometric_tilt_offset(inputs)
+        self._center_physical_trim.update(
+            float(inputs.offset_x) - geom_x,
+            float(inputs.offset_y) - geom_y,
+            inputs.target_found,
+            inputs.dt,
+        )
+        self._handoff_trim.update(
+            inputs.offset_x, inputs.offset_y, inputs.target_found, inputs.dt
+        )
+        self._center_trim_snapshot = self._center_trim.snapshot()
+        self._center_physical_trim_snapshot = self._center_physical_trim.snapshot()
+        self._handoff_trim_snapshot = self._handoff_trim.snapshot()
+
+    def _commit_descent_lateral_trim(self, inputs: MissionInputs) -> None:
+        """Commit the FINAL_PROBE static acceleration trim into DESCENT.
+
+        Lateral P authority is already zero throughout FINAL_PROBE, so there is
+        no image-offset/feedforward pair to re-parameterise at the descent
+        boundary.  The bumpless choice is to start DESCENT from the exact static
+        feedforward FINAL_PROBE was already flying.
+
+        The committed value is also retained as a telemetry anchor.  If descent
+        adaptation is enabled, subsequent ticks may refine the live bias while
+        remaining inside the same APPROACH-seeded safety neighbourhood.
+        """
+        self._descent_roll_accel_bias = float(self._final_probe_roll_accel_bias)
+        self._descent_pitch_accel_bias = float(self._final_probe_pitch_accel_bias)
+        self._descent_roll_bias_frozen = self._descent_roll_accel_bias
+        self._descent_pitch_bias_frozen = self._descent_pitch_accel_bias
+        # Keep the near-field visual trim for diagnostics only.  The lateral P
+        # scales are zero from FINAL_PROBE onward, so these values no longer
+        # enter ControlLaw as setpoints.
+        if self._descent_trim_use_probe_mean and self._handoff_trim.has_mean:
+            self._descent_trim_offset_x = float(self._handoff_trim.mean_x)
+            self._descent_trim_offset_y = float(self._handoff_trim.mean_y)
+        else:
+            # Explicit legacy path, and the fallback if FINAL_PROBE never saw a
+            # single valid target sample to seed the mean.
+            self._descent_trim_offset_x = float(inputs.offset_x)
+            self._descent_trim_offset_y = float(inputs.offset_y)
+        self._descent_lateral_trim_frozen = True
+
     def _is_centered(self, offset_x: float, offset_y: float, target_found: bool) -> bool:
         return (
             bool(target_found)
             and abs(float(offset_x)) <= self._center_offset_thr
             and abs(float(offset_y)) <= self._center_offset_thr
         )
-
-    def _near_field_reached(
-        self,
-        offset_x: float,
-        offset_y: float,
-        target_found: bool,
-        area_fraction: float,
-        fov_saturated: bool,
-    ) -> bool:
-        centered = self._is_centered(offset_x, offset_y, target_found)
-
-        # Area fraction is the monotone near-field trigger. fov_saturated remains a
-        # diagnostic but does not drive the phase transition.
-        visually_close = float(area_fraction) >= self._fov_near_area_fraction
-        return centered and visually_close
-
-    #: Phase table, imported from ``mission/phases/``. Kept as a class
-    #: attribute so existing callers (``bee_node``, tests) can still reach it
-    #: as ``MissionRoutine.PHASES``.
-    PHASES: ClassVar[dict] = PHASES

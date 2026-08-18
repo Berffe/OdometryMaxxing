@@ -72,14 +72,25 @@ class ActuationFeedback:
     """
 
     last_thrust_cmd: float = 0.0
+    last_roll_cmd_rad: float = 0.0
+    last_pitch_cmd_rad: float = 0.0
     last_vertical_accel_cmd: Optional[float] = None
     last_roll_accel_cmd: float = 0.0
     last_pitch_accel_cmd: float = 0.0
 
     @classmethod
-    def from_control_law(cls, control_law, last_thrust_cmd: float) -> "ActuationFeedback":
+    def from_control_law(
+        cls,
+        control_law,
+        last_thrust_cmd: float,
+        *,
+        last_roll_cmd_rad: float = 0.0,
+        last_pitch_cmd_rad: float = 0.0,
+    ) -> "ActuationFeedback":
         return cls(
             last_thrust_cmd=float(last_thrust_cmd),
+            last_roll_cmd_rad=float(last_roll_cmd_rad),
+            last_pitch_cmd_rad=float(last_pitch_cmd_rad),
             last_vertical_accel_cmd=control_law.last_vertical_accel_cmd,
             last_roll_accel_cmd=control_law.last_roll_accel_cmd,
             last_pitch_accel_cmd=control_law.last_pitch_accel_cmd,
@@ -135,6 +146,10 @@ class MissionInputs:
     def flow_valid(self) -> bool:
         return bool(getattr(self.flow, "valid", False))
 
+    @property
+    def divergence_1_s(self) -> float:
+        return float(getattr(self.flow, "divergence", 0.0))
+
 
 @dataclass
 class MissionControl:
@@ -154,6 +169,15 @@ class MissionControl:
     roll_d_scale: Optional[float] = None
     pitch_p_scale: Optional[float] = None
     pitch_d_scale: Optional[float] = None
+    # Optional lateral trim contract. In CENTER/APPROACH the offset setpoint is
+    # the geometric image displacement caused by the previous shaped camera
+    # tilt and acceleration feedforward remains zero. FINAL_PROBE disables P,
+    # activates/adapts the static acceleration trim, and DESCENT carries the
+    # final value frozen alongside the optical-flow D branch.
+    roll_offset_setpoint: float = 0.0
+    pitch_offset_setpoint: float = 0.0
+    roll_accel_feedforward_m_s2: float = 0.0
+    pitch_accel_feedforward_m_s2: float = 0.0
     enable_integral: bool = True
     substate: str = CENTER
     effects: tuple[ControlEffect, ...] = ()
@@ -174,6 +198,10 @@ class MissionControl:
             "roll_d_scale": self.roll_d_scale,
             "pitch_p_scale": self.pitch_p_scale,
             "pitch_d_scale": self.pitch_d_scale,
+            "roll_offset_setpoint": self.roll_offset_setpoint,
+            "pitch_offset_setpoint": self.pitch_offset_setpoint,
+            "roll_accel_feedforward_m_s2": self.roll_accel_feedforward_m_s2,
+            "pitch_accel_feedforward_m_s2": self.pitch_accel_feedforward_m_s2,
             "enable_integral": self.enable_integral,
         }
 
@@ -197,6 +225,10 @@ class MissionControl:
             f"K={float(self.thrust_gain_override or 0.0):.4f}, "
             f"RP/RD={float(roll_p):.4f}/{float(roll_d):.4f}, "
             f"PP/PD={float(pitch_p):.4f}/{float(pitch_d):.4f}, "
+            f"trim=({float(self.roll_offset_setpoint):+.3f},"
+            f"{float(self.pitch_offset_setpoint):+.3f}), "
+            f"ff=({float(self.roll_accel_feedforward_m_s2):+.3f},"
+            f"{float(self.pitch_accel_feedforward_m_s2):+.3f}) m/s^2, "
             f"integral={int(bool(self.enable_integral))}"
         )
 

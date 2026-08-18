@@ -1,8 +1,9 @@
-"""Controller-event and Gazebo-truth CSV logging.
+"""Controller-event, Gazebo-truth and wind-command CSV logging.
 
 The controller CSV records what the visual controller knew and commanded.
 The truth CSV records every atomic Gazebo truth packet without reconstruction.
-The two files share a run id and are merged later by ``analyse_log.py`` on
+The wind CSV records every bridged WindController diagnostic packet.
+All three files share a run id and are merged later by ``analyse_log.py`` on
 Gazebo SIM time.
 
 Schema ownership
@@ -18,8 +19,9 @@ Two failure modes that used to be silent are now loud:
   instead of being dropped (the old ``if col in row`` guard);
 * two sources claiming the same column name raise at construction.
 
-The truth sink is unchanged: its layout comes from ``truth_layout.TRUTH_FIELDS``,
-which is already a single source of truth shared with the Gazebo plugin.
+The dense diagnostic sinks keep independent schemas: physical truth comes from
+``truth_layout.TRUTH_FIELDS`` and commanded wind from ``wind_layout.WIND_FIELDS``.
+Neither schema is mixed into the controller log.
 """
 from __future__ import annotations
 
@@ -37,8 +39,11 @@ from bee_control.diagnostics.telemetry import (
     snapshot,
 )
 from bee_control.diagnostics.truth_layout import TRUTH_FIELDS
+from bee_control.diagnostics.wind_layout import WIND_FIELDS
+
+
 class _AsyncCsvSink:
-    """Small non-blocking CSV sink used for the dense truth stream."""
+    """Small non-blocking CSV sink used for dense diagnostic streams."""
 
     def __init__(self, path: Path, fieldnames, *, queue_size: int = 2048,
                  flush_every_rows: int = 100):
@@ -56,8 +61,7 @@ class _AsyncCsvSink:
         try:
             self._queue.put_nowait(dict(row))
         except queue.Full:
-            # Truth is dense. Dropping a row under pathological disk pressure is
-            # safer than blocking the ROS executor / controller.
+            # Diagnostic streams must never block the ROS executor / controller.
             self.dropped_rows += 1
 
     def close(self):
@@ -89,6 +93,7 @@ class DiagnosticsWriter:
     #: per-run fingerprint below covers accidental column drift automatically.
     CONTROLLER_SCHEMA_VERSION = "6.0-controller"
     TRUTH_LOG_SCHEMA_VERSION = "1.0-truth-log"
+    WIND_LOG_SCHEMA_VERSION = "1.0-wind-log"
 
     #: Columns this writer owns outright. Everything else comes from sources.
     BASE_FIELDS = (
@@ -105,7 +110,8 @@ class DiagnosticsWriter:
     def __init__(self, sources: Sequence[TelemetrySource], output_dir="logs",
                  filename=None, *, strict: bool = True,
                  controller_flush_every_rows: int = 25,
-                 truth_queue_size: int = 2048):
+                 truth_queue_size: int = 2048,
+                 wind_queue_size: int = 2048):
         self._sources = list(sources)
         self._strict = bool(strict)
 
@@ -122,13 +128,18 @@ class DiagnosticsWriter:
         filename = filename or f"bee_controller_{run_id}.csv"
         controller_path = root / filename
         if filename.startswith("bee_controller_"):
-            truth_name = "bee_truth_" + filename[len("bee_controller_"):]
+            suffix = filename[len("bee_controller_"):]
+            truth_name = "bee_truth_" + suffix
+            wind_name = "bee_wind_" + suffix
         else:
             truth_name = f"bee_truth_{run_id}.csv"
+            wind_name = f"bee_wind_{run_id}.csv"
         truth_path = root / truth_name
+        wind_path = root / wind_name
 
         self.filepath = str(controller_path)
         self.truth_filepath = str(truth_path)
+        self.wind_filepath = str(wind_path)
         self._start_wall = time.time()
         self._start_mono = time.monotonic()
         self._controller_flush_every_rows = max(1, int(controller_flush_every_rows))
@@ -148,6 +159,16 @@ class DiagnosticsWriter:
             queue_size=truth_queue_size,
             flush_every_rows=100,
         )
+        self._wind_sink = _AsyncCsvSink(
+            wind_path,
+            [
+                "wind_log_schema_version",
+                "wind_receipt_wall_timestamp_sec",
+                "wind_receipt_monotonic_timestamp_sec",
+            ] + list(WIND_FIELDS),
+            queue_size=wind_queue_size,
+            flush_every_rows=100,
+        )
 
     @property
     def fieldnames(self) -> Sequence[str]:
@@ -156,6 +177,10 @@ class DiagnosticsWriter:
     @property
     def truth_dropped_rows(self) -> int:
         return int(self._truth_sink.dropped_rows)
+
+    @property
+    def wind_dropped_rows(self) -> int:
+        return int(self._wind_sink.dropped_rows)
 
     def write_truth(self, truth: Mapping, *, receipt_wall_sec: float,
                     receipt_monotonic_sec: float):
@@ -166,6 +191,16 @@ class DiagnosticsWriter:
         }
         row.update(truth)
         self._truth_sink.submit(row)
+
+    def write_wind(self, wind: Mapping, *, receipt_wall_sec: float,
+                   receipt_monotonic_sec: float):
+        row = {
+            "wind_log_schema_version": self.WIND_LOG_SCHEMA_VERSION,
+            "wind_receipt_wall_timestamp_sec": float(receipt_wall_sec),
+            "wind_receipt_monotonic_timestamp_sec": float(receipt_monotonic_sec),
+        }
+        row.update(wind)
+        self._wind_sink.submit(row)
 
     def write(self, *, event: str = "", event_detail: str = "",
               controller_phase: str = ""):
@@ -191,6 +226,7 @@ class DiagnosticsWriter:
 
     def close(self):
         self._truth_sink.close()
+        self._wind_sink.close()
         if not self._controller_file.closed:
             self._controller_file.flush()
             self._controller_file.close()

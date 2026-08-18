@@ -42,6 +42,9 @@ ln -s ~/PX4-Autopilot/BEE_LAND/plugins/oscillating_platform_controller \
 ln -s ~/PX4-Autopilot/BEE_LAND/plugins/bee_landing_truth \
       ~/PX4-Autopilot/src/modules/simulation/gz_plugins/bee_landing_truth
 
+ln -s ~/PX4-Autopilot/BEE_LAND/plugins/wind_controller \
+      ~/PX4-Autopilot/src/modules/simulation/gz_plugins/wind_controller
+
 # Custom drone model (bee_x500, with camera/IMU) → must live under Tools/simulation/gz/models/
 ln -s ~/PX4-Autopilot/BEE_LAND/models/bee_x500 \
       ~/PX4-Autopilot/Tools/simulation/gz/models/bee_x500

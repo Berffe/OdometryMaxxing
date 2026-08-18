@@ -13,6 +13,7 @@ exec ros2 run ros_gz_bridge parameter_bridge \
   /platform/pose@geometry_msgs/msg/Pose[gz.msgs.Pose \
   /bee_platform/touched@std_msgs/msg/Bool[gz.msgs.Boolean \
   /bee_land/truth@ros_gz_interfaces/msg/Float32Array[gz.msgs.Float_V \
+  /bee_land/wind_cmd@ros_gz_interfaces/msg/Float32Array[gz.msgs.Float_V \
   "${GEAR_LEFT_GZ}@ros_gz_interfaces/msg/Contacts[gz.msgs.Contacts" \
   "${GEAR_RIGHT_GZ}@ros_gz_interfaces/msg/Contacts[gz.msgs.Contacts" \
   --ros-args \

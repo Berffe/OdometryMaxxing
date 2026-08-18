@@ -284,6 +284,10 @@ class ControlLaw:
         roll_d_scale: Optional[float] = None,
         pitch_p_scale: Optional[float] = None,
         pitch_d_scale: Optional[float] = None,
+        roll_offset_setpoint: float = 0.0,
+        pitch_offset_setpoint: float = 0.0,
+        roll_accel_feedforward_m_s2: float = 0.0,
+        pitch_accel_feedforward_m_s2: float = 0.0,
         enable_integral: bool = True,
     ) -> AttitudeSetpoint:
         """Desired roll/pitch/yaw/thrust from visual data only.
@@ -301,6 +305,12 @@ class ControlLaw:
         roll_p_scale / roll_d_scale / pitch_p_scale / pitch_d_scale:
             optional per-axis overrides used by the independent lateral schedules.
             When omitted, the shared values preserve the existing callouts.
+        roll_offset_setpoint / pitch_offset_setpoint:
+            normalized image trim about which the lateral P feedback acts. Zero
+            preserves the legacy controller.
+        roll_accel_feedforward_m_s2 / pitch_accel_feedforward_m_s2:
+            acceleration-domain static trim carried separately from the scheduled
+            dynamic feedback. Zero preserves the legacy controller.
         enable_integral: when False, the divergence integral neither accumulates
             nor contributes to the vertical thrust component this tick.
         """
@@ -319,27 +329,52 @@ class ControlLaw:
             flow_y = float(getattr(flow, "mean_flow_y_norm", 0.0)) if flow_valid else 0.0
             offset_x = float(target.offset_x)
             offset_y = float(target.offset_y)
+            roll_error = offset_x - float(roll_offset_setpoint)
+            pitch_error = offset_y - float(pitch_offset_setpoint)
 
             # Error-magnitude blend protects both axes against authority
             # saturation, while the mission may now schedule roll and pitch
             # independently after the three-axis feasibility probe.
-            err_scale = self._offset_magnitude_gain_scale(offset_x, offset_y)
-            roll_p = lateral_p_scale if roll_p_scale is None else roll_p_scale
-            roll_d = lateral_d_scale if roll_d_scale is None else roll_d_scale
-            pitch_p = lateral_p_scale if pitch_p_scale is None else pitch_p_scale
-            pitch_d = lateral_d_scale if pitch_d_scale is None else pitch_d_scale
-            roll_p = max(0.0, float(roll_p)) * err_scale
-            roll_d = max(0.0, float(roll_d)) * err_scale
-            pitch_p = max(0.0, float(pitch_p)) * err_scale
-            pitch_d = max(0.0, float(pitch_d)) * err_scale
+            err_scale = self._offset_magnitude_gain_scale(roll_error, pitch_error)
+            roll_p = max(0.0, float(
+                lateral_p_scale if roll_p_scale is None else roll_p_scale
+            ))
+            roll_d = max(0.0, float(
+                lateral_d_scale if roll_d_scale is None else roll_d_scale
+            ))
+            pitch_p = max(0.0, float(
+                lateral_p_scale if pitch_p_scale is None else pitch_p_scale
+            ))
+            pitch_d = max(0.0, float(
+                lateral_d_scale if pitch_d_scale is None else pitch_d_scale
+            ))
 
-            roll_accel_cmd = self._roll_output_sign * -(
-                self._roll_kp * roll_p * offset_x
-                + self._roll_kd * roll_d * flow_x
+            # The large-offset blend exists to keep the FAR-FIELD compound P+D
+            # request out of the collapsing-gain part of the angle soft limit.
+            # Once a mission phase disables position P (FINAL_PROBE onward),
+            # image offset is intentionally no longer trusted.  Do not let that
+            # same saturated/unreliable offset attenuate the optical-flow D
+            # branch that now owns lateral tracking.
+            roll_p_active = roll_p > 1e-12
+            pitch_p_active = pitch_p > 1e-12
+            roll_p *= err_scale
+            pitch_p *= err_scale
+            if roll_p_active:
+                roll_d *= err_scale
+            if pitch_p_active:
+                pitch_d *= err_scale
+
+            roll_accel_cmd = float(roll_accel_feedforward_m_s2) + (
+                self._roll_output_sign * -(
+                    self._roll_kp * roll_p * roll_error
+                    + self._roll_kd * roll_d * flow_x
+                )
             )
-            pitch_accel_cmd = self._pitch_output_sign * -(
-                self._pitch_kp * pitch_p * offset_y
-                + self._pitch_kd * pitch_d * flow_y
+            pitch_accel_cmd = float(pitch_accel_feedforward_m_s2) + (
+                self._pitch_output_sign * -(
+                    self._pitch_kp * pitch_p * pitch_error
+                    + self._pitch_kd * pitch_d * flow_y
+                )
             )
 
         # --- Vertical axis: accel-domain divergence law -> vertical thrust component. ---

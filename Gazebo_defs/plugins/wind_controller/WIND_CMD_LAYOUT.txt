@@ -1,0 +1,15 @@
+/bee_land/wind_cmd  (gz.msgs.Float_V), schema 1
+
+0  schema_version
+1  sequence
+2  sim_time_sec
+3  enabled
+4  command_x_enu_m_s
+5  command_y_enu_m_s
+6  command_z_enu_m_s
+7  command_norm_m_s
+8  raw_x_enu_m_s
+9  raw_y_enu_m_s
+10 raw_z_enu_m_s
+11 raw_norm_m_s
+12 clamped

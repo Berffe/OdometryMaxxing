@@ -1,9 +1,9 @@
 """Command-acceleration probe: de-biasing, rolling percentile, leaky peak.
 
-Three instances run in parallel (vertical, roll, pitch) from APPROACH_PROBE
-through FINAL_PROBE. They measure the THRUST-COMMAND RESIDUAL, never a physical
-acceleration -- that provenance is what makes the feasibility argument valid
-without any truth data reaching the controller.
+Three instances run in parallel (vertical, roll, pitch). APPROACH_PROBE uses
+them for diagnostics; FINAL_PROBE resets them and is the only phase whose
+envelopes feed the feasibility gates. They measure the THRUST-COMMAND RESIDUAL,
+never a physical acceleration.
 """
 from __future__ import annotations
 
@@ -30,9 +30,9 @@ class ThrustModel:
 class ProbeResult:
     peak_accel: float = 0.0
     n_samples: int = 0
-    duration_sec: float = 0.0        # elapsed in the CURRENT phase (since the last retune)
-    total_duration_sec: float = 0.0  # elapsed since the probe started (across the retune)
-    ready: bool = False              # both duration requirements met
+    duration_sec: float = 0.0
+    total_duration_sec: float = 0.0  # diagnostic elapsed time since the latest reset
+    ready: bool = False
 
 
 class PlatformProbe:
@@ -204,23 +204,13 @@ class PlatformProbe:
         decay = math.exp(-dt / max(1e-3, self._peak_decay_tau))
         self._peak = max(protected_peak, decay * self._peak)
 
-    def result(
-        self,
-        min_duration_sec: float,
-        min_total_duration_sec: float = 0.0,
-    ) -> ProbeResult:
-        """ready requires BOTH: enough time in the current phase (min_duration_sec,
-        e.g. the near-field hold) AND enough total probing (min_total_duration_sec,
-        e.g. about one platform period, which the near-field hold alone is far too
-        short to provide)."""
+    def result(self, min_duration_sec: float) -> ProbeResult:
+        """Return the current phase-local envelope and readiness."""
         return ProbeResult(
             peak_accel=float(self._peak),
             n_samples=int(self._n),
             duration_sec=float(self._elapsed),
             total_duration_sec=float(self._total_elapsed),
-            ready=(
-                self._elapsed >= float(min_duration_sec)
-                and self._total_elapsed >= float(min_total_duration_sec)
-            ),
+            ready=self._elapsed >= float(min_duration_sec),
         )
 

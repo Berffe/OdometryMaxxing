@@ -7,17 +7,17 @@
 	<magnetic_field>5.5645e-06 2.28758e-05 -4.23884e-05</magnetic_field>
 
 	<!-- =======================================================================
-	     SIMPLE WIND TEST CASE
+	     DETERMINISTIC WIND CONTROLLER
 
 	     World frame is ENU:
 	       +X = East, +Y = North, +Z = Up
 
-	     Mean wind: 0.5 m/s toward +X (East).
-	     WindEffects below adds deterministic oscillations in horizontal
-	     magnitude and direction. No stochastic noise is used in this first test.
+	     The <wind> element creates Gazebo's world wind entity. WindController
+	     publishes its time-varying velocity seed; WindEffects applies the
+	     resulting force to links with <enable_wind>true</enable_wind>.
 	     ======================================================================= -->
 	<wind>
-		<linear_velocity>0.5 0.0 0.0</linear_velocity>
+		<linear_velocity>0.0 0.0 0.0</linear_velocity>
 	</wind>
 
 	<plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
@@ -30,38 +30,6 @@
 	<plugin filename="gz-sim-magnetometer-system" name="gz::sim::systems::Magnetometer"/>
 	<plugin filename="gz-sim-navsat-system" name="gz::sim::systems::NavSat"/>
 
-	<!-- Gazebo world-level wind force model.
-	     Horizontal magnitude: 2.0 m/s mean with +/-25% sinusoidal variation
-	                           (1.5 to 2.5 m/s), period 8 s.
-	     Horizontal direction: mean +X, oscillating +/-15 deg, period 12 s.
-	     Rise time: 1 s.
-	     No random noise in this first deterministic test. -->
-	<plugin filename="gz-sim-wind-effects-system" name="gz::sim::systems::WindEffects">
-		<force_approximation_scaling_factor>1.0</force_approximation_scaling_factor>
-
-		<horizontal>
-			<magnitude>
-				<time_for_rise>1.0</time_for_rise>
-				<sin>
-					<amplitude_percent>0.25</amplitude_percent>
-					<period>8.0</period>
-				</sin>
-			</magnitude>
-
-			<direction>
-				<time_for_rise>1.0</time_for_rise>
-				<sin>
-					<amplitude>15.0</amplitude>
-					<period>12.0</period>
-				</sin>
-			</direction>
-		</horizontal>
-
-		<vertical>
-			<time_for_rise>1.0</time_for_rise>
-		</vertical>
-	</plugin>
-	
 	<spherical_coordinates>
 	<surface_model>EARTH_WGS84</surface_model>
 	<world_frame_orientation>ENU</world_frame_orientation>
@@ -214,32 +182,195 @@
 
 
 
-	<!-- ---------------------------------------------------------------------------
-		B. Deterministic multi-frequency composition.
+	<!-- ================================================================
+		COHERENT MARINE ENVIRONMENT
+		Wind -> wind sea -> correlated vessel response
+		================================================================ -->
 
-			Hand-written components, no RNG involved. Useful as the intermediate
-			step between a single sinusoid and a stochastic family: the disturbance
-			is richer but every line of it is stated explicitly in the paper.
-		--------------------------------------------------------------------------- -->
-	<plugin filename="libOscillatingPlatformController.so" name="custom::OscillatingPlatformController">
+	<!-- Atmospheric wind.
+		Use realistic-ish environmental velocity, but reduce Gazebo's
+		linear force coefficient so the drone disturbance remains sensible. -->
+	<plugin filename="libWindController.so"
+			name="custom::WindController">
+
+		<enabled>true</enabled>
+		<seed>42</seed>
+
+		<!-- prevailing wind -->
+		<mean_velocity>6.0 0.0 0.0</mean_velocity>
+
+		<!-- slow atmospheric gust, NOT wave-frequency vessel motion -->
+		<axis_x>
+			<component>
+				<amplitude>0.60</amplitude>
+				<frequency>0.030</frequency>
+				<phase>0.0</phase>
+			</component>
+		</axis_x>
+
+		<axis_y>
+			<component>
+				<amplitude>0.25</amplitude>
+				<frequency>0.020</frequency>
+				<phase>1.2</phase>
+			</component>
+		</axis_y>
+
+		<axis_z/>
+
+		<max_wind_speed>8.0</max_wind_speed>
+
+		<wind_topic>/world/bee_platform/wind</wind_topic>
+		<truth_topic>/bee_land/wind_cmd</truth_topic>
+	</plugin>
+
+	<!-- Gazebo's force model is very strong at k=1.
+		k=0.08 gives ~0.48 m/s² at 6 m/s when nearly stationary. -->
+	<plugin filename="gz-sim-wind-effects-system"
+			name="gz::sim::systems::WindEffects">
+
+		<force_approximation_scaling_factor>
+			0.08
+		</force_approximation_scaling_factor>
+
+		<horizontal>
+			<magnitude>
+				<time_for_rise>0.004</time_for_rise>
+			</magnitude>
+			<direction>
+				<time_for_rise>0.004</time_for_rise>
+			</direction>
+		</horizontal>
+
+		<vertical>
+			<time_for_rise>0.004</time_for_rise>
+		</vertical>
+	</plugin>
+
+
+	<!-- ================================================================
+		SHIP RESPONSE
+
+		Underlying representative wave components:
+
+		f1 = 0.10 Hz
+		f2 = 0.16 Hz   <-- dominant
+		f3 = 0.22 Hz
+
+		Base wave phases:
+		phi = 0.4, 2.0, 4.4 rad
+
+		Every ship DOF uses THESE SAME frequencies.
+		Amplitude and phase offsets approximate different RAOs.
+		================================================================ -->
+
+	<plugin filename="libOscillatingPlatformController.so"
+			name="custom::OscillatingPlatformController">
+
 		<link_name>platform_link</link_name>
 
+		<!-- SURGE: waves mainly arriving along X -->
 		<axis_x>
-			<component><amplitude>0.30</amplitude><frequency>0.070</frequency><phase>3.5</phase></component>
-			<component><amplitude>0.06</amplitude><frequency>0.150</frequency><phase>1.0</phase></component>
+			<component>
+				<amplitude>0.050</amplitude>
+				<frequency>0.10</frequency>
+				<phase>1.40</phase>
+			</component>
+			<component>
+				<amplitude>0.040</amplitude>
+				<frequency>0.16</frequency>
+				<phase>3.00</phase>
+			</component>
+			<component>
+				<amplitude>0.020</amplitude>
+				<frequency>0.22</frequency>
+				<phase>5.40</phase>
+			</component>
 		</axis_x>
+
+		<!-- SWAY: smaller response for nearly head-on sea -->
 		<axis_y>
-			<component><amplitude>0.20</amplitude><frequency>0.050</frequency><phase>0.5</phase></component>
-			<component><amplitude>0.08</amplitude><frequency>0.190</frequency><phase>1.1</phase></component>
+			<component>
+				<amplitude>0.015</amplitude>
+				<frequency>0.10</frequency>
+				<phase>1.90</phase>
+			</component>
+			<component>
+				<amplitude>0.015</amplitude>
+				<frequency>0.16</frequency>
+				<phase>3.50</phase>
+			</component>
+			<component>
+				<amplitude>0.010</amplitude>
+				<frequency>0.22</frequency>
+				<phase>5.90</phase>
+			</component>
 		</axis_y>
+
+		<!-- HEAVE: strongest translational wave response -->
 		<axis_z>
-			<component><amplitude>0.40</amplitude><frequency>0.080</frequency><phase>1.7</phase></component>
-			<component><amplitude>0.25</amplitude><frequency>0.190</frequency><phase>3.0</phase></component>
+			<component>
+				<amplitude>0.10</amplitude>
+				<frequency>0.10</frequency>
+				<phase>0.50</phase>
+			</component>
+			<component>
+				<amplitude>0.18</amplitude>
+				<frequency>0.16</frequency>
+				<phase>2.10</phase>
+			</component>
+			<component>
+				<amplitude>0.06</amplitude>
+				<frequency>0.22</frequency>
+				<phase>4.50</phase>
+			</component>
 		</axis_z>
+
+		<!-- Small roll from slightly oblique sea -->
+		<axis_roll>
+			<component>
+				<amplitude>0.0087</amplitude> <!-- 0.5 deg -->
+				<frequency>0.10</frequency>
+				<phase>1.60</phase>
+			</component>
+			<component>
+				<amplitude>0.0140</amplitude> <!-- 0.8 deg -->
+				<frequency>0.16</frequency>
+				<phase>3.20</phase>
+			</component>
+			<component>
+				<amplitude>0.0052</amplitude> <!-- 0.3 deg -->
+				<frequency>0.22</frequency>
+				<phase>5.60</phase>
+			</component>
+		</axis_roll>
+
+		<!-- Pitch naturally stronger in a mainly head-on sea -->
+		<axis_pitch>
+			<component>
+				<amplitude>0.0175</amplitude> <!-- 1.0 deg -->
+				<frequency>0.10</frequency>
+				<phase>0.90</phase>
+			</component>
+			<component>
+				<amplitude>0.0349</amplitude> <!-- 2.0 deg -->
+				<frequency>0.16</frequency>
+				<phase>2.50</phase>
+			</component>
+			<component>
+				<amplitude>0.0122</amplitude> <!-- 0.7 deg -->
+				<frequency>0.22</frequency>
+				<phase>4.90</phase>
+			</component>
+		</axis_pitch>
 
 		<position_gain>20.0</position_gain>
 		<max_linear_velocity>5.0</max_linear_velocity>
-		<angular_enabled>false</angular_enabled>
+
+		<angular_enabled>true</angular_enabled>
+		<angular_gain>10.0</angular_gain>
+		<max_angular_velocity>1.0</max_angular_velocity>
+
 	</plugin>
 
 

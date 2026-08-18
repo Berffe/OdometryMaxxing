@@ -33,8 +33,10 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
     return MissionControl(
         divergence_setpoint=0.0,
         thrust_gain_override=routine._compute_probe_gain(),
-        lateral_p_scale=routine._probe_lateral_p_scale,
+        lateral_p_scale=0.0,
         lateral_d_scale=routine._probe_lateral_d_scale,
+        roll_accel_feedforward_m_s2=routine._final_probe_roll_accel_bias,
+        pitch_accel_feedforward_m_s2=routine._final_probe_pitch_accel_bias,
         enable_integral=True,
         substate=INFEASIBLE,
         info={

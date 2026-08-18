@@ -64,15 +64,15 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
         pitch_k / routine.pitch_gate.k_descend_start
         if routine.pitch_gate.k_descend_start > 1e-9 else 1.0
     )
-    roll_p_scale = routine._probe_lateral_p_scale * roll_ratio
+    roll_p_scale = 0.0
     roll_d_scale = routine._probe_lateral_d_scale * roll_ratio
-    pitch_p_scale = routine._probe_lateral_p_scale * pitch_ratio
+    pitch_p_scale = 0.0
     pitch_d_scale = routine._probe_lateral_d_scale * pitch_ratio
 
     # Legacy shared fields remain populated for compatibility and represent the
     # most demanding active lateral axis. ControlLaw receives the specific
     # per-axis fields below.
-    lateral_p_scale = max(roll_p_scale, pitch_p_scale)
+    lateral_p_scale = 0.0
     lateral_d_scale = max(roll_d_scale, pitch_d_scale)
     h_pred = predicted_height(routine._h0, routine._d_star, elapsed, routine._descent_d_star_ramp_in)
 
@@ -93,6 +93,15 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
         roll_d_scale=roll_d_scale,
         pitch_p_scale=pitch_p_scale,
         pitch_d_scale=pitch_d_scale,
+        # Near field is deliberately flow-only in feedback: the static wind
+        # trim was adapted throughout FINAL_PROBE, carried bumplessly across the
+        # descent commitment, and may continue adapting slowly as wind changes.
+        # Saturated image position has zero command authority from FINAL_PROBE
+        # onward.
+        roll_offset_setpoint=0.0,
+        pitch_offset_setpoint=0.0,
+        roll_accel_feedforward_m_s2=routine._descent_roll_accel_bias,
+        pitch_accel_feedforward_m_s2=routine._descent_pitch_accel_bias,
         enable_integral=False,
         substate=DESCEND,
         # DESCEND starts with no inherited vertical bias, and further integral
@@ -131,6 +140,10 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
             "roll_d_scale": roll_d_scale,
             "pitch_p_scale": pitch_p_scale,
             "pitch_d_scale": pitch_d_scale,
+            "descent_trim_offset_x": routine._descent_trim_offset_x,
+            "descent_trim_offset_y": routine._descent_trim_offset_y,
+            "descent_roll_accel_bias_m_s2": routine._descent_roll_accel_bias,
+            "descent_pitch_accel_bias_m_s2": routine._descent_pitch_accel_bias,
             "elapsed_sec": elapsed,
             "t_crit_sec": critical_time(
                 routine._h0,

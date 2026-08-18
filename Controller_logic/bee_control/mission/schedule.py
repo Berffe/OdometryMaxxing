@@ -33,6 +33,16 @@ def commanded_divergence_integral(
     return d * (t - 0.5 * T)
 
 
+def scheduled_gain_from_integral(
+    commanded_divergence_integral: float,
+    k_floor: float,
+    k_explore: float,
+) -> float:
+    """Monotone gain schedule from an already accumulated commanded divergence."""
+    exponent = max(0.0, float(commanded_divergence_integral))
+    decay = math.exp(-exponent)
+    return max(float(k_floor), min(float(k_explore), float(k_explore) * decay))
+
 def scheduled_gain_at_time(
     elapsed_sec: float,
     descent_divergence_setpoint: float,
@@ -58,8 +68,7 @@ def scheduled_gain_at_time(
     exponent = commanded_divergence_integral(
         elapsed_sec, descent_divergence_setpoint, d_star_ramp_in_sec
     )
-    decay = math.exp(-exponent)
-    return max(float(k_floor), min(float(k_explore), float(k_explore) * decay))
+    return scheduled_gain_from_integral(exponent, k_floor, k_explore)
 
 
 def critical_time(

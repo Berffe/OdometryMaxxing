@@ -40,7 +40,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field, fields, replace
-from typing import Any, Mapping
+from typing import Any, Mapping, Optional
 
 
 # --------------------------------------------------------------------------
@@ -52,6 +52,7 @@ from typing import Any, Mapping
 class TopicsConfig:
     camera: str = "/bee_x500/camera/image"
     truth: str = "/bee_land/truth"
+    wind: str = "/bee_land/wind_cmd"
     # PX4 renames these across releases; every candidate is subscribed and the
     # one that exists wins. Order is newest-first, purely cosmetic.
     vehicle_status: tuple[str, ...] = (
@@ -154,10 +155,14 @@ class CameraConfig:
 class ControlConfig:
     """Constant PD gains handed to ``ControlLaw`` (acceleration domain)."""
 
-    roll_kp: float = 5.0
-    roll_kd: float = 3.5
-    pitch_kp: float = 5.0
-    pitch_kd: float = 3.5
+    # Retuned after the 2026-08-18 wind run.  The previous 5.0 / 3.5 pair
+    # produced a visibly oscillatory CENTER capture.  The reduced proportional
+    # authority is the main damping change; D remains high enough to dissipate
+    # lateral motion without approaching the theoretical near-field ceiling.
+    roll_kp: float = 4.0
+    roll_kd: float = 3.0
+    pitch_kp: float = 4.0
+    pitch_kd: float = 3.0
 
 
 @dataclass(frozen=True)
@@ -198,23 +203,33 @@ class MissionConfig:
     descent_divergence_setpoint: float = 0.30
     descent_d_star_ramp_in_sec: float = 6.0
 
-    # --- Phase durations / triggers ---
-    final_probe_duration_sec: float = 2.0 * PROBE_DESIGN_PERIOD_SEC
-    final_probe_entry_ramp_sec: float = 1.5
-    fov_near_area_fraction: float = 0.8
-    probe_min_duration_sec: float = 3.0 * PROBE_DESIGN_PERIOD_SEC
+    # --- APPROACH visual-height hold / FINAL_PROBE timing ---
+    # APPROACH_PROBE keeps the nominal far-field divergence command until this
+    # slow outer loop begins braking on visual scale.  For a planar target,
+    # q = 0.5*ln(area_fraction) is a log-linear range coordinate and q_dot is
+    # the same expansion-rate quantity regulated by the inner vertical PI.
+    approach_hold_area_fraction: float = 0.70
+    approach_visual_p_gain_1_s: float = 0.50
+    approach_retreat_divergence_limit: float = 0.03
+    approach_hold_log_scale_tolerance: float = 0.05
+    approach_hold_divergence_tolerance_1_s: float = 0.1
+    approach_hold_dwell_sec: float = 0.75
+
+    # FINAL_PROBE starts only after APPROACH has already established the visual
+    # height hold and near-zero divergence.  Its measurements alone feed gates.
+    final_probe_duration_sec: float = 3.0 * PROBE_DESIGN_PERIOD_SEC
 
     # --- Geometry / feasibility ---
     leg_clearance_m: float = 0.182
     ceiling_safety_factor: float = 0.6
     # k(t) decays toward max(k_min, ceiling_margin * k_ceiling_leg) rather than
-    # toward k_min: settle at 70% of the ALREADY safety-derated ceiling. This
+    # toward k_min: settle at 50% of the ALREADY safety-derated ceiling. This
     # is the second of two multiplicative margins, not the only one.
-    ceiling_margin: float = 0.6
-    # Height at which the near-field trigger actually fires. ANCHOR of the
-    # whole gain schedule. A CAMERA-GEOMETRY constant (target diameter vs FOV),
-    # calibratable from a log: read relative_z_m at FINAL_PROBE entry.
-    near_field_height_m: float = 0.5
+    ceiling_margin: float = 0.50
+    # Height corresponding to the APPROACH visual-hold / FINAL_PROBE handoff.
+    # This is a camera-geometry calibration used only by the feasibility bounds;
+    # update it from truth logs whenever approach_hold_area_fraction changes.
+    near_field_height_m: float = 0.32
 
     # --- Gains handed to the schedule ---
     initial_thrust_gain: float = 6.50
@@ -234,21 +249,16 @@ class MissionConfig:
     pitch_flow_admissible_norm_s: float = 0.4
     max_closing_speed_m_s: float = 0.05
 
-    # --- Probe conditioning: FAR field (APPROACH_PROBE) ---
-    # Sized against the PLATFORM period, not the control rate: this phase
-    # exists precisely to see the slow oscillation the short near-field hold
-    # structurally cannot.
+    # --- Probe conditioning: APPROACH diagnostics ---
     far_probe_window_sec: float = 1.5 * PROBE_DESIGN_PERIOD_SEC
     far_probe_decay_tau_sec: float = 1.5 * PROBE_DESIGN_PERIOD_SEC
     far_probe_highpass_tau_sec: float = 4.0 * PROBE_DESIGN_PERIOD_SEC
 
-    # --- Probe conditioning: NEAR field (FINAL_PROBE hold, after retune) ---
-    # near_probe_decay_tau_sec is the handoff knob: how fast the carried
-    # far-field estimate is forgotten. Long on purpose -- an under-estimated
-    # peak_accel gives a too-low k_min and a too-permissive gate, so forgetting
-    # slowly is the conservative direction.
+    # --- Probe conditioning: FINAL_PROBE gate evidence ---
+    # FINAL_PROBE resets all three acceleration probes before applying these
+    # near-field constants, so no APPROACH envelope can enter a gate.
     near_probe_window_sec: float = 0.6 * PROBE_DESIGN_PERIOD_SEC
-    near_probe_decay_tau_sec: float = PROBE_DESIGN_PERIOD_SEC
+    near_probe_decay_tau_sec: float = 1.5 * PROBE_DESIGN_PERIOD_SEC
     near_probe_highpass_tau_sec: float = 2.0 * PROBE_DESIGN_PERIOD_SEC
 
     # Additive m/s^2 floors: unmodeled perturbation + ground effect + cold start.
@@ -261,23 +271,100 @@ class MissionConfig:
     # --- CENTER phase ---
     enable_center: bool = True
     enable_center_condition_gate: bool = True
-    center_condition_dwell_sec: float = 0.75
-    center_offset_radius_max: float = 0.12
-    center_flow_radius_max_norm_s: float = 0.25
+    # Require a genuinely settled lateral state before starting the approach.
+    # The raw trim radius is intentionally left permissive because steady wind
+    # plus camera tilt creates a legitimate non-zero visual operating point;
+    # strictness is applied to residual motion, optical flow and dwell instead.
+    center_condition_dwell_sec: float = 1.50
+    # Final CENTER criterion in the geometric-tilt-compensated frame:
+    # radius of (measured target offset - image location of the world-vertical
+    # ray through the camera).  Unlike the raw image offset, this SHOULD tend to
+    # zero when the adaptive visual centre has brought the platform physically
+    # underneath the vehicle.
+    center_offset_radius_max: float = 0.05
+    center_flow_radius_max_norm_s: float = 0.10
     center_timeout_sec: float = 20.0
     # Timeout stays diagnostic by default: never leave CENTER merely because
     # the clock expired while the target is still moving / off-centre.
-    center_timeout_allows_handoff: bool = True
+    center_timeout_allows_handoff: bool = False
     # Legacy box-threshold gate, used only when the condition gate is off.
-    center_offset_threshold: float = 0.10
+    center_offset_threshold: float = 0.25
     center_dwell_sec: float = 2.0
 
+    # --- Lateral visual trim ---
+    # A PD lateral loop with no integrator rejects a steady wind only by
+    # holding a steady image offset. The trim estimators themselves stay
+    # passive; CENTER feeds the geometric physical-trim mean to the separate
+    # slow VisualCenterAdaptation outer loop below.
+    #
+    # These were previously read out of MissionConfig with getattr() defaults,
+    # which meant they could never actually be set: with_overrides() rejects
+    # names that are not declared fields, so every run silently used the
+    # hardcoded fallback. They are real fields now.
+    #
+    # CENTER gate estimator: short, because it has to settle inside the
+    # handoff dwell window.
+    center_trim_tau_sec: float = 1.0
+    # None means DERIVE as max(center_offset_radius_max, center_offset_threshold).
+    # This is the permissive RAW-image bound used only while identifying the
+    # initial steady PD equilibrium; it is intentionally looser than the final
+    # physical-centering bound above. With the defaults below it resolves to 0.25.
+    center_trim_mean_radius_max: Optional[float] = None
+    center_trim_residual_radius_max: float = 0.06
+
+    # --- Adaptive physical visual centre ---
+    # CENTER and APPROACH_PROBE continuously move the visual setpoint so the
+    # non-zero P error required to reject steady wind is retained while the
+    # tilt-corrected physical centring error tends to zero. The estimator is
+    # frozen only when FINAL_PROBE removes lateral P authority. This outer
+    # adaptation must remain slower than the lateral P/D loop.
+    center_visual_adaptation_tau_sec: float = 5.0
+    center_visual_adaptation_max_bias_norm: float = 0.50
+    # Smooth motion gate: at this optical-flow radius adaptation runs at 50%.
+    center_visual_adaptation_flow_scale_norm_s: float = 0.10
+    # Independent per-axis slew protection for the moving visual reference.
+    center_visual_adaptation_max_rate_norm_s: float = 0.05
+
+    # Visual-trim estimators used around the probe handoffs. They remain passive:
+    # lateral acceleration feedforward is handled separately by PlatformProbe /
+    # FINAL_PROBE adaptation. Set the tau multipliers to match the corresponding
+    # far/near probe conditioning windows.
+    far_trim_tau_sec: float = 4.0 * PROBE_DESIGN_PERIOD_SEC
+    near_trim_tau_sec: float = 2.0 * PROBE_DESIGN_PERIOD_SEC
+    # False restores the previous behaviour: DESCENT freezes the single
+    # instantaneous image offset from the decision tick. Kept as a one-line
+    # revert for A/B comparison against earlier logs.
+    descent_trim_use_probe_mean: bool = True
+
+    # --- Static lateral acceleration trim ---
+    # No feedforward in CENTER/APPROACH; seed from the passive APPROACH
+    # PlatformProbe when FINAL_PROBE starts; adapt the static term as an EMA of
+    # the realized lateral command during FINAL_PROBE.  When this switch is True,
+    # DESCENT continues the same slow adaptation from the committed FINAL_PROBE
+    # value so changing wind can be tracked during the short terminal segment.
+    descent_lateral_bias_adaptive: bool = True
+    # Near-field adaptation time constant, shared by FINAL_PROBE and DESCENT.
+    # It must remain slower than the lateral D loop so the static estimate cannot
+    # chase the oscillatory flow.
+    descent_lateral_bias_tau_sec: float = 2.0
+    # Hard bound around the passive APPROACH seed, shared across FINAL_PROBE and
+    # DESCENT.  The terminal adaptation therefore cannot accumulate a second
+    # deviation allowance after the descent handoff.
+    descent_lateral_bias_deviation_limit_m_s2: float = 0.5
+
     # --- Lateral schedule ---
+    # 2026-08-18 wind retune.  With ControlConfig = (Kp, Kd) = (4.0, 3.0),
+    # the effective CENTER gains are (4.0, 2.4) and the fully-ramped APPROACH
+    # gains are (3.0, 1.95). FINAL_PROBE disables P completely and therefore
+    # flies Kd = 1.95. At the current camera/delay/safety constants that is
+    # below even the safety-scaled lateral ceiling at leg height (~2.35), while
+    # remaining comfortably above the ~0.7 disturbance floor observed in the
+    # 2026-08-18 approach diagnostics.
     center_to_probe_lateral_ramp_sec: float = 2.0
-    center_lateral_p_scale: float = 1.0
-    center_lateral_d_scale: float = 0.70
+    center_lateral_p_scale: float = 1.00
+    center_lateral_d_scale: float = 0.80
     probe_lateral_p_scale: float = 0.75
-    probe_lateral_d_scale: float = 0.7
+    probe_lateral_d_scale: float = 0.65
 
     # --- Visual synchronisation (tracking) gate ---
     # A one-time REJECTION test during the stationary FINAL_PROBE hold on
@@ -306,7 +393,7 @@ class MissionConfig:
     # Minimum FINAL_PROBE-hold observation before chi is allowed to veto. The
     # robust chi envelope is restarted at hold entry while the derivative
     # history stays warm from the preceding visual samples.
-    tracking_min_observation_sec: float = 1.0 * PROBE_DESIGN_PERIOD_SEC
+    tracking_min_observation_sec: float = 2.0 * PROBE_DESIGN_PERIOD_SEC
 
     # --- Mode switches ---
     enable_descent: bool = True
