@@ -20,9 +20,15 @@ from __future__ import annotations
 import math
 import time
 import tempfile
+import warnings
+from dataclasses import fields
 
 from bee_control.core.clock import SteadyWallClock, TimeManager
-from bee_control.core.config import BeeConfig, MissionConfig
+from bee_control.core.config import (
+    RENAMED_MISSION_FIELDS,
+    BeeConfig,
+    MissionConfig,
+)
 from bee_control.core.controller_state import ControllerState, PX4Status, VisionTelemetry
 from bee_control.diagnostics.diagnostics_writer import DiagnosticsWriter
 from bee_control.interfaces.flight_sequencer import (
@@ -137,6 +143,89 @@ def test_derived_values_are_wired():
     assert math.isclose(
         cfg.mission.stability_dt_sec,
         cfg.camera.stability_dt_sec(cfg.scheduling))
+
+    # Previously omitted, so a change to the scheduling tick silently left the
+    # mission's stability_dt fallback behind at its own literal.
+    assert math.isclose(
+        cfg.mission.stability_dt_fallback_sec,
+        cfg.scheduling.control_period_sec)
+    assert math.isclose(cfg.mission.roll_d_gain, cfg.control.roll_kd)
+    assert math.isclose(cfg.mission.pitch_d_gain, cfg.control.pitch_kd)
+
+
+def test_renamed_fields_map_onto_real_fields():
+    """Every alias must point at a field that actually exists today."""
+    known = {f.name for f in fields(MissionConfig())}
+    for old, new in RENAMED_MISSION_FIELDS.items():
+        assert new in known, f"alias {old!r} points at missing field {new!r}"
+        assert old not in known, f"{old!r} is both a live field and an alias"
+
+
+def test_deprecated_names_still_work_and_warn():
+    """An existing launch file or notebook must not break on the rename."""
+    base = MissionConfig()
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        cfg = base.with_overrides(descent_lateral_bias_tau_sec=3.25)
+        value = cfg.descent_lateral_bias_tau_sec
+    assert math.isclose(cfg.wind_trim_tau_sec, 3.25)
+    assert math.isclose(value, 3.25)
+    assert len(caught) == 2
+    assert all(issubclass(w.category, DeprecationWarning) for w in caught)
+
+
+def test_setting_both_old_and_new_name_raises():
+    """Silently picking one of two conflicting values is the failure to avoid."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        try:
+            MissionConfig().with_overrides(
+                descent_lateral_bias_tau_sec=1.0, wind_trim_tau_sec=2.0)
+        except TypeError as exc:
+            assert "wind_trim_tau_sec" in str(exc)
+        else:
+            raise AssertionError("a conflicting override pair was accepted")
+
+
+def test_unknown_attribute_still_raises_attribute_error():
+    """The alias __getattr__ must not swallow genuine typos."""
+    try:
+        MissionConfig().wind_trimm_tau_sec   # typo on purpose
+    except AttributeError as exc:
+        assert "wind_trimm_tau_sec" in str(exc)
+    else:
+        raise AssertionError("a misspelled attribute returned a value")
+
+
+def test_every_mission_field_declares_its_unit():
+    """Config naming convention: a float knob names its unit in its suffix.
+
+    Dimensionless ratios, counts and booleans are the documented exception.
+    """
+    unit_suffixes = (
+        "_sec", "_m", "_m_s", "_m_s2", "_rad", "_deg",
+        "_norm", "_norm_s", "_1_s", "_1_s2",
+    )
+    dimensionless = {
+        "roll_kappa", "pitch_kappa", "roll_d_gain", "pitch_d_gain",
+        "ceiling_safety_factor", "ceiling_margin", "initial_thrust_gain",
+        "approach_hold_area_fraction", "approach_retreat_divergence_limit",
+        "approach_hold_log_scale_tolerance", "approach_divergence_setpoint",
+        "descent_divergence_setpoint", "probe_attenuation_comp",
+        "center_offset_radius_max", "center_trim_mean_radius_max",
+        "center_trim_residual_radius_max", "center_legacy_box_threshold",
+        "center_visual_adaptation_max_bias_norm",
+        "center_lateral_p_scale", "center_lateral_d_scale",
+        "probe_lateral_p_scale", "probe_lateral_d_scale",
+    }
+    offenders = [
+        f.name for f in fields(MissionConfig())
+        if not f.name.startswith(("enable_", "probe_only", "descent_trim_use",
+                                  "center_timeout_allows", "wind_trim_adapt"))
+        and f.name not in dimensionless
+        and not f.name.endswith(unit_suffixes)
+    ]
+    assert not offenders, f"fields with no unit suffix: {sorted(offenders)}"
 
 
 # --------------------------------------------------------------------------
@@ -649,8 +738,8 @@ def test_final_probe_seed_comes_from_passive_approach_probe_mean():
 def test_final_probe_bias_tracks_the_realized_lateral_command():
     """During FINAL_PROBE it integrates the slow part of the D-only command."""
     tau = 2.0
-    routine = _final_probe_ready(descent_lateral_bias_tau_sec=tau,
-                                 descent_lateral_bias_deviation_limit_m_s2=10.0)
+    routine = _final_probe_ready(wind_trim_tau_sec=tau,
+                                 wind_trim_deviation_limit_m_s2=10.0)
     target, dt, t = 0.70, 1 / 30.0, 0.0
     start = routine._final_probe_roll_accel_bias
     for _ in range(int(round(tau / dt))):
@@ -685,8 +774,8 @@ def test_final_probe_bias_holds_outside_phase_or_without_measurement():
 def test_final_probe_bias_cannot_leave_the_approach_neighbourhood():
     """Near-field adaptation stays bounded around the passively measured seed."""
     limit = 0.35
-    routine = _final_probe_ready(descent_lateral_bias_deviation_limit_m_s2=limit,
-                                 descent_lateral_bias_tau_sec=0.2)
+    routine = _final_probe_ready(wind_trim_deviation_limit_m_s2=limit,
+                                 wind_trim_tau_sec=0.2)
     for i in range(600):
         routine._update_near_field_lateral_bias(_bias_inputs(i / 30.0, 9.0))
     assert math.isclose(routine._final_probe_roll_accel_bias, 0.20 + limit)
@@ -699,9 +788,9 @@ def test_final_probe_bias_cannot_leave_the_approach_neighbourhood():
 def _descent_bias_ready(*, adaptive=True, tau=2.0, limit=10.0):
     """A DESCEND routine with a known committed FINAL_PROBE operating point."""
     cfg = MissionConfig(
-        descent_lateral_bias_adaptive=adaptive,
-        descent_lateral_bias_tau_sec=tau,
-        descent_lateral_bias_deviation_limit_m_s2=limit,
+        wind_trim_adapt_in_descent=adaptive,
+        wind_trim_tau_sec=tau,
+        wind_trim_deviation_limit_m_s2=limit,
     )
     routine = MissionRoutine(hover_thrust=0.73, config=cfg)
     routine.start(0.0, 5.0)
@@ -774,7 +863,7 @@ def test_center_trim_bound_still_derives_from_the_offset_gates():
     """This bound decides whether CENTER can hand off at all.
 
     It was originally a ``getattr`` fallback that DERIVED the value as
-    ``max(center_offset_radius_max, center_offset_threshold)`` -- the looser of
+    ``max(center_offset_radius_max, center_legacy_box_threshold)`` -- the looser of
     the modern radial gate and the legacy box threshold. Replacing that with a
     hardcoded number silently tightened the handoff gate from 0.25 to 0.20 and
     stranded the mission in CENTER. Keep it derived so tuning either input still
@@ -783,10 +872,10 @@ def test_center_trim_bound_still_derives_from_the_offset_gates():
     cfg = MissionConfig()
     routine = MissionRoutine(hover_thrust=0.73, config=cfg)
     assert routine._center_trim_mean_radius_max == max(
-        cfg.center_offset_radius_max, cfg.center_offset_threshold)
+        cfg.center_offset_radius_max, cfg.center_legacy_box_threshold)
 
     wider = MissionRoutine(hover_thrust=0.73, config=MissionConfig(
-        center_offset_radius_max=0.30, center_offset_threshold=0.25))
+        center_offset_radius_max=0.30, center_legacy_box_threshold=0.25))
     assert wider._center_trim_mean_radius_max == 0.30
 
     explicit = MissionRoutine(hover_thrust=0.73, config=MissionConfig(

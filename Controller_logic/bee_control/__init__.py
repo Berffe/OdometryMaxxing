@@ -11,6 +11,9 @@ Layout
 ``diagnostics/``  the log schema contract and the CSV writers
 ``tests/``        ROS-free contract tests
 
+Design notes live in ``docs/``: ``WIND_REJECTION.md`` covers the static/dynamic
+acceleration split that gives the near field its steady-wind rejection.
+
 Dependency direction is one-way, top of this list to bottom: ``core`` imports
 nothing else in the package; ``bee_node`` imports everything and is imported by
 nothing. If you ever need an import that points back up this list, that is the

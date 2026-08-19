@@ -2,13 +2,20 @@
 
     CENTER -> APPROACH_PROBE -> FINAL_PROBE -> DESCEND
 
-``routine``    MissionRoutine: config, shared state, dispatch, telemetry
-``phases/``    one file per phase, plus the registry
-``probe``      the command-acceleration probe (three instances run in parallel)
-``gates``      feasibility maths
-``schedule``   the k(t) descent trajectory and its look-ahead predicates
-``math_utils`` clamp, raised cosine, G
-``types``      the contract with the caller: MissionInputs, MissionControl, effects
+``routine``                   MissionRoutine: config, shared state, dispatch, telemetry
+``phases/``                   one file per phase, plus the registry
+``probe``                     the command-acceleration probe (three run in parallel)
+``gates``                     feasibility maths
+``schedule``                  the k(t) descent trajectory and its look-ahead predicates
+``trim``                      the slow visual-trim (wind equilibrium) estimator
+``visual_center_adaptation``  the far-field adaptive visual centre (wind rejection)
+``visual_mismatch``           the chi bandwidth diagnostic behind the tracking gate
+``math_utils``                clamp, raised cosine, G
+``types``                     the contract with the caller: MissionInputs, MissionControl, effects
+
+Wind rejection spans three of these -- ``visual_center_adaptation`` in the far
+field, the roll/pitch ``probe`` means as the passive seed, and the static term
+that ``routine`` adapts from FINAL_PROBE onward.  See ``docs/WIND_REJECTION.md``.
 
 Only ``routine`` and ``types`` are meant to be imported from outside this
 package. ``bee_node`` uses exactly two names: ``MissionRoutine`` and the types

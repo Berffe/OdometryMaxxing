@@ -140,7 +140,7 @@ class MissionRoutine:
             0.5 * math.radians(camera_cfg.vertical_fov_deg)
         )
 
-        self._dt = float(cfg.control_period_sec)
+        self._dt = float(cfg.stability_dt_fallback_sec)
         self._stability_dt = (
             float(cfg.stability_dt_sec) if cfg.stability_dt_sec is not None else self._dt
         )
@@ -179,8 +179,8 @@ class MissionRoutine:
         self._near_field_height = max(1e-3, float(cfg.near_field_height_m))
 
         self._enable_center = bool(cfg.enable_center)
-        self._center_offset_thr = max(0.0, float(cfg.center_offset_threshold))
-        self._center_dwell = max(0.0, float(cfg.center_dwell_sec))
+        self._center_offset_thr = max(0.0, float(cfg.center_legacy_box_threshold))
+        self._center_dwell = max(0.0, float(cfg.center_legacy_box_dwell_sec))
         self._center_timeout = max(0.0, float(cfg.center_timeout_sec))
 
         self._enable_center_condition_gate = bool(cfg.enable_center_condition_gate)
@@ -226,17 +226,15 @@ class MissionRoutine:
         self._far_trim_tau = max(1e-3, float(cfg.far_trim_tau_sec))
         self._near_trim_tau = max(1e-3, float(cfg.near_trim_tau_sec))
         self._descent_trim_use_probe_mean = bool(cfg.descent_trim_use_probe_mean)
-        self._descent_bias_adaptive = bool(cfg.descent_lateral_bias_adaptive)
-        self._descent_bias_tau = max(1e-3, float(cfg.descent_lateral_bias_tau_sec))
-        self._descent_bias_deviation_limit = abs(
-            float(cfg.descent_lateral_bias_deviation_limit_m_s2)
+        # Static lateral (wind) trim.  ONE tau and ONE deviation bound are
+        # shared by FINAL_PROBE and DESCENT; only the *continuation* into
+        # DESCENT is switchable.  See config.py section 8.
+        self._wind_trim_adapt_in_descent = bool(cfg.wind_trim_adapt_in_descent)
+        self._wind_trim_tau = max(1e-3, float(cfg.wind_trim_tau_sec))
+        self._wind_trim_deviation_limit = abs(
+            float(cfg.wind_trim_deviation_limit_m_s2)
         )
 
-        # Re-use the already validated lateral-bias adaptation time scale for
-        # this first FINAL_PROBE implementation.  No new config knob is
-        # introduced yet: config.py is intentionally left untouched until the
-        # new handoff has been flight-validated.
-        self._final_probe_bias_tau = self._descent_bias_tau
 
         self._approach_d_star_ramp_in = max(0.0, float(cfg.approach_d_star_ramp_in_sec))
         self._descent_d_star_ramp_in = max(0.0, float(cfg.descent_d_star_ramp_in_sec))
@@ -305,11 +303,11 @@ class MissionRoutine:
             derivative_window_sec=cfg.tracking_derivative_window_sec,
         )
         self._enable_tracking_gate = bool(cfg.enable_tracking_gate)
-        # Separate rejection limits per visual axis. ``tracking_chi_limit_1_s2``
-        # keeps the unqualified name for the vertical/z channel because the CSV
-        # column of that name is the vertical one; x/y are explicit.
+        # Separate rejection limits per visual axis.  The config fields are
+        # explicit (``tracking_chi_z_limit_1_s2``); the CSV column for the
+        # vertical channel keeps its legacy unqualified name ``chi_limit_1_s2``.
         self._tracking_z_chi_limit = max(
-            0.0, float(cfg.tracking_chi_limit_1_s2)
+            0.0, float(cfg.tracking_chi_z_limit_1_s2)
         )
         self._tracking_x_chi_limit = max(
             0.0, float(cfg.tracking_chi_x_limit_1_s2)
@@ -792,10 +790,10 @@ class MissionRoutine:
                 if self._descent_lateral_trim_frozen else None
             ),
             "descent_bias_adaptive": int(
-                bool(self._descent_bias_adaptive and self._substate == DESCEND)
+                bool(self._wind_trim_adapt_in_descent and self._substate == DESCEND)
             ),
-            "descent_bias_tau_sec": self._descent_bias_tau,
-            "descent_bias_deviation_limit_m_s2": self._descent_bias_deviation_limit,
+            "descent_bias_tau_sec": self._wind_trim_tau,
+            "descent_bias_deviation_limit_m_s2": self._wind_trim_deviation_limit,
             # Deviation from the exact FINAL_PROBE value committed at DESCENT
             # entry.  Zero means no post-commit correction was required.
             "descent_roll_bias_deviation_m_s2": blank(
@@ -1219,15 +1217,15 @@ class MissionRoutine:
         """
         if self._substate not in (FINAL_PROBE, DESCEND):
             return
-        if self._substate == DESCEND and not self._descent_bias_adaptive:
+        if self._substate == DESCEND and not self._wind_trim_adapt_in_descent:
             return
         if not (inputs.target_found and inputs.flow_valid):
             return
 
         beta = 1.0 - math.exp(
-            -max(1e-3, float(inputs.dt)) / max(1e-3, self._final_probe_bias_tau)
+            -max(1e-3, float(inputs.dt)) / max(1e-3, self._wind_trim_tau)
         )
-        limit = self._descent_bias_deviation_limit
+        limit = self._wind_trim_deviation_limit
 
         if self._substate == FINAL_PROBE:
             roll_current = self._final_probe_roll_accel_bias

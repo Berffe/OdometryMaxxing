@@ -1,6 +1,6 @@
 # BEE_LAND — Code Architecture Guide
 
-**Package:** `bee_control` v2.0 · 45 Python files · ~11,200 lines
+**Package:** `bee_control` v2.0 · 48 Python files · ~13,900 lines
 **Purpose:** bio-inspired, vision-only landing of a PX4 multirotor on a *moving* platform.
 
 This document is a map. It answers three questions in order:
@@ -10,6 +10,11 @@ This document is a map. It answers three questions in order:
 3. **Where do I edit** — a task → file lookup table, so you never have to guess again.
 
 Diagrams are shipped both inline (as Mermaid blocks) and as standalone `.mermaid` files.
+
+> **Revision note.** This guide was corrected against the code after the
+> wind-rejection work. Three ideas it previously documented were **abandoned**,
+> not merely retuned — see §7.8–§7.11. If you remember the old behaviour, read
+> those four entries first; the rest of the document assumes the new one.
 
 ---
 
@@ -89,6 +94,8 @@ graph TD
         mutils["mission/math_utils.py"]
         probe["mission/probe.py"]
         vmis["mission/visual_mismatch.py"]
+        trim["mission/trim.py"]
+        vcad["mission/visual_center_adaptation.py"]
         gates["mission/gates.py"]
         sched["mission/schedule.py"]
         phases["mission/phases/*"]
@@ -108,6 +115,7 @@ graph TD
     subgraph L5["diagnostics"]
         tele["diagnostics/telemetry.py"]
         truth["diagnostics/truth_layout.py"]
+        wind["diagnostics/wind_layout.py"]
         dwrite["diagnostics/diagnostics_writer.py"]
     end
 
@@ -123,6 +131,7 @@ graph TD
     mtypes --> state
     probe --> mutils
     vmis --> mutils
+    vcad --> mutils
     phases --> mtypes
     phases --> mutils
     phases --> gates
@@ -134,12 +143,16 @@ graph TD
     routine --> gates
     routine --> probe
     routine --> vmis
+    routine --> trim
+    routine --> vcad
+    routine --> mutils
     routine --> mtypes
     claw --> state
     seq --> config
     seq --> ctrlstate
     dwrite --> tele
     dwrite --> truth
+    dwrite --> wind
     node --> clock
     node --> config
     node --> ctrlstate
@@ -152,6 +165,7 @@ graph TD
     node --> px4i
     node --> dwrite
     node --> truth
+    node --> wind
     node --> derot
     node --> vworker
 
@@ -174,7 +188,8 @@ graph TD
 
 ### 2.1 Processes and threads
 
-There are **two OS processes** and **five threads of execution**.
+There are **two OS processes** and **six threads of execution** — the wind CSV
+sink joined the truth sink when the wind-command bridge was added.
 
 ```mermaid
 graph TB
@@ -184,13 +199,14 @@ graph TB
         DRAIN["<b>Thread</b> — _vision_drain_loop<br/>blocks on _vision_out_q"]
         MAVT["<b>Thread</b> — MavsdkWorker<br/>own asyncio event loop"]
         CSVT["<b>Thread</b> — _AsyncCsvSink<br/>truth CSV writer"]
+        CSVW["<b>Thread</b> — _AsyncCsvSink<br/>wind CSV writer"]
     end
 
     subgraph P2["PROCESS 2 — vision worker (spawn, daemon)"]
         VW["<b>run_vision_worker</b><br/>TargetAcquisition → OpticalFlowEstimator<br/>NO rclpy, NO DDS"]
     end
 
-    GZ["Gazebo<br/>/bee_x500/camera/image<br/>/bee_land/truth"]
+    GZ["Gazebo<br/>/bee_x500/camera/image<br/>/bee_land/truth<br/>/bee_land/wind_cmd"]
     PX4["PX4<br/>uXRCE-DDS"]
     MAVL["PX4 MAVLink<br/>udpin :14540"]
 
@@ -202,10 +218,17 @@ graph TB
     EXEC -->|"OffboardControlMode<br/>VehicleAttitudeSetpoint<br/>VehicleCommand"| PX4
     MAVT <-->|"takeoff / kill"| MAVL
     EXEC -->|truth rows| CSVT
+    EXEC -->|wind rows| CSVW
 
     style EXEC fill:#ffe6cc,color:#111
     style VW fill:#cce6ff,color:#111
 ```
+
+`/bee_land/wind_cmd` carries the WindController's own diagnostic packet — what
+wind was *commanded* in simulation. It is logged and never read by the
+controller. The vehicle's wind rejection is inferred entirely from its own
+command history (§5.5); this topic exists so an offline analysis can check the
+inference against ground truth.
 
 **Why the vision worker is a process, not a thread:** `rclpy.spin()` uses a
 single-threaded executor. Running the two heavy vision stages inline blocked the same
@@ -277,7 +300,7 @@ difference outside `(1e-4, 0.5)` falls back to the nominal frame period.
 
 ## Part 3 — Package reference
 
-### 3.1 `bee_node.py` — the ROS node (607 lines)
+### 3.1 `bee_node.py` — the ROS node (632 lines)
 
 The only file that imports `rclpy`. It is **wiring, I/O and process lifecycle** — nothing
 conceptual lives here.
@@ -289,6 +312,7 @@ conceptual lives here.
 | `on_camera` | executor | Convert frame, rotate 180°, gather body rates, ship to the vision queue |
 | `_vision_drain_loop` | own thread | Drain `VisionResult`, build timing metrics, publish `_latest_vision_bundle` **atomically** |
 | `on_truth` | executor | Decode the Gazebo truth packet → truth CSV; extract **only** the contact subset; latch `LANDED` on confirmed contact |
+| `on_wind` | executor | Decode the commanded-wind packet → wind CSV. Pure logging: nothing here reaches the controller |
 | `on_angular_velocity` | executor | Buffer PX4 body FRD rates for de-rotation |
 | `on_vehicle_status` | executor | Update `PX4Status`; log transitions |
 | `on_supervisor_timer` | executor | Clock-step watchdog + `sequencer.update()` |
@@ -316,10 +340,10 @@ flow result mid-update.
 
 | File | Contents | Key API |
 |---|---|---|
-| `clock.py` (184) | The only three time sources | `SteadyWallClock`, `TimeManager`, `ClockStep`, `ReceiptStamp` |
-| `config.py` (395) | Every tuning knob, frozen dataclasses | `BeeConfig.default()`, `MissionConfig.with_overrides()`, `BeeConfig.from_ros_parameters()` |
+| `clock.py` (179) | The only three time sources | `SteadyWallClock`, `TimeManager`, `ClockStep`, `ReceiptStamp` |
+| `config.py` (712) | Every tuning knob, frozen dataclasses | `BeeConfig.default()`, `MissionConfig.with_overrides()`, `BeeConfig.from_ros_parameters()` |
 | `state.py` (123) | ROS-free exchanged dataclasses | `FlowResult`, `TargetEstimate`, `AttitudeSetpoint`, `ContactState` |
-| `controller_state.py` (276) | Live snapshot + telemetry sources | `PX4Status`, `VisionTelemetry`, `ControllerState` |
+| `controller_state.py` (284) | Live snapshot + telemetry sources | `PX4Status`, `VisionTelemetry`, `ControllerState` |
 
 **Three time bases, not interchangeable:**
 
@@ -338,14 +362,41 @@ BeeConfig
 ├── vision      VisionConfig      derotation toggle, queue depth, lost-target timeout
 ├── camera      CameraConfig      FOV, frame period, latency budget → derives kappa, stability_dt
 ├── control     ControlConfig     constant PD gains handed to ControlLaw
-├── mission     MissionConfig     ~60 knobs — every value MissionRoutine reads
+├── mission     MissionConfig     70 knobs — every value MissionRoutine reads
 └── mavsdk      MavsdkConfig      takeoff altitude, timeouts, kill fallback
 ```
 
+111 knobs in total across the seven groups.
+
 Derived values are computed **once**, in `BeeConfig.default()`: `roll_kappa`,
-`pitch_kappa`, `stability_dt_sec`, `roll_d_gain`, `pitch_d_gain`. That is why the
-relationship between camera FOV and mission gain limits stays visible in one place
-instead of being re-derived at three call sites.
+`pitch_kappa`, `stability_dt_sec`, `roll_d_gain`, `pitch_d_gain`,
+`stability_dt_fallback_sec`. That is why the relationship between camera FOV and
+mission gain limits stays visible in one place instead of being re-derived at
+three call sites. They occupy **section 1** of `MissionConfig` and are marked
+*do not hand-edit*; `test_derived_values_are_wired` catches a new derived field
+that was added but never wired.
+
+**`MissionConfig` is organised in eleven numbered sections** — the mission
+timeline (CENTER → APPROACH → FINAL_PROBE → DESCENT) first, then the
+cross-cutting concerns: geometry, probe conditioning, wind trim, lateral
+schedule, tracking gate, mode switches. Two naming rules, both test-enforced:
+
+- **Every float names its unit in its suffix** (`_sec`, `_m_s2`, `_norm_s`,
+  `_1_s2`, …). Dimensionless ratios, counts and booleans are the documented
+  exception. Pinned by `test_every_mission_field_declares_its_unit`.
+- **A prefix names the owner.** `center_`, `approach_`, `final_probe_`,
+  `descent_` name a phase; `far_`/`near_` name a conditioning regime;
+  `wind_trim_`, `probe_`, `tracking_` name a quantity. A knob read by *two*
+  phases must be named for the quantity, never for one of them — that is why
+  the static lateral term is `wind_trim_*` (§7.9).
+
+**Renamed fields.** Seven `MissionConfig` fields were renamed; `RENAMED_MISSION_FIELDS`
+at the bottom of `config.py` maps old → new. Old names still work in
+`with_overrides()`, in `from_ros_parameters()` and on attribute access, each with a
+`DeprecationWarning`. The one place they do **not** work is direct construction —
+a frozen dataclass's generated `__init__` cannot be aliased without also swallowing
+genuine typos, which is the failure mode this config exists to prevent. CSV column
+names are unchanged, so `analyse_log.py` is unaffected.
 
 Overriding is via `dataclasses.replace`:
 
@@ -405,14 +456,22 @@ be imported from outside.
 
 | File | Job |
 |---|---|
-| `routine.py` (1202) | `MissionRoutine` — config plumbing, shared state, dispatch, telemetry |
-| `types.py` (229) | The contract with the caller: `MissionInputs`, `MissionControl`, `ControlEffect`, `PhaseSpec` |
-| `phases/` (8 files) | One file per phase + the registry |
-| `probe.py` (226) | `PlatformProbe` — the command-acceleration probe |
+| `routine.py` (1691) | `MissionRoutine` — config plumbing, shared state, dispatch, telemetry |
+| `types.py` (253) | The contract with the caller: `MissionInputs`, `MissionControl`, `ControlEffect`, `PhaseSpec` |
+| `phases/` (9 files) | One file per phase (8) + the registry |
+| `probe.py` (232) | `PlatformProbe` — the command-acceleration probe |
 | `gates.py` (361) | Feasibility maths — three independent gate families |
-| `schedule.py` (109) | The `k(t)` descent trajectory and look-ahead predicates |
+| `schedule.py` (118) | The `k(t)` descent trajectory and look-ahead predicates |
 | `visual_mismatch.py` (298) | `VisualMismatchProbe` — the height-free `chi` bandwidth estimator |
-| `math_utils.py` (35) | `clamp`, `raised_cosine01`, `G_ACCEL`, `blank` |
+| `trim.py` (125) | `VisualTrim` — slow image-offset equilibrium vs. its live residual |
+| `visual_center_adaptation.py` (161) | `VisualCenterAdaptation` — the far-field adaptive visual centre |
+| `math_utils.py` (31) | `clamp`, `raised_cosine01`, `G_ACCEL`, `blank` |
+
+`trim.py` and `visual_center_adaptation.py` are the far-field half of wind
+rejection. `trim` is purely observational — it separates the slow image
+equilibrium from the fast motion about it and hands both to the gates and the
+log, with no control authority of its own. `visual_center_adaptation` is the one
+that acts, by moving the visual *reference* (§5.5).
 
 #### `MissionRoutine` is deliberately *not* decomposed into components
 
@@ -461,17 +520,28 @@ resolve it through `PHASES[...]` at call time, not at import time.
 
 ### 3.5 `control/` — the control law
 
-`control_law.py` (597 lines) is one class, `ControlLaw`, in its own folder because the
+`control_law.py` (632 lines) is one class, `ControlLaw`, in its own folder because the
 control law is a distinct responsibility from the mission that schedules its gains.
 
 **Acceleration-domain allocation.** All three translation channels are assembled as
 desired accelerations, then converted to roll/pitch/thrust:
 
 ```
-a_roll  = -(k_p · p_scale · offset_x + k_d · d_scale · flow_x)
-a_pitch = -(k_p · p_scale · offset_y + k_d · d_scale · flow_y)
-a_z     =   thrust_gain_override · (D - D*)
+a_roll  = a_static_roll  - (k_p · p_scale · (offset_x - sp_x) + k_d · d_scale · flow_x)
+a_pitch = a_static_pitch - (k_p · p_scale · (offset_y - sp_y) + k_d · d_scale · flow_y)
+a_z     = thrust_gain_override · (D - D*)
 ```
+
+Two lateral terms are newer than the rest of this document:
+
+- **`sp_x` / `sp_y`** (`roll_offset_setpoint` / `pitch_offset_setpoint`) — the
+  image trim the P feedback acts *about*, rather than about image centre.
+  CENTER and APPROACH set it to the geometric tilt offset minus the learned
+  adaptive-centre bias; every other phase leaves it at zero.
+- **`a_static`** (`roll_accel_feedforward_m_s2` / `pitch_accel_feedforward_m_s2`)
+  — the static wind term. Exactly zero until FINAL_PROBE. See §5.5.
+
+Both default to zero, so a call that omits them is the legacy controller.
 
 The allocator uses the *known* vertical thrust component to compute required tilt rather
 than assuming `a_lat ≈ g·angle`. Near hover it reduces to the old angle-domain behaviour
@@ -500,6 +570,19 @@ accel request → exact tilt geometry → soft limit (L·tanh) → first-order f
 
 Properties the mission reads back each tick: `last_roll_accel_cmd`,
 `last_pitch_accel_cmd`, `last_vertical_accel_cmd`, `divergence_integral`, `hover_thrust`.
+These are the **shaped, authority-limited** accelerations — what the vehicle was
+actually asked to do, not what the law first requested — which is what makes them
+valid probe input. The node also feeds `last_roll_cmd_rad` / `last_pitch_cmd_rad`
+back through `ActuationFeedback`, because the far-field geometric tilt
+compensation needs the previous *attitude* command, not its acceleration.
+
+> **Known issue (open).** The whole lateral command, `a_static` included, is
+> assembled inside `if target_found:`. A target dropout therefore zeroes the
+> static wind term as well as the damping — during DESCEND, where `k_p` is
+> already zero, that removes the only force opposing a steady wind. The
+> estimator itself is safe (it freezes rather than ingesting zeros); only the
+> command path drops it. See `docs/CODE_REVIEW.md` §1 for the reproduction and
+> the suggested fix.
 
 ### 3.6 `interfaces/` — talking to the vehicle
 
@@ -543,8 +626,9 @@ the system that decides when visual commands may reach the vehicle.
 | File | Job |
 |---|---|
 | `telemetry.py` (102) | The `TelemetrySource` protocol, `collect_fields`, `snapshot`, `schema_fingerprint` |
-| `diagnostics_writer.py` (196) | Assembles the header from sources; writes both CSVs |
+| `diagnostics_writer.py` (232) | Assembles the header from sources; writes **three** CSVs |
 | `truth_layout.py` (116) | The fixed Gazebo truth field layout, shared with the plugin |
+| `wind_layout.py` (38) | The fixed commanded-wind field layout, shared with the WindController plugin |
 
 This package declares **no** column names of its own beyond eight base fields. Every other
 column is owned by the subsystem that produces it.
@@ -561,8 +645,10 @@ graph LR
     DW["DiagnosticsWriter<br/>BASE_FIELDS + collect_fields(sources)"]
     DW --> C1["bee_controller_&lt;runid&gt;.csv<br/>one row per control tick + events"]
     DW --> C2["bee_truth_&lt;runid&gt;.csv<br/>async sink, one row per truth packet"]
+    DW --> C3["bee_wind_&lt;runid&gt;.csv<br/>async sink, one row per wind packet"]
     C1 -.->|"merged on SIM time"| AN["analyse_log.py<br/>(offline)"]
     C2 -.-> AN
+    C3 -.-> AN
 
     style DW fill:#ffe6cc,color:#111
 ```
@@ -573,8 +659,15 @@ Two failure modes that used to be silent are now loud:
   dropped by an `if col in row` guard).
 - Two sources claiming the same column name raise **at construction**.
 
-The truth sink is `_AsyncCsvSink` — a bounded queue on its own thread. Under pathological
-disk pressure it **drops rows and counts them** rather than blocking the ROS executor.
+The truth and wind sinks are each an `_AsyncCsvSink` — a bounded queue on its own
+thread. Under pathological disk pressure they **drop rows and count them**
+(`truth_dropped_rows`, `wind_dropped_rows`) rather than blocking the ROS executor.
+
+The three schemas are deliberately independent: physical truth from
+`truth_layout.TRUTH_FIELDS`, commanded wind from `wind_layout.WIND_FIELDS`, and
+the controller row from whoever registered. Each dense packet is logged atomically,
+without reconstruction, so a dropped row is a visible gap rather than a silent
+interpolation.
 
 `schema_fingerprint` hashes the assembled column list into the
 `diagnostics_schema_version` cell, so a log that lost or renamed a column is recognisable
@@ -627,11 +720,10 @@ stateDiagram-v2
     [*] --> approach_probe: not enable_center
 
     center --> approach_probe: centred + settled for dwell<br/>OR timeout (if handoff allowed)<br/>[RESET_DIVERGENCE_INTEGRAL]
-    approach_probe --> final_probe: near field reached<br/>(centred AND area_fraction ≥ thr)<br/>[RESET_DIVERGENCE_INTEGRAL]
+    approach_probe --> final_probe: VISUAL-HEIGHT HOLD settled for dwell<br/>(centred, flow valid, NOT fov_saturated,<br/>|log scale error| ≤ tol, |D| ≤ tol)<br/>[RESET_DIVERGENCE_INTEGRAL]
 
     state final_probe {
-        [*] --> entry_ramp: D* → 0 (raised cosine)
-        entry_ramp --> hold: ramp complete<br/>retune probes, freeze handoff peaks<br/>begin chi gate window
+        [*] --> hold: entered ALREADY at D*=0<br/>reset probes + handoff trim, retune,<br/>freeze handoff peaks, seed static wind term,<br/>begin chi gate window
         hold --> verdict: all 3 probes ready
     }
 
@@ -654,9 +746,9 @@ stateDiagram-v2
 
 | Substate | Terminal | `D*` | `k` | Notes |
 |---|---|---|---|---|
-| `center` | no | 0 | `k_explore` | Visual hover until centred + laterally settled |
-| `approach_probe` | no | ramp → `approach_d_star` | decays `k_explore` → `k_probe` | Far-field probing; gain decays *parallel* to the shrinking ceiling |
-| `final_probe` | no | ramp → 0 | flat `k_probe` | The measurement that decides everything |
+| `center` | no | 0 | `k_explore` | Visual hover until centred + laterally settled. Also learns the adaptive visual centre (§5.5) |
+| `approach_probe` | no | outer visual-scale P loop, capped by a ramp to `approach_d_star`, and allowed to go **negative** (retreat) | decays `k_explore` → `k_probe` on the *commanded* divergence integral | Far-field probing; gain decays *parallel* to the shrinking ceiling and never rises on retreat |
+| `final_probe` | no | flat 0 | flat `k_probe` | The measurement that decides everything. Lateral P is exactly 0 from its first tick |
 | `probe_hold` | no | 0 | `k_probe` | `probe_only` mode — hold indefinitely |
 | `descend` | no | ramp → `d_star` | scheduled per-axis | Commitment already made |
 | `infeasible` | no | 0 | `k_probe` | **Active visual hover**, not a freeze |
@@ -669,7 +761,12 @@ a fiction that shows up only in the log and the gain-schedule plot.
 
 `infeasible` is **not** a freeze and **not** an abort: `MissionRoutine` latches an active
 visual hover with `D*=0` and a near-field-admissible gain, and `bee_node` keeps running
-the normal control path. This preserves vertical platform tracking and lateral centring.
+the normal control path. This preserves vertical platform tracking and lateral damping.
+
+One caveat worth knowing about `infeasible` and `probe_hold`: both fly
+`lateral_p_scale = 0` with the **frozen** static wind term, and neither adapts it.
+That is correct for seconds and questionable for minutes — see
+`docs/CODE_REVIEW.md` §3.
 
 ### 4.3 Dispatch
 
@@ -695,6 +792,14 @@ parallel — vertical, roll, pitch. Each measures the **thrust-command residual*
 physical acceleration. That provenance is what makes the whole argument valid without any
 truth data reaching the controller.
 
+**Each probe now has two consumers, one per half of its split.** The de-biasing
+step separates a slow EMA mean from the residual about it. The *residual* becomes
+`peak_accel` and feeds the gates — that is what the probe was built for. The
+*mean*, previously discarded, is read once at the FINAL_PROBE handoff by the
+roll and pitch instances, as the passive seed for the static wind term (§5.5).
+The probe stays passive either way: it observes command history and injects
+nothing.
+
 Each probe: **EMA de-bias → rolling percentile → leaky maximum.**
 
 ```
@@ -710,15 +815,24 @@ height-dependent probe under-read (scales with the value); the **additive** floo
 unmodelled/ground-effect terms *and* guarantees a nonzero floor when the percentile is
 small, where a bare factor would collapse.
 
-**Far → near handoff.** At `FINAL_PROBE` hold entry, `peak_accel` is frozen into
-`peak_accel_at_handoff` (diagnostics), the probes are `retune()`d to near-field time
-constants, and **the accumulated envelopes carry over**. `retune()` restarts the *phase*
-clock and rolling window but preserves mean and peak — so `ready` can require a minimum
-near-field hold while the total clock keeps counting.
+**Far → near handoff.** At `FINAL_PROBE` entry, `peak_accel` is frozen into
+`peak_accel_at_handoff` (diagnostics only), the roll/pitch means are captured as
+the wind seed, and then **all three probes and the handoff trim are `reset()`**
+before being `retune()`d to near-field constants.
 
-`ready` requires **both** a full near-field hold *and* enough total probing across both
-phases (~one platform period). The hold alone is far too short for the latter, which is
-what stops a fast FOV saturation from gating on a fraction of one platform cycle.
+> **Corrected.** An earlier revision of this document said the accumulated
+> envelopes *carry over* into the near field. They do not, and must not: no
+> APPROACH-era sample may reach a feasibility gate, which is the provenance rule
+> `test_handoff_trim_admits_no_approach_era_sample` enforces. `retune()` does
+> preserve mean and peak in isolation, but its only caller resets first, so that
+> path is currently unexercised — the docstring now says so.
+
+`ready` is therefore **phase-local only**: `ProbeResult.ready` is
+`elapsed >= final_probe_duration_sec`, where `elapsed` restarts at the retune.
+With the default `3.0 × PROBE_DESIGN_PERIOD_SEC` that is 20.1 s — about three
+platform periods inside FINAL_PROBE alone, which is what stops a gate from
+resting on a fraction of one platform cycle. `total_duration_sec` spans the
+retune but is **diagnostic only**; nothing reads it for readiness.
 
 ### 5.2 Three independent questions
 
@@ -757,6 +871,12 @@ The two families ask genuinely different things:
 | Do the lower and upper bounds **overlap at all**? | gain gates | `GAIN_MARGIN` |
 | Does the flown gain **reach the authority floor**? | gain gates | `AUTHORITY_LOWER_BOUND` |
 | Is the closed loop **actually fast enough to track**? | tracking gate | `VISUAL_MISMATCH` |
+
+The three `chi` limits are configured per axis as `tracking_chi_z_limit_1_s2`,
+`tracking_chi_x_limit_1_s2` and `tracking_chi_y_limit_1_s2`. The z field was
+previously the unqualified `tracking_chi_limit_1_s2`, which read like a shared
+limit; the **CSV column keeps its legacy unqualified name** `chi_limit_1_s2`, so
+only the config field moved.
 
 **Gain margin is not bandwidth.** A disturbance can fit comfortably inside the authority
 envelope and still vary too quickly for the loop to follow. That is what `chi` catches.
@@ -809,9 +929,90 @@ de Croon ceiling at leg height instead of sinking all the way to the Herisse flo
 
 `k_probe = min(k_explore, ceiling_margin · k_ceiling(near_field_height))` — the `min()`
 means the gain is only ever *reduced* to become admissible, never raised. This matters
-because `FINAL_PROBE` fires on FOV saturation, i.e. well below the height at which
-`k_explore` is still admissible; probing above the ceiling would feed self-induced
-oscillation straight into `peak_accel` and corrupt the one number the gate rests on.
+because `FINAL_PROBE` runs well below the height at which `k_explore` is still
+admissible; probing above the ceiling would feed self-induced oscillation straight into
+`peak_accel` and corrupt the one number the gate rests on.
+
+> **Corrected.** An earlier revision said `FINAL_PROBE` "fires on FOV
+> saturation." It no longer does — see §7.10. The handoff is now a *commanded*
+> visual scale (`approach_hold_area_fraction = 0.70`), and FOV saturation
+> triggers a **retreat** instead. `near_field_height_m` is the truth-log
+> calibration of the height that visual scale corresponds to; re-measure it
+> whenever `approach_hold_area_fraction` changes.
+
+**APPROACH uses a different accessor into the same schedule.**
+`scheduled_gain_at_time()` computes the commanded-divergence integral from
+elapsed time, which is valid for DESCEND because `D*` there follows a known
+raised-cosine ramp. APPROACH cannot use it, because its `D*` comes from an outer
+visual-scale P loop that may go negative. It instead accumulates
+`max(0, D*_cmd)·dt` itself and calls `scheduled_gain_from_integral()`. Clamping
+the accumulation at zero is what keeps the schedule **monotone**: a retreat never
+raises the gain back up, which is the conservative direction as the vehicle
+enters the near-field stability region.
+
+### 5.5 Wind rejection — the static/dynamic split
+
+A PD law with no integrator rejects a steady disturbance **only by holding a
+steady error**: under constant wind the lateral loop settles at
+`e_∞ = −a_wind / k_p`. There is no integrator on purpose — one on a visual
+position error, with a 60–80 ms loop delay, is a phase-margin liability exactly
+where the stability ceiling is tightest.
+
+That leaves two problems, and the near-field one is the hard one, because
+`FINAL_PROBE` sets `k_p = 0`. With no error term there is no steady counter-wind
+force at all, at the moment precision matters most.
+
+**Far field — move the reference, not the force.** `VisualCenterAdaptation`
+adapts a bias `b` on the visual setpoint:
+
+```
+e_phys = e_meas − e_geom          physical centring error (tilt-compensated)
+e_sp   = e_geom − b               what the P loop actually chases
+ḃ      = w(flow) · e_phys / τ
+```
+
+When the platform is physically centred (`e_phys → 0`), `b` freezes at exactly
+the value that **preserves** the steady P error — and therefore the counter-wind
+force. The vehicle sits over the platform while the image still shows an offset,
+which is the correct steady state under wind. `w(flow) = 1/(1 + (|ω|/scale)²)`
+smoothly slows adaptation during transients so the reference cannot chase a deck
+oscillation. Active in CENTER and APPROACH_PROBE; stopped at FINAL_PROBE, where
+`b` would become meaningless.
+
+**Near field — supply the force directly.** The commanded lateral acceleration is
+split by time scale:
+
+```
+a_cmd = a_static + a_D(flow)
+        ╰──┬───╯   ╰────┬───╯
+     steady wind     deck motion
+```
+
+`a_static` is never hand-tuned. It is the roll/pitch `PlatformProbe` **mean** —
+the half of the probe's split that the gates do not use (§5.1) — promoted to
+feedforward at the FINAL_PROBE handoff, on the same tick that lateral P goes to
+zero. Because the feedforward path is provably zero until that instant, the seed
+cannot have been self-generated by its own feedback.
+
+Thereafter a causal EMA tracks the realized command. Substituting
+`a_realized = a_static + a_D` gives `a_static ← a_static + β·a_D`: **an
+integrator driven by the D branch**, which is what makes integral action viable
+in a phase where position is distrusted. It is error-driven, not a random walk —
+an under-supplied static term produces consistent downwind flow, hence a non-zero
+mean in `a_D`, which integrates in. The stability condition is the usual nested
+one: `wind_trim_tau_sec` must be slower than the lateral D loop.
+
+Four safety properties, each with a test:
+
+| Property | Mechanism |
+|---|---|
+| One neighbourhood, not two | Both FINAL_PROBE and DESCEND clamp to `seed ± wind_trim_deviation_limit_m_s2` around the *same* passive APPROACH seed |
+| Missing evidence freezes it | No target or no valid flow → the update returns without touching the bias |
+| No post-commit re-litigation | DESCEND adaptation changes commands only; feasibility is decided once |
+| The feedforward never enters a gate | Gates consume the residual envelope; the static term is the mean subtracted off before it |
+
+`docs/WIND_REJECTION.md` is the full design note — derivation, tuning table,
+what to plot when it misbehaves, and the known limitations.
 
 ---
 
@@ -1001,6 +1202,71 @@ no partially initialised window to observe and the cycle is gone outright.
 `from bee_control.mission import MissionRoutine` behaves exactly as before, and
 the previously-fatal case above now imports cleanly.
 
+### 7.8 Wind rejection — ADDED
+
+The static/dynamic acceleration split (§5.5). Three pieces:
+`VisualCenterAdaptation` for the far field, the roll/pitch probe means as the
+near-field seed, and the EMA in
+`MissionRoutine._update_near_field_lateral_bias()` that keeps it live through
+FINAL_PROBE and DESCENT.
+
+Nothing was removed to make room for it. The lateral PD law, the gates and the
+probe conditioning are unchanged; the feature reads a quantity
+(`PlatformProbe.mean_accel`) that was already being computed and thrown away.
+
+### 7.9 `descent_lateral_bias_*` → `wind_trim_*` — RENAMED
+
+The adaptation time constant and the deviation bound are **shared by FINAL_PROBE
+and DESCENT**, so a `descent_` prefix implied a separation that does not exist.
+`routine.py` even carried a comment explaining that FINAL_PROBE was reusing the
+descent knob "until flight-validated" — a note that outlived its truth and has
+been removed. Seven fields renamed in total, with a deprecation shim; see §3.2.
+
+Also fixed in the same pass: `BeeConfig.default()` never wired
+`control_period_sec` into `MissionConfig`, despite a comment claiming it was
+derived. Changing `SchedulingConfig.control_period_sec` silently left the
+mission's stability-`dt` fallback behind at its own literal `0.005`. Now wired,
+renamed to `stability_dt_fallback_sec` to end the collision, and covered by
+`test_derived_values_are_wired`.
+
+### 7.10 FOV-saturation handoff → visual-height hold — ABANDONED
+
+**The single biggest behavioural change since the previous revision of this
+document.** APPROACH_PROBE used to hand off to FINAL_PROBE when the target
+crossed an area-fraction threshold — effectively, when the box saturated the
+frame.
+
+It now runs a slow outer P loop on **log visual scale**. For a planar target,
+`q = 0.5·ln(area_fraction)` is a log-linear range coordinate and `q̇` is the same
+expansion-rate quantity the inner vertical PI already regulates, so the outer
+loop commands `D*` directly and brakes on visual scale. Handoff requires the
+whole hold condition — centred, flow valid, **not** FOV-saturated,
+`|log scale error| ≤ tol`, `|D| ≤ tol` — sustained for `approach_hold_dwell_sec`.
+
+Three consequences worth internalising:
+
+- **FOV saturation is now a fault, not a trigger.** A saturated box is not a
+  range measurement, so APPROACH commands a bounded *retreat* until valid visual
+  scale returns.
+- **FINAL_PROBE no longer has a `D*` entry ramp.** APPROACH hands it an already
+  settled operating point at near-zero divergence, so the phase holds flat at
+  `D* = 0` from its first tick. The old sub-state diagram showed an
+  `entry_ramp → hold` pair; there is only `hold`.
+- **`near_field_height_m` is now a calibration of `approach_hold_area_fraction`,**
+  not of a saturation geometry. Re-measure it from truth logs whenever the area
+  fraction changes.
+
+### 7.11 Probe envelope carry-over → full reset — ABANDONED
+
+`retune()` was designed to preserve mean and peak so an envelope could span the
+far → near transition. The provenance rule won instead: no APPROACH-era sample
+may reach a feasibility gate, so `_begin_final_probe_measurement()` calls
+`reset()` on all three probes *and* the handoff trim before retuning.
+
+The preserving path in `retune()` still exists and is still correct in
+isolation, but has no live caller. Its docstring now says so, rather than
+describing a handoff that no longer happens.
+
 ## Part 8 — "I want to change X" → edit this
 
 | I want to… | Edit | Also touch |
@@ -1013,6 +1279,9 @@ the previously-fatal case above now imports cleanly.
 | **Change the feasibility maths** | `mission/gates.py` | `MissionRoutine.TELEMETRY_FIELDS` if new outputs |
 | **Change the `k(t)` descent trajectory** | `mission/schedule.py` | — |
 | **Change the probe conditioning** | `mission/probe.py` | — |
+| **Change wind rejection (near field)** | `MissionRoutine._update_near_field_lateral_bias` | `core/config.py` §8 (`wind_trim_*`); read `docs/WIND_REJECTION.md` first |
+| **Change wind rejection (far field)** | `mission/visual_center_adaptation.py` | `core/config.py` §2 (`center_visual_adaptation_*`) |
+| **Change the APPROACH → FINAL_PROBE handoff** | `mission/phases/approach_probe.py` | `approach_hold_*` knobs; re-measure `near_field_height_m` from truth logs |
 | **Change the `chi` bandwidth test** | `mission/visual_mismatch.py` | `gates.compute_tracking_gate` for the verdict |
 | **Change how a command is formed from measurements** | `control/control_law.py` | — |
 | **Add a scheduled gain** | `mission/types.py` (`MissionControl` + `control_kwargs()`) + `control_law.compute()` signature | the phase that sets it |
@@ -1027,6 +1296,7 @@ the previously-fatal case above now imports cleanly.
 | **Add a log column** | the subsystem's `telemetry_fields()` + `telemetry()` | nothing in `diagnostics/` |
 | **Change column *order*** | source registration order in `bee_node.__init__` | — |
 | **Change the Gazebo truth layout** | `diagnostics/truth_layout.py` | the Gazebo plugin — they share this |
+| **Change the commanded-wind layout** | `diagnostics/wind_layout.py` | the WindController plugin — they share this |
 | **Change ROS topics / QoS** | `core/config.py` (`TopicsConfig`) / `bee_node.__init__` | — |
 | **Change timer rates** | `core/config.py` (`SchedulingConfig`) | — |
 | **Add a regression test** | `tests/test_contracts.py` | — |
@@ -1048,39 +1318,42 @@ the previously-fatal case above now imports cleanly.
 
 | File | Lines | One-line job |
 |---|---:|---|
-| `bee_node.py` | 607 | ROS 2 node: I/O, timers, wiring, process lifecycle |
-| `core/config.py` | 395 | Every tuning knob, seven frozen dataclass groups |
-| `core/controller_state.py` | 276 | `PX4Status`, `VisionTelemetry`, `ControllerState` |
-| `core/clock.py` | 184 | Three time bases; step-immune wall clock |
+| `bee_node.py` | 632 | ROS 2 node: I/O, timers, wiring, process lifecycle |
+| `core/config.py` | 712 | Every tuning knob, seven frozen dataclass groups |
+| `core/controller_state.py` | 284 | `PX4Status`, `VisionTelemetry`, `ControllerState` |
+| `core/clock.py` | 179 | Three time bases; step-immune wall clock |
 | `core/state.py` | 123 | The ROS-free exchanged dataclasses |
-| `vision/optical_flow.py` | 1067 | Farneback + constrained affine `lambda` fit |
-| `vision/target_acquisition.py` | 456 | NN-free colourfulness detector |
+| `vision/optical_flow.py` | 1070 | Farneback + constrained affine `lambda` fit |
+| `vision/target_acquisition.py` | 464 | NN-free colourfulness detector |
 | `vision/derotation.py` | 350 | Body-rate compensation + `AngularRateBuffer` |
 | `vision/vision_worker.py` | 199 | The out-of-process vision loop |
-| `mission/routine.py` | 1122 | `MissionRoutine`: state, dispatch, gates wiring, telemetry |
+| `mission/routine.py` | 1691 | `MissionRoutine`: state, dispatch, gates wiring, telemetry |
 | `mission/gates.py` | 361 | Vertical / lateral / tracking feasibility maths |
 | `mission/visual_mismatch.py` | 298 | Height-free `chi` bandwidth estimator |
-| `mission/types.py` | 229 | `MissionInputs`, `MissionControl`, `ControlEffect`, `PhaseSpec` |
-| `mission/probe.py` | 226 | `PlatformProbe`, `ProbeResult`, `ThrustModel` |
-| `mission/schedule.py` | 109 | `k(t)`, `critical_time`, `predicted_height` |
-| `mission/math_utils.py` | 35 | `clamp`, `raised_cosine01`, `G_ACCEL`, `blank` |
-| `mission/phases/final_probe.py` | 171 | Near-field hold; the verdict and three-way handoff |
-| `mission/phases/approach_probe.py` | 160 | Far-field descent while probes build envelopes |
-| `mission/phases/center.py` | 158 | Visual hover until centred and settled |
-| `mission/phases/descend.py` | 154 | Scheduled-gain descent, per-axis |
-| `mission/phases/infeasible.py` | 84 | Active hover after rejection + structured reason |
-| `mission/phases/__init__.py` | 66 | The phase registry |
+| `mission/types.py` | 253 | `MissionInputs`, `MissionControl`, `ControlEffect`, `PhaseSpec` |
+| `mission/probe.py` | 232 | `PlatformProbe`, `ProbeResult`, `ThrustModel` |
+| `mission/visual_center_adaptation.py` | 161 | Far-field adaptive visual centre (wind rejection) |
+| `mission/trim.py` | 125 | `VisualTrim`: slow image equilibrium vs. live residual |
+| `mission/schedule.py` | 118 | `k(t)`, `critical_time`, `predicted_height` |
+| `mission/math_utils.py` | 31 | `clamp`, `raised_cosine01`, `G_ACCEL`, `blank` |
+| `mission/phases/center.py` | 238 | Visual hover until centred and settled; learns the adaptive centre |
+| `mission/phases/approach_probe.py` | 190 | Far-field descent + visual-height hold; probes build envelopes |
+| `mission/phases/descend.py` | 167 | Scheduled-gain descent, per-axis |
+| `mission/phases/final_probe.py` | 103 | Near-field hold; the verdict and three-way handoff |
+| `mission/phases/infeasible.py` | 86 | Active hover after rejection + structured reason |
+| `mission/phases/__init__.py` | 72 | The phase registry |
 | `mission/phases/aborted.py` | 62 | Terminal, latched by the node |
-| `mission/phases/probe_hold.py` | 60 | `probe_only` mode |
+| `mission/phases/probe_hold.py` | 62 | `probe_only` mode |
 | `mission/phases/landed.py` | 60 | Terminal, latched by the node |
-| `control/control_law.py` | 597 | Acceleration-domain visual PD + allocation |
+| `control/control_law.py` | 632 | Acceleration-domain visual PD + allocation |
 | `interfaces/mavsdk_worker.py` | 402 | Takeoff + terminal motor stop |
 | `interfaces/flight_sequencer.py` | 276 | Outer lifecycle + setpoint authority |
 | `interfaces/px4_interface.py` | 121 | uORB adapter |
-| `diagnostics/diagnostics_writer.py` | 196 | Both CSVs, schema assembly |
+| `diagnostics/diagnostics_writer.py` | 232 | All three CSVs, schema assembly |
 | `diagnostics/truth_layout.py` | 116 | Gazebo truth field layout |
 | `diagnostics/telemetry.py` | 102 | The `TelemetrySource` contract |
-| `tests/test_contracts.py` | 424 | ROS-free contract regression tests |
+| `diagnostics/wind_layout.py` | 38 | Commanded-wind field layout |
+| `tests/test_contracts.py` | 1163 | ROS-free contract regression tests |
 | `tests/_optical_flow_debug.py` | ~780 | Divergence-reduction bench, synthetic scene, analytic truth |
 | `tests/_optFlow_targetAcqu_debug.py` | ~600 | End-to-end detector -> ROI -> flow, scored under FOV saturation |
 | `tests/_divergence_estimators.py` | ~430 | The seven reductions + shared comparison rendering |
@@ -1100,11 +1373,14 @@ makes it easy to miss. `find_packages()` fixes it, provided every folder has an
 | Group | Guarantees |
 |---|---|
 | Telemetry | Every source declares what it emits; no column collisions; the writer rejects undeclared keys; flow owns its timing schema; unknown timing keys are *reported*, not raised |
-| Config | An unknown mission knob raises; derived values are actually wired |
+| Config | An unknown mission knob raises; derived values are actually wired; every alias in `RENAMED_MISSION_FIELDS` points at a live field; deprecated names still work and warn; setting old **and** new name raises; a misspelled attribute still raises `AttributeError`; every float knob names its unit |
 | Phases | Every registered phase dispatches; transitions **declare** their control effects; terminal substates are latched, not overwritten |
 | Sequencer | Reaches `closed_loop` and both terminals; offboard timeout aborts |
 | `chi` | Regression uses old values and real `dt` spacing; constant divergence keeps physical `chi` in envelope; envelope reset keeps the derivative warm; the gate is advisory until enabled; an unready probe never rejects |
 | Clock | `SteadyWallClock` survives a backward step; PX4 stamps stay monotonic across one; steps reach the log |
+| Wind trim | Feedforward is exactly zero until FINAL_PROBE; the seed comes from the passive APPROACH probe mean; the bias tracks the realized command at the configured `tau`; it holds outside the phase and on missing visual evidence; it cannot leave the APPROACH-seeded neighbourhood; DESCENT starts from the exact FINAL_PROBE value and shares that one neighbourhood |
+| Adaptive centre | The learned bias recentres while preserving the steady P error; large flow slows adaptation; the bias keeps adapting through APPROACH; it is not inverse-P-scaled; no acceleration feedforward leaks into the far field |
+| Trim | The handoff trim admits no APPROACH-era sample; an unseeded trim cannot satisfy a gate and survives a dropout; every trim knob is a reachable config field |
 
 If you change a seam, one of these should fail. If none do, the seam probably wasn't
 covered — add the test.

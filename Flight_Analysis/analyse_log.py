@@ -1433,8 +1433,9 @@ def _plot_probe_axis(
 ) -> None:
 	"""Plot the probe quantities that matter independently of wind.
 
-	Panel 1 compares the command-derived probe acceleration with the actual
-	Gazebo drone-platform relative acceleration and the gate envelope.
+	Panel 1 compares the command-derived probe acceleration with the full
+	truth acceleration in the gate coordinates: the Gazebo drone-platform
+	dynamic acceleration shifted by the probe's estimated static mean.
 	Panel 2 shows the slowly varying probe mean, gate envelope and stability
 	capacity in the exact coordinates used by the feasibility logic.
 
@@ -1459,6 +1460,10 @@ def _plot_probe_axis(
 	)
 
 	static_mean = _num(c, f"mission_{probe_prefix}_mean_accel_m_s2").to_numpy(float)
+	# The feasibility envelope is expressed around this static operating point.
+	# Put Gazebo's dynamic relative acceleration in the same coordinates before
+	# comparing the truth trace with the probe command and gate envelope.
+	full_truth_accel = relative_accel + static_mean
 	peak_used = _num(c, peak_column).to_numpy(float)
 	capacity_ceiling = _last_finite_value(c_all, capacity_ceiling_column)
 
@@ -1480,13 +1485,13 @@ def _plot_probe_axis(
 		linewidth=1.8,
 		label="Command-derived probe acceleration",
 	)
-	if np.isfinite(relative_accel).any():
+	if np.isfinite(full_truth_accel).any():
 		axes[0].plot(
 			t,
-			relative_accel,
+			full_truth_accel,
 			alpha=0.78,
 			linewidth=1.6,
-			label="Gazebo drone-platform relative acceleration",
+			label="Full truth acceleration (Gazebo dynamic + probe static mean)",
 		)
 	if upper_peak is not None:
 		peak_line = axes[0].plot(

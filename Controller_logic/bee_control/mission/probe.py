@@ -4,6 +4,22 @@ Three instances run in parallel (vertical, roll, pitch). APPROACH_PROBE uses
 them for diagnostics; FINAL_PROBE resets them and is the only phase whose
 envelopes feed the feasibility gates. They measure the THRUST-COMMAND RESIDUAL,
 never a physical acceleration.
+
+Two separated quantities, two consumers
+---------------------------------------
+``update_accel`` splits each command stream into a slow EMA mean and the
+residual about it, and the two halves are consumed by different subsystems:
+
+``peak_accel``   the leaky-max envelope of the RESIDUAL -- the dynamic part.
+                 Feeds the feasibility gates. This is what the probe exists for.
+``mean_accel``   the EMA itself -- the static part. The roll/pitch instances'
+                 means are read once, at the FINAL_PROBE handoff, as the passive
+                 seed for the static lateral (wind) trim. See
+                 ``MissionRoutine._begin_final_probe_measurement`` and
+                 ``docs/WIND_REJECTION.md``.
+
+The probe itself stays passive either way: it observes command history and
+injects nothing. Only the phase decides what to do with the two numbers.
 """
 from __future__ import annotations
 
