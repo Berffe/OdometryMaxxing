@@ -16,10 +16,11 @@ dataclass field either exists or raises at construction.
 Three groups, three owners
 --------------------------
 * ``SchedulingConfig`` / ``TopicsConfig`` / ``VisionConfig``: node plumbing.
-* ``CameraConfig`` / ``ControlConfig`` / ``MissionConfig``: flight tuning.
+* ``CameraConfig`` / ``ControlConfig`` / ``StabilityDelayBudget`` /
+  ``MissionConfig``: flight tuning.
 * ``MavsdkConfig``: the takeoff/termination side channel.
 
-Derived quantities (``roll_kappa``, ``stability_dt_sec``, the probe time
+Derived quantities (``roll_kappa``, the two stability dts, the probe time
 constants scaled off the platform period) are computed once in
 ``BeeConfig.default()`` so the relationship between them stays visible instead
 of being re-derived at three call sites.
@@ -152,7 +153,7 @@ class VisionConfig:
     enable_derotation: bool = True
     input_queue_max: int = 2
     lost_target_timeout_sec: float = 2.0
-    show_camera: bool = True
+    show_camera: bool = False
     angular_rate_buffer_len: int = 256
 
 
@@ -161,11 +162,6 @@ class CameraConfig:
     horizontal_fov_deg: float = 80.0
     vertical_fov_deg: float = 80.0
     frame_period_sec: float = 1.0 / 60.0
-    # Retained design target, not a measurement: the latency the stability
-    # margin is sized against.
-    processing_latency_budget_sec: float = 0.02
-    # Command-shaping filter + slew group delay, lumped.
-    smoothing_delay_sec: float = 0.03
 
     @property
     def horizontal_fov_rad(self) -> float:
@@ -180,19 +176,72 @@ class CameraConfig:
     def pitch_kappa(self) -> float:
         return 1.0 / math.tan(math.radians(self.vertical_fov_deg / 2.0))
 
-    def stability_dt_sec(self, scheduling: SchedulingConfig) -> float:
-        """Total visual-loop delay the de Croon stability ceiling is built on.
 
-        Frame period + vision compute budget + setpoint publication period +
-        command smoothing. This is NOT the control tick: the ceiling is set by
-        how stale the newest measurement can be, not by how often we act.
-        """
+@dataclass(frozen=True)
+class StabilityDelayBudget:
+    """The visual-loop delay the de Croon ceiling is built on, itemised.
+
+    ``k_ceiling(h) = 2*s*h/dt`` and its lateral counterpart are set by how STALE
+    the newest measurement can be by the time the vehicle acts on it -- not by
+    how often the control loop runs. Every field below is one physical
+    contributor to that staleness; the total is their sum.
+
+    This group OWNS the budget: each term appears here once, under one name, and
+    nothing else in the package re-declares it. Two of the terms are also real
+    operational values with their own owners -- the camera's frame period and
+    the PX4 setpoint timer period -- so ``BeeConfig.default()`` wires those in
+    rather than letting a second literal drift away from the first.
+
+    Adding a contributor is one field plus one line in ``total_sec`` and
+    ``itemised()``. If it applies to only one channel, give it a default of 0.0
+    and set it in whichever of ``BeeConfig.vertical_stability_delay`` /
+    ``lateral_stability_delay`` pays it.
+    """
+
+    #: Time between camera frames: the newest measurement is on average half a
+    #: frame old and at worst a whole one.
+    #: <- CameraConfig.frame_period_sec, wired in BeeConfig.default().
+    camera_frame_period_sec: float = 1.0 / 60.0
+    #: Detection + optical flow compute. Measured across several test runs.
+    vision_processing_sec: float = 0.020
+    #: How long a computed setpoint waits before it is published to PX4.
+    #: <- SchedulingConfig.px4_setpoint_period_sec, wired in BeeConfig.default().
+    setpoint_publication_sec: float = 0.010
+    #: Command-shaping filter + slew limiter group delay, lumped. Measured
+    #: across several test runs.
+    command_smoothing_sec: float = 0.030
+    #: PX4's own attitude/rate loop: the lag between an attitude SETPOINT being
+    #: accepted and the airframe actually holding that attitude. LATERAL ONLY --
+    #: the vertical channel commands thrust, which PX4 applies directly with no
+    #: inner loop in between, so it does not pay this term.
+    #:
+    #: THE ONE TERM STILL AWAITING VALIDATION. It feeds a safety ceiling, and
+    #: too small a value is the OPTIMISTIC direction: it claims a higher
+    #: admissible lateral gain than the airframe can actually carry. To measure
+    #: it, command a small attitude step and log the delay between the setpoint
+    #: timestamp and vehicle_attitude crossing ~63% of the step.
+    attitude_loop_sec: float = 0.10
+
+    @property
+    def total_sec(self) -> float:
         return (
-            self.frame_period_sec
-            + self.processing_latency_budget_sec
-            + scheduling.px4_setpoint_period_sec
-            + self.smoothing_delay_sec
+            self.camera_frame_period_sec
+            + self.vision_processing_sec
+            + self.setpoint_publication_sec
+            + self.command_smoothing_sec
+            + self.attitude_loop_sec
         )
+
+    def itemised(self) -> Mapping[str, float]:
+        """name -> seconds, in the order the delay is physically incurred."""
+        return {
+            "camera_frame_period_sec": self.camera_frame_period_sec,
+            "vision_processing_sec": self.vision_processing_sec,
+            "setpoint_publication_sec": self.setpoint_publication_sec,
+            "command_smoothing_sec": self.command_smoothing_sec,
+            "attitude_loop_sec": self.attitude_loop_sec,
+            "total_sec": self.total_sec,
+        }
 
 
 @dataclass(frozen=True)
@@ -207,6 +256,7 @@ class ControlConfig:
     roll_kd: float = 3.5
     pitch_kp: float = 4.0
     pitch_kd: float = 3.5
+
 
 
 @dataclass(frozen=True)
@@ -259,10 +309,21 @@ class MissionConfig:
     # ----------------------------------------------------------------------
     roll_kappa: float = 1.0               # <- CameraConfig.roll_kappa
     pitch_kappa: float = 1.0              # <- CameraConfig.pitch_kappa
-    # Total visual-loop delay the de Croon ceiling is sized against: frame
-    # period + vision compute + setpoint publication + command smoothing.
-    # NOT the control tick.  <- CameraConfig.stability_dt_sec(scheduling)
-    stability_dt_sec: float = 1.0 / 30.0
+    # Total visual-loop delay the de Croon ceiling is sized against.  NOT the
+    # control tick: the ceiling is set by how STALE the newest measurement can
+    # be, not by how often we act.  See StabilityDelayBudget for the itemised
+    # breakdown and for how to add a term.
+    #
+    # Two of them, because the two channels do not carry the same delay.  The
+    # vertical command is thrust, applied by PX4 directly.  The lateral command
+    # is an ATTITUDE setpoint, so it additionally waits on PX4's inner
+    # attitude/rate loop -- which means the lateral ceiling is strictly lower
+    # than the vertical one at the same height, and the lateral axes have less
+    # margin than a single shared dt implied.
+    #
+    # <- BeeConfig.vertical_stability_delay() / lateral_stability_delay()
+    vertical_stability_dt_sec: float = 1.0 / 30.0
+    lateral_stability_dt_sec: float = 1.0 / 30.0
     roll_d_gain: float = 3.5              # <- ControlConfig.roll_kd
     pitch_d_gain: float = 3.5             # <- ControlConfig.pitch_kd
     # Control tick period, used ONLY as the stability_dt fallback.  The mission
@@ -348,7 +409,7 @@ class MissionConfig:
     # q = 0.5*ln(area_fraction) is a log-linear range coordinate and q_dot is
     # the same expansion-rate quantity regulated by the inner vertical PI.
     approach_hold_area_fraction: float = 0.75
-    approach_visual_p_gain_1_s: float = 0.50
+    approach_visual_p_gain_1_s: float = 0.40
     approach_retreat_divergence_limit: float = 0.03
     approach_hold_log_scale_tolerance: float = 0.05
     approach_hold_divergence_tolerance_1_s: float = 0.1
@@ -360,6 +421,31 @@ class MissionConfig:
     # FINAL_PROBE starts only after APPROACH has already established the visual
     # height hold and near-zero divergence.  Its measurements alone feed gates.
     final_probe_duration_sec: float = 3.0 * PROBE_DESIGN_PERIOD_SEC
+
+    # --- Residual lateral centring ----------------------------------------
+    # FINAL_PROBE keeps a small image-position P term instead of removing it.
+    #
+    # P on image position is INTEGRAL action on optical flow, because position
+    # is the integral of velocity.  It is the only term in the lateral loop
+    # that can observe a bias in the flow measurement.  With P at exactly zero
+    # the loop holds VELOCITY, so a constant flow bias integrates without bound:
+    # the 2026-08-19 09:42 run drifted at ~12 mm/s for the whole 20 s hold and
+    # touched down 15.5 cm off, 85% of leg_clearance_m.  The measured bias of
+    # ~0.013 norm/s implies a steady offset of only ~2.5 cm at this scale.
+    #
+    # It is cheap.  In that run the image offset was 26x quieter than the flow
+    # in command units, so this P adds ~2% to the D branch's noise while
+    # restoring a bounded position error.
+    #
+    # Small on purpose.  The steady wind force is NOT this term's job -- the
+    # static acceleration trim (section 8) carries it, and the wind-trim EMA
+    # absorbs whatever mean force P contributes, so DESCENT inherits it in the
+    # feedforward when P is dropped.  P here handles the residual centring
+    # error only.  Raising it toward the APPROACH value would start competing
+    # with the feedforward for the same disturbance.
+    #
+    # Set to 0.0 to restore the previous velocity-hold behaviour exactly.
+    final_probe_lateral_p_scale: float = 0.3
 
     # ======================================================================
     # 5. DESCENT -- scheduled-gain terminal segment
@@ -379,7 +465,7 @@ class MissionConfig:
     # Height corresponding to the APPROACH visual-hold / FINAL_PROBE handoff.
     # This is a camera-geometry calibration used only by the feasibility bounds;
     # update it from truth logs whenever approach_hold_area_fraction changes.
-    near_field_height_m: float = 0.50
+    near_field_height_m: float = 0.40
 
     # Starting exploration gain k_explore for the descent schedule.
     initial_thrust_gain: float = 6.50
@@ -456,7 +542,7 @@ class MissionConfig:
     # remain slower than the lateral D loop so the static estimate cannot chase
     # the oscillatory flow -- that is the loop's stability condition, not a
     # preference.
-    wind_trim_tau_sec: float = 6.0
+    wind_trim_tau_sec: float = 5.0 * PROBE_DESIGN_PERIOD_SEC
     # Hard bound around the passive APPROACH seed, shared across FINAL_PROBE and
     # DESCENT.  ONE neighbourhood for both phases: continuing to adapt after the
     # descent commitment does not buy a second deviation allowance.
@@ -471,18 +557,41 @@ class MissionConfig:
     # ======================================================================
     # 9. Lateral gain schedule
     # ======================================================================
-    # 2026-08-18 wind retune.  With ControlConfig = (Kp, Kd) = (4.0, 3.0),
-    # the effective CENTER gains are (4.0, 2.4) and the fully-ramped APPROACH
-    # gains are (3.0, 1.95). FINAL_PROBE disables P completely and therefore
-    # flies Kd = 1.95. At the current camera/delay/safety constants that is
-    # below even the safety-scaled lateral ceiling at leg height (~2.35), while
-    # remaining comfortably above the ~0.7 disturbance floor observed in the
-    # 2026-08-18 approach diagnostics.
-    center_to_probe_lateral_ramp_sec: float = 2.0
+    # The lateral D schedule mirrors the vertical one exactly: ONE far-field
+    # gain is configured, and the near-field value it decays to is DERIVED from
+    # the same ceiling the descent targets.
+    #
+    #   vertical   k_probe    = min(initial_thrust_gain,
+    #                              ceiling_margin * k_ceiling(near_field_height))
+    #   lateral    Kd_probe   = min(d_gain * center_lateral_d_scale,
+    #                              ceiling_margin * k_ceiling_lat(near_field_height))
+    #
+    # Same near_field_height_m, same ceiling_margin, same ceiling_safety_factor,
+    # and the same commanded-divergence-integral driver for the decay, so the
+    # lateral gain reaches its near-field value exactly when the vertical one
+    # does.  The min() only ever REDUCES the gain to become admissible.
+    #
+    # There is deliberately no configured near-field lateral D.  Asserting one
+    # makes its admissibility a coincidence between three unrelated constants:
+    # the lateral ceiling is a function of kappa, lateral_stability_dt_sec and
+    # near_field_height_m, so a wider lens, a slower loop or a lower handoff
+    # silently moves it out from under a hand-set value.  Deriving it means a
+    # platform whose lateral authority IS constrained gets a real decay instead
+    # of a number that happens to fit this airframe.
+    #
+    # The ceiling is evaluated PER AXIS, because roll and pitch have their own
+    # kappa and their own D gain whenever the lens is not square.
+    #
+    # FINAL_PROBE's D is deliberately NOT attenuated by the large-offset blend
+    # (MissionControl.scale_lateral_d_with_offset=False), so the Kd the gates
+    # are computed against is the Kd actually flown.
+    #
+    # P has no ceiling analogue -- it is not the flow loop the de Croon bound
+    # applies to -- so its endpoint stays configured and it rides the same
+    # decay curve as D.
     center_lateral_p_scale: float = 1.00
     center_lateral_d_scale: float = 0.80
     probe_lateral_p_scale: float = 0.75
-    probe_lateral_d_scale: float = 0.65
 
     # ======================================================================
     # 10. Visual synchronisation (tracking) gate
@@ -580,6 +689,9 @@ class BeeConfig:
     vision: VisionConfig = field(default_factory=VisionConfig)
     camera: CameraConfig = field(default_factory=CameraConfig)
     control: ControlConfig = field(default_factory=ControlConfig)
+    stability_delay: StabilityDelayBudget = field(
+        default_factory=StabilityDelayBudget
+    )
     mission: MissionConfig = field(default_factory=MissionConfig)
     mavsdk: MavsdkConfig = field(default_factory=MavsdkConfig)
 
@@ -587,7 +699,7 @@ class BeeConfig:
     def default(cls) -> "BeeConfig":
         """The flown configuration, with derived mission values wired in.
 
-        ``roll_kappa`` / ``pitch_kappa`` / ``stability_dt_sec`` are functions of
+        ``roll_kappa`` / ``pitch_kappa`` / the two stability dts are functions of
         the camera and scheduling configs. Computing them here keeps the single
         source of truth for FOV and loop delay in one object each, instead of
         three module constants that can drift apart.
@@ -599,10 +711,21 @@ class BeeConfig:
         camera = CameraConfig()
         scheduling = SchedulingConfig()
         control = ControlConfig()
+        # The two terms that are also real operational values keep ONE owner
+        # each; the literals in StabilityDelayBudget are only the standalone
+        # fallback, exactly like MissionConfig section 1.
+        stability_delay = replace(
+            StabilityDelayBudget(),
+            camera_frame_period_sec=camera.frame_period_sec,
+            setpoint_publication_sec=scheduling.px4_setpoint_period_sec,
+        )
         mission = MissionConfig(
             roll_kappa=camera.roll_kappa,
             pitch_kappa=camera.pitch_kappa,
-            stability_dt_sec=camera.stability_dt_sec(scheduling),
+            vertical_stability_dt_sec=replace(
+                stability_delay, attitude_loop_sec=0.0
+            ).total_sec,
+            lateral_stability_dt_sec=stability_delay.total_sec,
             roll_d_gain=control.roll_kd,
             pitch_d_gain=control.pitch_kd,
             # Previously omitted: the mission kept its own literal 0.005 while
@@ -611,8 +734,25 @@ class BeeConfig:
             stability_dt_fallback_sec=scheduling.control_period_sec,
         )
         return cls(
-            scheduling=scheduling, camera=camera, control=control, mission=mission
+            scheduling=scheduling,
+            camera=camera,
+            control=control,
+            stability_delay=stability_delay,
+            mission=mission,
         )
+
+    def vertical_stability_delay(self) -> StabilityDelayBudget:
+        """Delay on the thrust channel: no inner loop between us and the motors.
+
+        The whole budget minus the attitude-loop term, which the vertical
+        channel does not pay.
+        """
+        return replace(self.stability_delay, attitude_loop_sec=0.0)
+
+    def lateral_stability_delay(self) -> StabilityDelayBudget:
+        """The full budget: a lateral command is an ATTITUDE setpoint, so no
+        lateral acceleration exists until PX4 has driven the airframe there."""
+        return self.stability_delay
 
     @classmethod
     def from_ros_parameters(cls, node) -> "BeeConfig":
@@ -653,12 +793,23 @@ class BeeConfig:
         return replace(base, mission=base.mission.with_overrides(**overrides))
 
     def describe(self) -> Mapping[str, Any]:
-        """Flat name -> value view, for a one-shot startup log row."""
+        """Flat name -> value view, for a one-shot startup log row.
+
+        The per-channel totals are added on top of the ``stability_delay``
+        group: they are DERIVED (the group holds the terms, not the two sums),
+        and they are the numbers a review most often wants spelled out.
+        """
         out: dict[str, Any] = {}
         for group in fields(self):
             value = getattr(self, group.name)
             for f in fields(value):
                 out[f"{group.name}.{f.name}"] = getattr(value, f.name)
+        out["stability_delay.vertical_total_sec"] = (
+            self.vertical_stability_delay().total_sec
+        )
+        out["stability_delay.lateral_total_sec"] = (
+            self.lateral_stability_delay().total_sec
+        )
         return out
 
 
@@ -671,6 +822,12 @@ class BeeConfig:
 #: Accepted by ``with_overrides()``, ``from_ros_parameters()`` and attribute
 #: access, each with a ``DeprecationWarning``.  Delete an entry once no launch
 #: file, notebook or analysis script still uses it.
+#:
+#: Only true RENAMES belong here. ``stability_dt_sec`` was deliberately NOT
+#: added when it became vertical_/lateral_: aliasing a SPLIT onto one of its two
+#: halves would quietly leave the other half at its default, which is the exact
+#: class of silent mis-tuning this module exists to prevent. An old launch file
+#: setting it now fails loudly instead.
 RENAMED_MISSION_FIELDS: Mapping[str, str] = {
     # The static lateral term spans FINAL_PROBE and DESCENT; the old prefix
     # implied FINAL_PROBE had a separate tau and a separate bound.

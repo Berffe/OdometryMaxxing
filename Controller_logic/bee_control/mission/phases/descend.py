@@ -65,9 +65,9 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
         if routine.pitch_gate.k_descend_start > 1e-9 else 1.0
     )
     roll_p_scale = 0.0
-    roll_d_scale = routine._probe_lateral_d_scale * roll_ratio
+    roll_d_scale = routine.roll_probe_lateral_d_scale * roll_ratio
     pitch_p_scale = 0.0
-    pitch_d_scale = routine._probe_lateral_d_scale * pitch_ratio
+    pitch_d_scale = routine.pitch_probe_lateral_d_scale * pitch_ratio
 
     # Legacy shared fields remain populated for compatibility and represent the
     # most demanding active lateral axis. ControlLaw receives the specific

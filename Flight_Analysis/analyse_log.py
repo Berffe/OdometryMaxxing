@@ -77,6 +77,30 @@ CONTROL_HOVER_THRUST = 0.73
 G_ACCEL = 9.80665
 
 
+# Current ControlLaw / ControlConfig lateral constants, mirrored here so the
+# gain plots can show the coefficient the controller ACTUALLY applies rather
+# than the unitless phase scale.  None of these are logged: the base gains live
+# in ControlConfig and the blend lives in ControlLaw's constructor, and neither
+# reaches the CSV.  Keep them in step with core/config.py and control_law.py --
+# a mismatch here misreports the plots, it cannot affect a flight.
+#
+# The base D gain is preferentially IDENTIFIED from the log instead (see
+# _identify_base_lateral_d_gain); these are the fallback for runs that never
+# populate a scheduled physical K.
+CONTROL_ROLL_KP = 4.0
+CONTROL_PITCH_KP = 4.0
+CONTROL_ROLL_KD = 3.5
+CONTROL_PITCH_KD = 3.5
+
+# ControlLaw._offset_magnitude_gain_scale: full gain below the small threshold,
+# raised-cosine down to the floor at the large one.  Applied to P always, and to
+# D only when position P is active AND the phase did not opt out (FINAL_PROBE
+# does, so its D branch equals what the feasibility gates were computed with).
+OFFSET_BLEND_SMALL_THRESHOLD = 0.15
+OFFSET_BLEND_LARGE_THRESHOLD = 0.55
+OFFSET_BLEND_FLOOR = 0.45
+
+
 @dataclass(frozen=True)
 class AnalysisData:
 	controller: pd.DataFrame
@@ -1055,6 +1079,177 @@ def plot_drone_platform_position(data: AnalysisData, out: Path) -> None:
 	_finish_figure(fig, axes, data, out / "drone_platform_position.png")
 
 
+def _offset_magnitude_gain_scale(c: pd.DataFrame) -> np.ndarray:
+	"""Reproduce ControlLaw's large-offset blend from the logged offsets.
+
+	The blend is a raised cosine on the RADIAL error the P branch sees -- the
+	measured offset minus the phase's visual setpoint, both axes together -- and
+	it multiplies the phase scales before they ever reach the gains. It is not
+	logged, so a plot of the phase scale alone overstates the applied gain
+	wherever the target sits off centre. CENTER is the obvious case: it commands
+	scale 1.0 while the vehicle is still capturing a large offset, so the gain it
+	actually applies can be barely half of what the schedule says.
+	"""
+	error_x = _num(c, "target_offset_x") - _num(c, "mission_roll_offset_setpoint").fillna(0.0)
+	error_y = _num(c, "target_offset_y") - _num(c, "mission_pitch_offset_setpoint").fillna(0.0)
+	err = np.hypot(error_x.to_numpy(float), error_y.to_numpy(float))
+
+	span = max(OFFSET_BLEND_LARGE_THRESHOLD - OFFSET_BLEND_SMALL_THRESHOLD, 1e-9)
+	frac = np.clip((err - OFFSET_BLEND_SMALL_THRESHOLD) / span, 0.0, 1.0)
+	shaped = 0.5 * (1.0 - np.cos(np.pi * frac))
+	scale = 1.0 + (OFFSET_BLEND_FLOOR - 1.0) * shaped
+
+	# No target, no offset, no blend: ControlLaw skips the whole lateral branch.
+	scale[~np.isfinite(err)] = np.nan
+	return scale
+
+
+def _identify_base_lateral_d_gain(c: pd.DataFrame, axis: str) -> float:
+	"""Recover the immutable base K_D from the log, or fall back to the constant.
+
+	Rows where both the independently scheduled physical K and the exact per-axis
+	scale are present give their ratio directly; DESCEND always supplies both.
+	FINAL_PROBE / PROBE_HOLD / INFEASIBLE hold k_probe at the same scale and give
+	the same answer for a run that never descends.
+	"""
+	prefix = f"mission_{axis}"
+	axis_scale = _num(c, f"{prefix}_d_scale")
+	shared_scale = _num(c, "mission_lateral_d_scale")
+	scale_values = axis_scale.where(np.isfinite(axis_scale), shared_scale).to_numpy(float)
+
+	for column, mask in (
+		(f"{prefix}_k_applied", None),
+		(
+			f"{prefix}_k_probe",
+			np.isin(
+				_clean_string(
+					c.get("mission_substate", pd.Series("", index=c.index))
+				).to_numpy(),
+				["final_probe", "probe_hold", "infeasible"],
+			),
+		),
+	):
+		values = _num(c, column).to_numpy(float)
+		valid = (
+			np.isfinite(values)
+			& np.isfinite(scale_values)
+			& (np.abs(scale_values) > 1e-9)
+		)
+		if mask is not None:
+			valid = valid & mask
+		if np.any(valid):
+			ratios = values[valid] / scale_values[valid]
+			ratios = ratios[np.isfinite(ratios) & (ratios > 0.0)]
+			if ratios.size:
+				return float(np.nanmedian(ratios))
+
+	return CONTROL_ROLL_KD if axis == "roll" else CONTROL_PITCH_KD
+
+
+def _effective_axis_scale(c: pd.DataFrame, axis: str, branch: str) -> np.ndarray:
+	"""The phase scale ControlLaw resolves for this axis and branch.
+
+	Per-axis field when the phase supplies one, shared lateral field otherwise.
+	"""
+	axis_scale = _num(c, f"mission_{axis}_{branch}_scale")
+	shared = _num(c, f"mission_lateral_{branch}_scale")
+	return axis_scale.where(np.isfinite(axis_scale), shared).to_numpy(float)
+
+
+def _applied_lateral_gains(
+	c: pd.DataFrame, axis: str
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+	"""Return (P scheduled, P applied, D scheduled, D applied) in gain units.
+
+	"Scheduled" is base gain times the phase scale -- what the mission asked for.
+	"Applied" additionally carries ControlLaw's large-offset blend, which is what
+	the vehicle actually flew.
+
+	P always pays the blend. D pays it only when position P is active AND the
+	phase left ``scale_lateral_d_with_offset`` on; FINAL_PROBE turns it off so
+	its D branch stays exactly at the value the feasibility gates were computed
+	against.
+	"""
+	base_kp = CONTROL_ROLL_KP if axis == "roll" else CONTROL_PITCH_KP
+	base_kd = _identify_base_lateral_d_gain(c, axis)
+
+	p_scale = _effective_axis_scale(c, axis, "p")
+	d_scale = _effective_axis_scale(c, axis, "d")
+	blend = _offset_magnitude_gain_scale(c)
+
+	p_scheduled = base_kp * p_scale
+	p_applied = p_scheduled * blend
+
+	# Older logs predate the opt-out flag; they always attenuated when P was on.
+	if "mission_lateral_d_offset_attenuated" in c.columns:
+		d_attenuated = _bool(c, "mission_lateral_d_offset_attenuated").to_numpy()
+	else:
+		d_attenuated = np.ones(len(c), dtype=bool)
+	d_blend = np.where(d_attenuated & (p_scale > 1e-12), blend, 1.0)
+
+	d_scheduled = base_kd * d_scale
+	d_applied = d_scheduled * d_blend
+	return p_scheduled, p_applied, d_scheduled, d_applied
+
+
+def plot_lateral_p_gain(data: AnalysisData, out: Path) -> None:
+	"""P-gain evolution: what the schedule asked for, and what was applied."""
+	c = data.control
+	t = _relative_time(c["_sim_time"], data.t0)
+	fig, axes = plt.subplots(3, 1, figsize=(13, 9), sharex=True)
+
+	for ax, axis in ((axes[0], "roll"), (axes[1], "pitch")):
+		p_scheduled, p_applied, _, _ = _applied_lateral_gains(c, axis)
+		if np.isfinite(p_scheduled).any():
+			ax.plot(
+				t, p_scheduled, linestyle="--", linewidth=1.5, alpha=0.85,
+				label="Scheduled P gain (base x phase scale)",
+			)
+		if np.isfinite(p_applied).any():
+			ax.plot(
+				t, p_applied, linewidth=1.9,
+				label="Applied P gain (also x off-centre blend)",
+			)
+		ax.axhline(0.0, linestyle=":", linewidth=0.9, alpha=0.55)
+		ax.set_ylabel(f"{axis.capitalize()} P gain")
+		_legend(ax, ncol=2)
+
+	axes[0].set_title(
+		"Lateral P gain: schedule vs. what ControlLaw applied"
+	)
+
+	# The gap between the two curves above is entirely this blend, so show it
+	# with the radial error that drives it.
+	blend = _offset_magnitude_gain_scale(c)
+	axes[2].plot(t, blend, linewidth=1.8, label="Off-centre gain blend")
+	axes[2].axhline(
+		OFFSET_BLEND_FLOOR, linestyle="--", linewidth=1.2, alpha=0.8,
+		label=f"Blend floor ({OFFSET_BLEND_FLOOR:g})",
+	)
+	axes[2].axhline(1.0, linestyle=":", linewidth=0.9, alpha=0.55)
+
+	error_x = _num(c, "target_offset_x") - _num(c, "mission_roll_offset_setpoint").fillna(0.0)
+	error_y = _num(c, "target_offset_y") - _num(c, "mission_pitch_offset_setpoint").fillna(0.0)
+	radial = np.hypot(error_x.to_numpy(float), error_y.to_numpy(float))
+	axes[2].plot(
+		t, radial, alpha=0.75, linewidth=1.4,
+		label="Radial P error |offset - setpoint|",
+	)
+	for threshold, name in (
+		(OFFSET_BLEND_SMALL_THRESHOLD, "full gain below"),
+		(OFFSET_BLEND_LARGE_THRESHOLD, "floor at/above"),
+	):
+		axes[2].axhline(
+			threshold, linestyle="-.", linewidth=1.0, alpha=0.6,
+			label=f"{name} {threshold:g}",
+		)
+	axes[2].set_ylabel("Blend / normalized")
+	axes[2].set_xlabel("Time since common log start [s SIM]")
+	_legend(axes[2], ncol=3)
+
+	_finish_figure(fig, axes, data, out / "lateral_p_gain.png")
+
+
 def plot_gain_schedule(data: AnalysisData, out: Path) -> None:
 	c = data.control
 	t = _relative_time(c["_sim_time"], data.t0)
@@ -1075,89 +1270,26 @@ def plot_gain_schedule(data: AnalysisData, out: Path) -> None:
 	axes[0].set_title("Mission gain schedule")
 	_legend(axes[0], ncol=2)
 
-	def actual_lateral_d_gain(axis: str) -> pd.Series:
-		"""Reconstruct the D gain that ControlLaw actually receives.
-
-		The mission historically commands lateral *scales*. The independent
-		``mission_<axis>_k_applied`` quantity is the scheduled physical K used by
-		the lateral gate/descent logic and is not necessarily populated in CENTER,
-		APPROACH_PROBE or FINAL_PROBE. Plotting it directly therefore creates gaps
-		or apparent jumps that do not exist in the controller.
-
-		For every active phase the physical coefficient is instead
-
-		    K_D,actual = K_D,base * effective_axis_d_scale,
-
-		where the effective scale is the independent axis scale when available and
-		the historical shared lateral D scale otherwise.
-
-		Recover the immutable base K_D from rows where both the independently
-		scheduled K and the exact per-axis scale are logged. In DESCEND their ratio
-		is identically the base controller gain. If a run never reaches DESCEND, use
-		the FINAL_PROBE/PROBE_HOLD value k_probe and its contemporaneous scale.
-		"""
-		prefix = f"mission_{axis}"
-		axis_scale = _num(c, f"{prefix}_d_scale")
-		shared_scale = _num(c, "mission_lateral_d_scale")
-
-		# CENTER / APPROACH_PROBE / FINAL_PROBE still use the historical shared
-		# lateral scale in some mission versions. DESCEND supplies independent
-		# per-axis scales. Reconstruct the scale exactly as ControlLaw sees it:
-		# prefer the axis-specific value when present, otherwise use the shared one.
-		scale = axis_scale.where(np.isfinite(axis_scale), shared_scale)
-		scheduled = _num(c, f"{prefix}_k_applied")
-
-		scale_values = scale.to_numpy(float)
-		scheduled_values = scheduled.to_numpy(float)
-		base_gain = np.nan
-
-		# Preferred identification: DESCEND's scheduled K divided by the exact
-		# per-axis scale sent to ControlLaw. This remains valid even when roll and
-		# pitch have different independently scheduled floors.
-		valid = (
-			np.isfinite(scheduled_values)
-			& np.isfinite(scale_values)
-			& (np.abs(scale_values) > 1e-9)
-		)
-		if np.any(valid):
-			ratios = scheduled_values[valid] / scale_values[valid]
-			ratios = ratios[np.isfinite(ratios) & (ratios > 0.0)]
-			if ratios.size:
-				base_gain = float(np.nanmedian(ratios))
-
-		# Probe-only / infeasible-run fallback: k_probe is the actual D gain held
-		# during FINAL_PROBE, so k_probe / d_scale identifies the same base K_D.
-		if not np.isfinite(base_gain):
-			k_probe = _num(c, f"{prefix}_k_probe").to_numpy(float)
-			phase = _clean_string(
-				c.get("mission_substate", pd.Series("", index=c.index))
-			).to_numpy()
-			probe_phase = np.isin(phase, ["final_probe", "probe_hold", "infeasible"])
-			valid_probe = (
-				probe_phase
-				& np.isfinite(k_probe)
-				& np.isfinite(scale_values)
-				& (np.abs(scale_values) > 1e-9)
-			)
-			if np.any(valid_probe):
-				ratios = k_probe[valid_probe] / scale_values[valid_probe]
-				ratios = ratios[np.isfinite(ratios) & (ratios > 0.0)]
-				if ratios.size:
-					base_gain = float(np.nanmedian(ratios))
-
-		if np.isfinite(base_gain) and np.isfinite(scale_values).any():
-			return pd.Series(base_gain * scale_values, index=c.index, dtype=float)
-
-		# Older logs may only contain the physical scheduled K. It is preferable
-		# to show the available actual-gain samples than to relabel a unitless
-		# legacy scale as a physical gain.
-		return scheduled
-
 	def plot_lateral_axis(ax: plt.Axes, axis: str) -> None:
 		prefix = f"mission_{axis}"
-		actual = actual_lateral_d_gain(axis)
-		if np.isfinite(actual).any():
-			ax.plot(t, actual, linewidth=1.9, label=f"Actual {axis} D gain")
+		_, _, d_scheduled, d_applied = _applied_lateral_gains(c, axis)
+
+		# Two curves, because they are not the same number.  The schedule is
+		# base gain x phase scale; the APPLIED gain also carries ControlLaw's
+		# off-centre blend, which bites hardest in CENTER -- scale 1.0 while the
+		# vehicle is still capturing a large offset.  Comparing the gate lines
+		# below against the schedule alone would overstate the damping the
+		# vehicle actually had.
+		if np.isfinite(d_scheduled).any():
+			ax.plot(
+				t, d_scheduled, linestyle="--", linewidth=1.5, alpha=0.85,
+				label="Scheduled D gain (base x phase scale)",
+			)
+		if np.isfinite(d_applied).any():
+			ax.plot(
+				t, d_applied, linewidth=1.9,
+				label="Applied D gain (also x off-centre blend)",
+			)
 
 		# All gate quantities below already live in the same physical D-gain
 		# coordinates, so they can now be compared directly with the solid curve.
@@ -1173,7 +1305,7 @@ def plot_gain_schedule(data: AnalysisData, out: Path) -> None:
 		# Very old logs have neither an independent per-axis scale nor physical K.
 		# Retain a clearly marked diagnostic fallback without pretending it has K
 		# units. Current logs should never take this branch.
-		if not np.isfinite(actual).any():
+		if not np.isfinite(d_applied).any():
 			legacy = _num(c, "mission_lateral_d_scale")
 			if np.isfinite(legacy).any():
 				ax.plot(
@@ -1419,6 +1551,22 @@ def _wind_axis_components(
 	return relative_accel, wind_compensation, relative_accel + wind_compensation
 
 
+def _wind_force_scale_is_usable(data: AnalysisData) -> bool:
+	"""True when the wind->acceleration conversion can be trusted.
+
+	Either no wind was commanded (the contribution is identically zero and the
+	drag coefficient is irrelevant), or the caller supplied a real
+	``--wind-force-scale``. The 1.0 default is a placeholder, not a measurement:
+	using it with a 6 m/s wind reports ~6 m/s2 of demand against a probe mean
+	near 0.8, which does not just mislabel the curve, it rescales the axis and
+	hides the probe traces entirely.
+	"""
+	enabled = _num(data.wind, "wind_enabled", 0.0).to_numpy(float)
+	if not np.any(np.isfinite(enabled) & (enabled > 0.5)):
+		return True
+	return abs(float(data.wind_force_scale) - 1.0) > 1e-9
+
+
 def _plot_probe_axis(
 	data: AnalysisData,
 	out: Path,
@@ -1431,16 +1579,34 @@ def _plot_probe_axis(
 	capacity_ceiling_column: str,
 	filename: str,
 ) -> None:
-	"""Plot the probe quantities that matter independently of wind.
+	"""Plot the probe quantities that matter, against an INDEPENDENT truth.
 
-	Panel 1 compares the command-derived probe acceleration with the full
-	truth acceleration in the gate coordinates: the Gazebo drone-platform
-	dynamic acceleration shifted by the probe's estimated static mean.
+	Panel 1 compares the command-derived probe acceleration with the full truth
+	acceleration in gate coordinates. Both terms of that truth come from
+	outside the controller:
+
+	    truth = (drone - platform) dynamic acceleration   [truth CSV]
+	          + the acceleration needed to cancel the wind [wind CSV]
+
+	The second term used to be the probe's OWN static mean, which made the
+	comparison circular -- the reference was built from the estimate it was
+	supposed to validate, so the two curves agreed by construction and the plot
+	could not show a wrong static term. The wind CSV carries the commanded wind
+	the simulator actually applied, so the reference is now independent of
+	anything the controller believes.
+
 	Panel 2 shows the slowly varying probe mean, gate envelope and stability
-	capacity in the exact coordinates used by the feasibility logic.
+	capacity in the exact coordinates used by the feasibility logic, with the
+	same independent wind contribution alongside the probe's estimate of it --
+	those two curves agreeing IS the thing worth checking.
 
-	The reconstructed WindEffects contribution deliberately lives in the
-	``--wind`` plot group instead of being mixed into every probe figure.
+	One caveat that comes with the independence: the wind CSV logs a VELOCITY,
+	so turning it into an acceleration needs the airframe's drag coefficient,
+	which is ``--wind-force-scale`` (Gazebo's
+	force_approximation_scaling_factor). It defaults to 1.0, which is not a
+	physical value for this airframe, so the wind curves carry the scale in
+	their label and are suppressed entirely when wind is enabled and the scale
+	was left at its default -- a mis-scaled reference is worse than none.
 	"""
 	c_all = data.control
 	probe_end_sim = _probe_plot_end_sim_time(data)
@@ -1455,15 +1621,27 @@ def _plot_probe_axis(
 
 	t = _relative_time(c["_sim_time"], data.t0)
 	tc = c["_sim_time"].to_numpy(float)
-	relative_accel, _, _ = _wind_axis_components(
+	relative_accel, wind_compensation, full_truth_accel = _wind_axis_components(
 		data, tc, truth_axis=truth_axis, truth_sign=truth_sign
 	)
 
 	static_mean = _num(c, f"mission_{probe_prefix}_mean_accel_m_s2").to_numpy(float)
-	# The feasibility envelope is expressed around this static operating point.
-	# Put Gazebo's dynamic relative acceleration in the same coordinates before
-	# comparing the truth trace with the probe command and gate envelope.
-	full_truth_accel = relative_accel + static_mean
+	# ``full_truth_accel`` is the sum returned above: Gazebo's dynamic relative
+	# acceleration plus the wind cancellation the COMMANDED wind demands. That
+	# is what the controller has to produce, reconstructed without reference to
+	# any probe output.
+	wind_scale_known = _wind_force_scale_is_usable(data)
+	if not wind_scale_known:
+		# Fall back to the dynamic term alone rather than showing a curve that is
+		# wrong by an unknown drag coefficient.
+		full_truth_accel = relative_accel
+		wind_compensation = np.full_like(relative_accel, np.nan)
+	truth_label = (
+		"Full truth acceleration (Gazebo dynamic + commanded wind"
+		f", K_w={data.wind_force_scale:g})"
+		if wind_scale_known
+		else "Full truth acceleration (dynamic only, no K_w)"
+	)
 	peak_used = _num(c, peak_column).to_numpy(float)
 	capacity_ceiling = _last_finite_value(c_all, capacity_ceiling_column)
 
@@ -1491,7 +1669,7 @@ def _plot_probe_axis(
 			full_truth_accel,
 			alpha=0.78,
 			linewidth=1.6,
-			label="Full truth acceleration (Gazebo dynamic + probe static mean)",
+			label=truth_label,
 		)
 	if upper_peak is not None:
 		peak_line = axes[0].plot(
@@ -1509,6 +1687,14 @@ def _plot_probe_axis(
 	if np.isfinite(static_mean).any():
 		axes[1].plot(
 			t, static_mean, linestyle=":", linewidth=2.0, label="Probe mean acceleration"
+		)
+	# The independent target for that mean: what the commanded wind actually
+	# demands on this axis. Divergence between these two is a wrong static term,
+	# and it is only visible because the reference no longer comes from the probe.
+	if np.isfinite(wind_compensation).any():
+		axes[1].plot(
+			t, wind_compensation, linewidth=1.6, alpha=0.85,
+			label=f"Commanded-wind contribution (truth, K_w={data.wind_force_scale:g})",
 		)
 	if upper_peak is not None:
 		peak_line_mid = axes[1].plot(
@@ -2724,6 +2910,7 @@ def main(argv: Optional[list[str]] = None) -> int:
 		("detections_boxes_fov.png", plot_detections_boxes_fov),
 		("drone_platform_position.png", plot_drone_platform_position),
 		("gain_schedule.png", plot_gain_schedule),
+		("lateral_p_gain.png", plot_lateral_p_gain),
 		("lateral_match.png", plot_lateral_match),
 		("lateral_decomposition.png", plot_lateral_decomposition),
 		("lateral_commands.png", plot_lateral_commands),

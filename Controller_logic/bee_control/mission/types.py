@@ -169,15 +169,30 @@ class MissionControl:
     roll_d_scale: Optional[float] = None
     pitch_p_scale: Optional[float] = None
     pitch_d_scale: Optional[float] = None
-    # Optional lateral trim contract. In CENTER/APPROACH the offset setpoint is
-    # the geometric image displacement caused by the previous shaped camera
-    # tilt and acceleration feedforward remains zero. FINAL_PROBE disables P,
-    # activates/adapts the static acceleration trim, and DESCENT carries the
-    # final value frozen alongside the optical-flow D branch.
+    # Optional lateral trim contract.
+    #
+    # CENTER / APPROACH   setpoint = geometric tilt offset MINUS the learned
+    #                     adaptive-centre bias; no acceleration feedforward.
+    #                     The bias is what makes the steady P error generate
+    #                     the counter-wind force.
+    # FINAL_PROBE         setpoint = geometric tilt offset ONLY, and the static
+    #                     acceleration trim takes over the wind force.  Keeping
+    #                     the bias here would double-count it: the feedforward
+    #                     already supplies that force, so P would additionally
+    #                     hold an error to supply it a second time.  A small
+    #                     residual P remains for centring -- see config
+    #                     ``final_probe_lateral_p_scale``.
+    # DESCENT             setpoint = 0 with P off; the committed feedforward
+    #                     carries everything, because image offset stops being
+    #                     a position measurement about a second before contact.
     roll_offset_setpoint: float = 0.0
     pitch_offset_setpoint: float = 0.0
     roll_accel_feedforward_m_s2: float = 0.0
     pitch_accel_feedforward_m_s2: float = 0.0
+    # False keeps the optical-flow D branch at exactly ``lateral_d_scale``,
+    # unattenuated by the large-offset blend. FINAL_PROBE needs this because
+    # its D branch is the evidence the lateral feasibility gates rest on.
+    scale_lateral_d_with_offset: bool = True
     enable_integral: bool = True
     substate: str = CENTER
     effects: tuple[ControlEffect, ...] = ()
@@ -202,6 +217,7 @@ class MissionControl:
             "pitch_offset_setpoint": self.pitch_offset_setpoint,
             "roll_accel_feedforward_m_s2": self.roll_accel_feedforward_m_s2,
             "pitch_accel_feedforward_m_s2": self.pitch_accel_feedforward_m_s2,
+            "scale_lateral_d_with_offset": self.scale_lateral_d_with_offset,
             "enable_integral": self.enable_integral,
         }
 

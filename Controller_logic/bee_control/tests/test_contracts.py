@@ -21,13 +21,15 @@ import math
 import time
 import tempfile
 import warnings
-from dataclasses import fields
+from dataclasses import fields, replace
 
 from bee_control.core.clock import SteadyWallClock, TimeManager
 from bee_control.core.config import (
     RENAMED_MISSION_FIELDS,
     BeeConfig,
+    CameraConfig,
     MissionConfig,
+    StabilityDelayBudget,
 )
 from bee_control.core.controller_state import ControllerState, PX4Status, VisionTelemetry
 from bee_control.diagnostics.diagnostics_writer import DiagnosticsWriter
@@ -37,7 +39,11 @@ from bee_control.interfaces.flight_sequencer import (
     SequencerPorts,
     SetpointPolicy,
 )
-from bee_control.mission.gates import compute_tracking_gate
+from bee_control.mission.schedule import scheduled_gain_from_integral
+from bee_control.mission.gates import (
+    compute_tracking_gate,
+    lateral_ceiling_gain_at_height,
+)
 from bee_control.mission.routine import MissionRoutine
 from bee_control.mission.visual_center_adaptation import VisualCenterAdaptation
 from bee_control.mission.trim import VisualTrim
@@ -141,8 +147,11 @@ def test_derived_values_are_wired():
     cfg = BeeConfig.default()
     assert math.isclose(cfg.mission.roll_kappa, cfg.camera.roll_kappa)
     assert math.isclose(
-        cfg.mission.stability_dt_sec,
-        cfg.camera.stability_dt_sec(cfg.scheduling))
+        cfg.mission.vertical_stability_dt_sec,
+        cfg.vertical_stability_delay().total_sec)
+    assert math.isclose(
+        cfg.mission.lateral_stability_dt_sec,
+        cfg.lateral_stability_delay().total_sec)
 
     # Previously omitted, so a change to the scheduling tick silently left the
     # mission's stability_dt fallback behind at its own literal.
@@ -216,7 +225,8 @@ def test_every_mission_field_declares_its_unit():
         "center_trim_residual_radius_max", "center_legacy_box_threshold",
         "center_visual_adaptation_max_bias_norm",
         "center_lateral_p_scale", "center_lateral_d_scale",
-        "probe_lateral_p_scale", "probe_lateral_d_scale",
+        "probe_lateral_p_scale",
+        "final_probe_lateral_p_scale",
     }
     offenders = [
         f.name for f in fields(MissionConfig())
@@ -317,7 +327,11 @@ def test_final_probe_starts_from_fresh_gate_evidence_without_integral_reset():
             break
 
     assert control is not None and control.substate == "final_probe"
-    assert control.lateral_p_scale == 0.0
+    # The handoff tick is already a FINAL_PROBE command: residual P, geometric
+    # setpoint, and an unattenuated D branch, all on the same tick that
+    # activates the static term.
+    assert math.isclose(control.lateral_p_scale, cfg.final_probe_lateral_p_scale)
+    assert control.scale_lateral_d_with_offset is False
     assert routine.peak_accel_at_handoff > 1.0
     assert routine.probe_result.peak_accel == 0.0
     assert ControlEffect.RESET_DIVERGENCE_INTEGRAL not in control.effects
@@ -409,7 +423,11 @@ def test_descent_handoff_keeps_the_last_final_probe_static_feedforward():
         rows["descend"]["roll_accel_feedforward_m_s2"],
         abs_tol=1e-6,
     ), "the FINAL_PROBE static term never adapted"
-    assert rows["final_probe"]["lateral_p_scale"] == 0.0
+    # FINAL_PROBE keeps a small residual P; only DESCENT removes it entirely.
+    assert math.isclose(
+        rows["final_probe"]["lateral_p_scale"],
+        MissionConfig().final_probe_lateral_p_scale,
+    )
     assert rows["descend"]["lateral_p_scale"] == 0.0
     assert rows["descend"]["roll_p_scale"] == 0.0
     assert rows["descend"]["pitch_p_scale"] == 0.0
@@ -719,6 +737,321 @@ def test_far_field_accel_feedforward_is_zero_until_final_probe():
     assert rows["center"]["pitch_accel_feedforward_m_s2"] == 0.0
     assert rows["approach_probe"]["roll_accel_feedforward_m_s2"] == 0.0
     assert rows["approach_probe"]["pitch_accel_feedforward_m_s2"] == 0.0
+
+
+def test_each_delay_term_has_exactly_one_owner():
+    """No term may be declared twice under two names.
+
+    The budget used to be a VIEW that copied four terms out of CameraConfig,
+    SchedulingConfig and ControlConfig, so every quantity had two names and two
+    places it could be edited. It owns them now; the two that are also real
+    operational values are wired, not re-declared.
+    """
+    cfg = BeeConfig.default()
+    delay_fields = {f.name for f in fields(cfg.stability_delay)}
+
+    # Nothing outside the budget may declare a delay term of its own.
+    for group in (cfg.camera, cfg.control, cfg.scheduling):
+        for f in fields(group):
+            assert f.name not in delay_fields
+    assert not hasattr(cfg.control, "attitude_loop_delay_sec")
+    assert not hasattr(cfg.camera, "processing_latency_budget_sec")
+    assert not hasattr(cfg.camera, "smoothing_delay_sec")
+
+    # The two shared quantities are wired from their owner, not copied.
+    assert math.isclose(
+        cfg.stability_delay.camera_frame_period_sec, cfg.camera.frame_period_sec
+    )
+    assert math.isclose(
+        cfg.stability_delay.setpoint_publication_sec,
+        cfg.scheduling.px4_setpoint_period_sec,
+    )
+
+
+def test_wired_delay_terms_follow_their_owner():
+    """Changing the camera frame period must move the budget with it."""
+    fast = replace(
+        BeeConfig.default(), camera=replace(CameraConfig(), frame_period_sec=1 / 120)
+    )
+    rebuilt = BeeConfig.default()
+    assert math.isclose(
+        rebuilt.stability_delay.camera_frame_period_sec, rebuilt.camera.frame_period_sec
+    )
+    # A hand-built config that changes only the camera is NOT rewired -- that is
+    # what BeeConfig.default() is for, and the mismatch must be visible.
+    assert not math.isclose(
+        fast.stability_delay.camera_frame_period_sec, fast.camera.frame_period_sec
+    )
+
+
+def test_stability_delay_budget_sums_its_items():
+    cfg = BeeConfig.default()
+    for budget in (cfg.vertical_stability_delay(), cfg.lateral_stability_delay()):
+        items = budget.itemised()
+        assert math.isclose(
+            items["total_sec"],
+            sum(v for k, v in items.items() if k != "total_sec"),
+        )
+        assert math.isclose(items["total_sec"], budget.total_sec)
+
+
+def test_only_the_lateral_budget_carries_the_attitude_loop():
+    """The vertical command is thrust: PX4 applies it with no inner loop."""
+    base = BeeConfig.default()
+    cfg = replace(
+        base, stability_delay=replace(base.stability_delay, attitude_loop_sec=0.05)
+    )
+    assert cfg.vertical_stability_delay().attitude_loop_sec == 0.0
+    assert math.isclose(cfg.lateral_stability_delay().attitude_loop_sec, 0.05)
+    assert math.isclose(
+        cfg.lateral_stability_delay().total_sec,
+        cfg.vertical_stability_delay().total_sec + 0.05,
+    )
+
+
+def test_attitude_loop_delay_lowers_only_the_lateral_ceiling():
+    """The whole point: the lateral axes have less margin than the vertical.
+
+    An extra inner-loop delay must reduce the admissible lateral gain and leave
+    the vertical schedule untouched.
+    """
+    base = BeeConfig.default()
+    delayed = replace(
+        base,
+        stability_delay=replace(
+            base.stability_delay,
+            attitude_loop_sec=base.stability_delay.attitude_loop_sec + 0.04,
+        ),
+    )
+    delayed = replace(
+        delayed,
+        mission=delayed.mission.with_overrides(
+            lateral_stability_dt_sec=delayed.lateral_stability_delay().total_sec,
+        ),
+    )
+
+    r0 = MissionRoutine(hover_thrust=0.73, config=base.mission)
+    r1 = MissionRoutine(hover_thrust=0.73, config=delayed.mission)
+
+    assert r1.roll_probe_lateral_gain < r0.roll_probe_lateral_gain
+    assert math.isclose(r1.probe_gain, r0.probe_gain)
+
+
+def test_the_two_stability_dts_are_not_silently_shared():
+    """A single dt overstated the lateral margin; they must be independent."""
+    cfg = MissionConfig().with_overrides(lateral_stability_dt_sec=0.25)
+    assert not math.isclose(
+        cfg.lateral_stability_dt_sec, cfg.vertical_stability_dt_sec
+    )
+
+
+def test_the_old_shared_name_is_rejected_not_aliased():
+    """A SPLIT must not be aliased onto one half: the other would stay default."""
+    assert "stability_dt_sec" not in RENAMED_MISSION_FIELDS
+    try:
+        MissionConfig().with_overrides(stability_dt_sec=0.1)
+    except TypeError as exc:
+        assert "stability_dt_sec" in str(exc)
+    else:
+        raise AssertionError("the ambiguous shared name was silently accepted")
+
+
+def test_lateral_probe_gain_is_derived_from_the_lateral_ceiling():
+    """Same construction as the vertical k_probe, same constants."""
+    cfg = MissionConfig()
+    routine = MissionRoutine(hover_thrust=0.73, config=cfg)
+
+    ceiling = lateral_ceiling_gain_at_height(
+        cfg.near_field_height_m, cfg.lateral_stability_dt_sec, cfg.roll_kappa,
+        cfg.max_closing_speed_m_s, cfg.ceiling_safety_factor,
+    )
+    far = cfg.roll_d_gain * cfg.center_lateral_d_scale
+    assert math.isclose(
+        routine.roll_probe_lateral_gain, min(far, cfg.ceiling_margin * ceiling)
+    )
+    # The min() only ever reduces.
+    assert routine.roll_probe_lateral_gain <= far + 1e-12
+
+
+def test_a_tighter_lateral_ceiling_lowers_the_near_field_gain():
+    """The reason the endpoint is derived: another airframe must get less gain.
+
+    A lower handoff height and a slower visual loop both shrink the lateral
+    ceiling; an asserted near-field scale would not notice either.
+    """
+    base = MissionConfig()
+    tight = base.with_overrides(
+        near_field_height_m=0.5 * base.near_field_height_m,
+        lateral_stability_dt_sec=2.0 * base.lateral_stability_dt_sec,
+    )
+    loose = base.with_overrides(near_field_height_m=10.0 * base.near_field_height_m)
+
+    g_tight = MissionRoutine(hover_thrust=0.73, config=tight).roll_probe_lateral_gain
+    g_loose = MissionRoutine(hover_thrust=0.73, config=loose).roll_probe_lateral_gain
+
+    assert g_tight < g_loose
+    # With the ceiling far away the far-field gain passes through untouched.
+    assert math.isclose(g_loose, loose.roll_d_gain * loose.center_lateral_d_scale)
+
+
+def test_lateral_probe_gain_is_evaluated_per_axis():
+    """Roll and pitch have their own kappa; a non-square lens must separate them."""
+    cfg = MissionConfig().with_overrides(
+        roll_kappa=1.0, pitch_kappa=3.0, near_field_height_m=0.2
+    )
+    routine = MissionRoutine(hover_thrust=0.73, config=cfg)
+    # Larger kappa -> lower ceiling -> lower admissible gain.
+    assert routine.pitch_probe_lateral_gain < routine.roll_probe_lateral_gain
+
+
+def test_lateral_gates_judge_the_gain_actually_flown():
+    """A gate measuring a different gain than the vehicle flies is measuring
+    a vehicle that does not exist."""
+    routine = MissionRoutine(hover_thrust=0.73, config=MissionConfig())
+    routine.start(0.0, 5.0)
+    rows = _fly_to_descend(routine)
+
+    assert math.isclose(
+        rows["descend"]["roll_k_probe"], routine.roll_probe_lateral_gain, rel_tol=1e-9
+    )
+    assert math.isclose(
+        rows["descend"]["pitch_k_probe"], routine.pitch_probe_lateral_gain, rel_tol=1e-9
+    )
+
+
+def test_approach_lateral_d_rides_the_commanded_divergence_integral():
+    """Same driver as the vertical schedule, so both reach the near field together."""
+    cfg = MissionConfig()
+    routine = MissionRoutine(hover_thrust=0.73, config=cfg)
+    routine.start(0.0, 5.0)
+    rows = _fly_to_descend(routine)
+
+    far_scale = cfg.center_lateral_d_scale
+    probe_scale = routine.roll_probe_lateral_d_scale
+
+    # CENTER flies the far-field scale; FINAL_PROBE flies the derived one.
+    assert math.isclose(rows["center"]["lateral_d_scale"], far_scale)
+    assert math.isclose(rows["final_probe"]["roll_d_scale"], probe_scale)
+    assert probe_scale <= far_scale + 1e-12
+
+    # The decay itself is the shared driver: more accumulated commanded
+    # divergence never raises the gain, and it bottoms out at the derived value.
+    far_gain = cfg.roll_d_gain * far_scale
+    probe_gain = routine.roll_probe_lateral_gain
+    seq = [
+        scheduled_gain_from_integral(
+            commanded_divergence_integral=i,
+            k_floor=probe_gain,
+            k_explore=far_gain,
+        )
+        for i in (0.0, 0.25, 0.75, 2.0, 8.0)
+    ]
+    assert seq == sorted(seq, reverse=True)
+    assert math.isclose(seq[0], far_gain)
+    assert math.isclose(seq[-1], probe_gain)
+
+
+def test_final_probe_keeps_a_small_residual_lateral_p():
+    """P at exactly zero makes the loop hold VELOCITY, so a constant flow bias
+    integrates without bound. The residual term is what bounds it."""
+    routine = MissionRoutine(hover_thrust=0.73, config=MissionConfig())
+    routine.start(0.0, 5.0)
+    rows = _fly_to_descend(routine)
+
+    p_scale = rows["final_probe"]["lateral_p_scale"]
+    assert 0.0 < p_scale < rows["approach_probe"]["lateral_p_scale"]
+    assert math.isclose(p_scale, MissionConfig().final_probe_lateral_p_scale)
+    # DESCENT still drops it: image offset stops measuring position near contact.
+    assert rows["descend"]["lateral_p_scale"] == 0.0
+
+
+def test_final_probe_lateral_p_can_be_switched_off():
+    """The knob must restore the previous velocity-hold behaviour exactly."""
+    cfg = MissionConfig().with_overrides(final_probe_lateral_p_scale=0.0)
+    routine = MissionRoutine(hover_thrust=0.73, config=cfg)
+    routine.start(0.0, 5.0)
+    rows = _fly_to_descend(routine)
+    assert rows["final_probe"]["lateral_p_scale"] == 0.0
+
+
+def test_final_probe_setpoint_is_geometric_tilt_without_the_learned_bias():
+    """Carrying the adaptive bias here would double-count the wind.
+
+    The bias exists so the steady P error generates the counter-wind force.
+    FINAL_PROBE's static feedforward already supplies that force, so keeping
+    the bias would ask the loop to supply it twice.
+    """
+    routine = MissionRoutine(hover_thrust=0.73, config=MissionConfig())
+    routine.start(0.0, 5.0)
+    rows = _fly_to_descend(routine)
+
+    fp = rows["final_probe"]
+    assert math.isclose(fp["roll_offset_setpoint"],
+                        fp["center_geometric_offset_x"], abs_tol=1e-9)
+    assert math.isclose(fp["pitch_offset_setpoint"],
+                        fp["center_geometric_offset_y"], abs_tol=1e-9)
+
+    # The far field DOES carry the bias, so the two setpoints must differ
+    # wherever the adaptation actually learned something.
+    ap = rows["approach_probe"]
+    if abs(ap["center_visual_bias_y"]) > 1e-6:
+        assert not math.isclose(ap["pitch_offset_setpoint"],
+                                ap["center_geometric_offset_y"], abs_tol=1e-9)
+
+
+def test_final_probe_does_not_attenuate_the_d_branch_with_offset():
+    """The gates rest on this phase's D branch; it must be the commanded one.
+
+    A large-offset multiplier on D there would make the gates claim damping
+    authority the vehicle does not have -- optimistic in the unsafe direction.
+    """
+    routine = MissionRoutine(hover_thrust=0.73, config=MissionConfig())
+    routine.start(0.0, 5.0)
+    rows = _fly_to_descend(routine)
+
+    assert rows["final_probe"]["lateral_d_offset_attenuated"] == 0
+    assert rows["approach_probe"]["lateral_d_offset_attenuated"] == 1
+    assert rows["center"]["lateral_d_offset_attenuated"] == 1
+
+
+def test_control_law_honours_the_d_attenuation_switch():
+    """Same large offset, same gains: only the switch differs."""
+    def realized(scale_d):
+        law = ControlLaw(command_filter_alpha=1.0, enable_slew_rate_limits=False)
+        law.compute(
+            TargetEstimate(found=True, offset_x=0.45, offset_y=0.0),
+            FlowResult(valid=True, mean_flow_x_norm=0.20, mean_flow_y_norm=0.0),
+            1 / 60.0,
+            lateral_p_scale=0.1,
+            lateral_d_scale=0.65,
+            scale_lateral_d_with_offset=scale_d,
+            enable_integral=False,
+        )
+        return law.last_roll_accel_cmd
+
+    attenuated = realized(True)
+    live = realized(False)
+    # The offset is past small_offset_threshold, so the blend is active and the
+    # unattenuated command must be the larger of the two in magnitude.
+    assert abs(live) > abs(attenuated)
+
+
+def test_d_attenuation_switch_defaults_to_the_previous_behaviour():
+    """With P off the switch must be a no-op, whichever way it is set."""
+    def realized(scale_d):
+        law = ControlLaw(command_filter_alpha=1.0, enable_slew_rate_limits=False)
+        law.compute(
+            TargetEstimate(found=True, offset_x=0.45, offset_y=0.0),
+            FlowResult(valid=True, mean_flow_x_norm=0.20, mean_flow_y_norm=0.0),
+            1 / 60.0,
+            lateral_p_scale=0.0,
+            lateral_d_scale=0.65,
+            scale_lateral_d_with_offset=scale_d,
+            enable_integral=False,
+        )
+        return law.last_roll_accel_cmd
+
+    assert math.isclose(realized(True), realized(False), abs_tol=1e-12)
 
 
 def test_final_probe_seed_comes_from_passive_approach_probe_mean():

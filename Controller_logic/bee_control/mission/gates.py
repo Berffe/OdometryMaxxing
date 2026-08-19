@@ -71,14 +71,14 @@ class LateralGateResult:
 
 def lateral_ceiling_gain_at_height(
     height_m: float,
-    control_period_sec: float,
+    stability_dt_sec: float,
     kappa: float,
     max_closing_speed_m_s: float,
     safety: float = 1.0,
 ) -> float:
     """Safety-scaled discrete lateral ceiling with bounded closing speed."""
     s = max(1e-3, float(safety))
-    dt = max(1e-6, float(control_period_sec))
+    dt = max(1e-6, float(stability_dt_sec))
     kappa = max(1e-6, float(kappa))
     c_max = max(0.0, float(max_closing_speed_m_s))
     return max(0.0, 2.0 * s * max(0.0, float(height_m)) / (kappa * dt) - c_max / kappa)
@@ -105,7 +105,7 @@ def compute_lateral_gate(
     probe_gain: float,
     near_field_height_m: float,
     leg_clearance_m: float,
-    control_period_sec: float,
+    stability_dt_sec: float,
     ceiling_safety_factor: float = 0.5,
     ceiling_margin: float = 0.8,
 ) -> LateralGateResult:
@@ -118,11 +118,11 @@ def compute_lateral_gate(
     k_min = c_max / kappa + max(0.0, float(peak_accel)) / omega_adm
     k_probe = max(0.0, float(probe_gain))
     k_ceiling_probe = lateral_ceiling_gain_at_height(
-        near_field_height_m, control_period_sec, kappa, c_max,
+        near_field_height_m, stability_dt_sec, kappa, c_max,
         ceiling_safety_factor,
     )
     k_ceiling_leg = lateral_ceiling_gain_at_height(
-        leg_clearance_m, control_period_sec, kappa, c_max,
+        leg_clearance_m, stability_dt_sec, kappa, c_max,
         ceiling_safety_factor,
     )
 
@@ -169,14 +169,14 @@ def compute_lateral_gate(
     )
 
 
-def critical_height(k_min: float, control_period_sec: float, safety: float = 1.0) -> float:
+def critical_height(k_min: float, stability_dt_sec: float, safety: float = 1.0) -> float:
     """Height where the safety-scaled de Croon ceiling reaches k_min."""
     s = max(1e-3, float(safety))
-    return float(k_min) * float(control_period_sec) / (2.0 * s)
+    return float(k_min) * float(stability_dt_sec) / (2.0 * s)
 
 
 def ceiling_gain_at_height(
-    height_m: float, control_period_sec: float, safety: float = 1.0
+    height_m: float, stability_dt_sec: float, safety: float = 1.0
 ) -> float:
     """Safety-scaled de Croon stability ceiling on k, at a given height.
 
@@ -187,7 +187,7 @@ def ceiling_gain_at_height(
     k_min.
     """
     s = max(1e-3, float(safety))
-    dt = max(1e-6, float(control_period_sec))
+    dt = max(1e-6, float(stability_dt_sec))
     return 2.0 * s * max(0.0, float(height_m)) / dt
 
 
@@ -195,7 +195,7 @@ def compute_gate(
     peak_accel: float,
     descent_divergence_setpoint: float,
     initial_thrust_gain: float,
-    control_period_sec: float,
+    stability_dt_sec: float,
     leg_clearance_m: float,
     ceiling_safety_factor: float = 0.5,
     min_divergence_setpoint: float = 0.01,
@@ -222,10 +222,10 @@ def compute_gate(
     margin = max(0.0, float(ceiling_margin))
 
     k_min = max(0.0, float(peak_accel)) / d_star
-    h_crit = critical_height(k_min, control_period_sec, s)
+    h_crit = critical_height(k_min, stability_dt_sec, s)
     k_explore = max(0.0, float(initial_thrust_gain))
 
-    k_ceiling_leg = ceiling_gain_at_height(leg_clearance_m, control_period_sec, s)
+    k_ceiling_leg = ceiling_gain_at_height(leg_clearance_m, stability_dt_sec, s)
     k_target = margin * k_ceiling_leg
 
     # The descent starts from wherever FINAL_PROBE left the gain (k_probe), not
@@ -237,7 +237,7 @@ def compute_gate(
         probe_within_ceiling = True
     else:
         k_ceiling_probe = ceiling_gain_at_height(
-            near_field_height_m, control_period_sec, s
+            near_field_height_m, stability_dt_sec, s
         )
         probe_within_ceiling = k_start <= k_ceiling_probe
 

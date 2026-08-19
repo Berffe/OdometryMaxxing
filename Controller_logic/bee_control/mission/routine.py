@@ -54,6 +54,7 @@ from .gates import (
     TrackingGateResult,
     compute_tracking_gate,
     ceiling_gain_at_height,
+    lateral_ceiling_gain_at_height,
     compute_lateral_gate,
 )
 from .math_utils import blank, clamp
@@ -141,9 +142,11 @@ class MissionRoutine:
         )
 
         self._dt = float(cfg.stability_dt_fallback_sec)
-        self._stability_dt = (
-            float(cfg.stability_dt_sec) if cfg.stability_dt_sec is not None else self._dt
-        )
+        # Two delays, because the two channels do not carry the same one: the
+        # lateral command is an attitude setpoint and additionally waits on
+        # PX4's inner attitude loop. See StabilityDelayBudget in config.py.
+        self._vertical_stability_dt = float(cfg.vertical_stability_dt_sec)
+        self._lateral_stability_dt = float(cfg.lateral_stability_dt_sec)
 
         self._d_star = max(0.0, float(cfg.descent_divergence_setpoint))
         self._approach_d_star = max(0.0, float(cfg.approach_divergence_setpoint))
@@ -238,12 +241,16 @@ class MissionRoutine:
 
         self._approach_d_star_ramp_in = max(0.0, float(cfg.approach_d_star_ramp_in_sec))
         self._descent_d_star_ramp_in = max(0.0, float(cfg.descent_d_star_ramp_in_sec))
-        self._lateral_ramp = max(0.0, float(cfg.center_to_probe_lateral_ramp_sec))
 
         self._center_lateral_p_scale = max(0.0, float(cfg.center_lateral_p_scale))
         self._center_lateral_d_scale = max(0.0, float(cfg.center_lateral_d_scale))
         self._probe_lateral_p_scale = max(0.0, float(cfg.probe_lateral_p_scale))
-        self._probe_lateral_d_scale = max(0.0, float(cfg.probe_lateral_d_scale))
+        # Residual image-position P retained through FINAL_PROBE.  Small by
+        # design: the static acceleration trim owns the steady wind force, so
+        # this term only closes the centring error the flow branch cannot see.
+        self._final_probe_lateral_p_scale = max(
+            0.0, float(cfg.final_probe_lateral_p_scale)
+        )
 
         self._tm = ThrustModel(hover_thrust)
 
@@ -558,6 +565,10 @@ class MissionRoutine:
         "substate",
         "divergence_setpoint_1_s", "thrust_gain_k",
         "lateral_p_scale", "lateral_d_scale",
+        # 1 when the large-offset blend is allowed to attenuate the D branch.
+        # FINAL_PROBE logs 0: its damping must equal the commanded d_scale,
+        # because that is the number the lateral feasibility gates rest on.
+        "lateral_d_offset_attenuated",
         "roll_p_scale", "roll_d_scale", "pitch_p_scale", "pitch_d_scale",
         "roll_offset_setpoint", "pitch_offset_setpoint",
         "roll_accel_feedforward_m_s2", "pitch_accel_feedforward_m_s2",
@@ -722,6 +733,7 @@ class MissionRoutine:
             "thrust_gain_k": blank(mc.thrust_gain_override),
             "lateral_p_scale": mc.lateral_p_scale,
             "lateral_d_scale": mc.lateral_d_scale,
+            "lateral_d_offset_attenuated": int(bool(mc.scale_lateral_d_with_offset)),
             "roll_p_scale": blank(mc.roll_p_scale),
             "roll_d_scale": blank(mc.roll_d_scale),
             "pitch_p_scale": blank(mc.pitch_p_scale),
@@ -1022,7 +1034,7 @@ class MissionRoutine:
         is only ever reduced to become admissible, never raised.
         """
         ceiling = ceiling_gain_at_height(
-            self._near_field_height, self._stability_dt, self._safety
+            self._near_field_height, self._vertical_stability_dt, self._safety
         )
         return min(self._initial_thrust_gain, self._ceiling_margin * ceiling)
 
@@ -1030,6 +1042,70 @@ class MissionRoutine:
     def probe_gain(self) -> float:
         """Gain held flat through FINAL_PROBE; the descent schedule starts here."""
         return self._compute_probe_gain()
+
+    def _compute_lateral_probe_gain(self, kappa: float, d_gain: float) -> float:
+        """The lateral D gain flown through FINAL_PROBE, derived not asserted.
+
+        Exactly the vertical construction in _compute_probe_gain(), transposed
+        onto the lateral ceiling::
+
+            Kd_probe = min(Kd_far, ceiling_margin * k_ceiling_lat(near_field_height))
+
+        with the same near_field_height_m, the same ceiling_margin and the same
+        ceiling_safety_factor.  ``Kd_far = d_gain * center_lateral_d_scale`` is
+        the lateral analogue of k_explore: the far-field gain, admissible while
+        high and progressively less so as the ceiling shrinks with height.
+
+        The lateral ceiling carries two terms the vertical one does not --
+
+            k_ceiling_lat(h) = 2*s*h/(kappa*dt) - c_max/kappa
+
+        -- so it depends on the FOV through kappa and on the admitted closing
+        speed.  That is why this takes the axis's own kappa and D gain: on a
+        non-square lens the roll and pitch ceilings genuinely differ, and a
+        single shared scale would silently fly the wider axis closer to its
+        bound than the narrower one.
+
+        As with the vertical, the min() only ever reduces: if the far-field gain
+        is already admissible at the handoff height nothing is dropped, and the
+        schedule below is flat.  A platform with less lateral authority -- wider
+        lens, slower visual loop, lower handoff -- gets a real decay from the
+        same code and the same constants.
+        """
+        ceiling = lateral_ceiling_gain_at_height(
+            self._near_field_height,
+            self._lateral_stability_dt,
+            kappa,
+            self._max_closing_speed,
+            self._safety,
+        )
+        far_field_gain = max(0.0, float(d_gain)) * self._center_lateral_d_scale
+        return min(far_field_gain, self._ceiling_margin * ceiling)
+
+    @property
+    def roll_probe_lateral_gain(self) -> float:
+        return self._compute_lateral_probe_gain(self._roll_kappa, self._roll_d_gain)
+
+    @property
+    def pitch_probe_lateral_gain(self) -> float:
+        return self._compute_lateral_probe_gain(self._pitch_kappa, self._pitch_d_gain)
+
+    @property
+    def roll_probe_lateral_d_scale(self) -> float:
+        """``roll_probe_lateral_gain`` expressed as the scale ControlLaw wants."""
+        return (
+            self.roll_probe_lateral_gain / self._roll_d_gain
+            if self._roll_d_gain > 1e-9
+            else 0.0
+        )
+
+    @property
+    def pitch_probe_lateral_d_scale(self) -> float:
+        return (
+            self.pitch_probe_lateral_gain / self._pitch_d_gain
+            if self._pitch_d_gain > 1e-9
+            else 0.0
+        )
 
     @property
     def feasible(self) -> bool:
@@ -1173,9 +1249,11 @@ class MissionRoutine:
             self._h0 = 5.0
 
         # Static lateral acceleration is absent in CENTER/APPROACH.  It adapts
-        # once lateral P authority is removed in FINAL_PROBE and may keep adapting
-        # through DESCENT to follow slow wind changes.  The update is causal: it
-        # uses the allocator-realized command from the previous control tick.
+        # from the FINAL_PROBE handoff onward -- the tick where the steady wind
+        # force moves off the P error -- and may keep adapting through DESCENT
+        # to follow slow wind changes.  The update is causal: it uses the
+        # allocator-realized command from the previous control tick, so the
+        # residual FINAL_PROBE P contribution is folded in automatically.
         self._update_near_field_lateral_bias(inputs)
 
         # Shared per-tick trim estimators run BEFORE dispatch, so every phase
@@ -1197,19 +1275,26 @@ class MissionRoutine:
 
         APPROACH_PROBE passively estimates the steady command through the
         existing roll/pitch PlatformProbe means.  At the FINAL_PROBE handoff that
-        estimate is activated as feedforward while lateral P authority becomes
-        exactly zero.  The near-field law is then
+        estimate is activated as feedforward, and lateral image-position P drops
+        from its APPROACH value to a small residual
+        (``final_probe_lateral_p_scale``).  The near-field law is then
 
-            a_cmd = a_static + a_D(flow)
+            a_cmd = a_static + a_P(offset - e_geom) + a_D(flow)
 
         and the causal EMA
 
             a_static <- a_static + beta * (a_realized - a_static)
 
-        absorbs the slow part of the remaining D correction.  FINAL_PROBE uses
-        ``_final_probe_*_accel_bias``; DESCENT starts from that exact value and,
-        when ``descent_lateral_bias_adaptive`` is enabled, keeps the same
-        estimator running on ``_descent_*_accel_bias``.
+        absorbs the slow part of BOTH corrections.  That is what makes the
+        descent boundary bumpless even though P is dropped there: by the time
+        the gates pass, whatever mean force the residual P was contributing has
+        already migrated into ``a_static``, and DESCENT inherits it in the
+        feedforward.  The wind rejection moves from the P error to the static
+        term gradually rather than at a single tick.
+
+        FINAL_PROBE uses ``_final_probe_*_accel_bias``; DESCENT starts from that
+        exact value and, when ``wind_trim_adapt_in_descent`` is enabled, keeps
+        the same estimator running on ``_descent_*_accel_bias``.
 
         Both phases share ONE safety neighbourhood centred on the passive
         APPROACH seed.  Continuing adaptation in DESCENT therefore does not buy
@@ -1267,7 +1352,7 @@ class MissionRoutine:
         denom = max(1e-9, abs(float(tan_half_fov)))
         return math.tan(float(angle_rad)) / denom
 
-    def _far_field_geometric_tilt_offset(
+    def _geometric_tilt_offset(
         self, inputs: MissionInputs
     ) -> tuple[float, float]:
         """Image location of the point directly below the camera.
@@ -1275,6 +1360,11 @@ class MissionRoutine:
         This is geometry only. It intentionally contains no wind/disturbance
         compensation. The previous shaped command keeps it causal and matches
         the attitude actually sent to PX4 closely in the validated wind logs.
+
+        Used by CENTER/APPROACH (as one half of the adaptive visual setpoint)
+        AND by FINAL_PROBE (on its own).  It carries no far-field assumption:
+        it is derived from the attitude command, so it stays exact regardless
+        of how much of the frame the target fills.
         """
         roll_geom = -self._tilt_to_normalized_offset(
             inputs.actuation.last_roll_cmd_rad, self._tan_half_hfov
@@ -1308,7 +1398,7 @@ class MissionRoutine:
         centring error, and the slow adaptation is allowed to learn the new
         equilibrium naturally instead of algebraically rescaling the bias.
         """
-        roll_geom, pitch_geom = self._far_field_geometric_tilt_offset(inputs)
+        roll_geom, pitch_geom = self._geometric_tilt_offset(inputs)
 
         snap = self._visual_center_adaptation_snapshot
         roll_sp = roll_geom - float(snap.bias_x)
@@ -1320,6 +1410,32 @@ class MissionRoutine:
         # is a moving visual reference, not a second force-command path.
         return roll_sp, pitch_sp, 0.0, 0.0
 
+    def _near_field_lateral_setpoint(
+        self, inputs: MissionInputs
+    ) -> tuple[float, float]:
+        """FINAL_PROBE visual setpoint: geometric tilt compensation, no bias.
+
+        The far-field setpoint is ``e_geom - b``.  The learned bias ``b`` exists
+        so that the steady P error generates the counter-wind force, which is
+        precisely the job the static acceleration trim takes over at this
+        handoff.  Carrying ``b`` here as well would ask the loop to supply that
+        force twice: the feedforward once, and P again by holding an error of
+        about ``b``.  On the 2026-08-19 09:42 run ``b`` had frozen at -0.519
+        normalized, so the double count would have parked the vehicle roughly
+        26 cm off centre -- worse than the drift this whole change removes.
+
+        ``e_geom`` alone is kept because it is the difference between "the
+        target is at image centre" and "the target is physically underneath
+        us".  Dropping it too would settle at the tilt offset instead: about
+        0.09 normalized, ~5 cm at the FINAL_PROBE height, which is a third of
+        ``leg_clearance_m``.
+        """
+        roll_geom, pitch_geom = self._geometric_tilt_offset(inputs)
+        return (
+            clamp(roll_geom, -1.0, 1.0),
+            clamp(pitch_geom, -1.0, 1.0),
+        )
+
     def _update_visual_center_adaptation(self, inputs: MissionInputs) -> None:
         """Advance the slow visual-centre finder in CENTER and APPROACH_PROBE.
 
@@ -1328,8 +1444,11 @@ class MissionRoutine:
         rather than frame noise.  Optical flow only modulates adaptation speed;
         the fast lateral P/D controller remains solely responsible for motion.
 
-        Adaptation deliberately stops at FINAL_PROBE, exactly where lateral
-        image-position P authority is removed.
+        Adaptation deliberately stops at FINAL_PROBE.  The trigger is no longer
+        "P authority is removed" -- FINAL_PROBE keeps a small residual P -- but
+        that the bias's PURPOSE is transferred there: the static acceleration
+        trim takes over the steady wind force, so a bias that exists to hold a
+        counter-wind P error has nothing left to do and would double-count it.
         """
         px, py, _radius, _residual = self._center_physical_trim_snapshot
         valid = (
@@ -1513,8 +1632,11 @@ class MissionRoutine:
         self._begin_tracking_gate_window()
 
     def _compute_lateral_gates(self) -> None:
-        roll_probe_gain = self._roll_d_gain * self._probe_lateral_d_scale
-        pitch_probe_gain = self._pitch_d_gain * self._probe_lateral_d_scale
+        # Same derivation the schedule flies, not a second copy of it: a gate
+        # that judged a different gain than the vehicle uses would be measuring
+        # a vehicle that does not exist.
+        roll_probe_gain = self.roll_probe_lateral_gain
+        pitch_probe_gain = self.pitch_probe_lateral_gain
         self.roll_gate = compute_lateral_gate(
             peak_accel=self.roll_probe_result.peak_accel,
             flow_admissible_norm_s=self._roll_flow_admissible,
@@ -1523,7 +1645,7 @@ class MissionRoutine:
             probe_gain=roll_probe_gain,
             near_field_height_m=self._near_field_height,
             leg_clearance_m=self._leg_clearance,
-            control_period_sec=self._stability_dt,
+            stability_dt_sec=self._lateral_stability_dt,
             ceiling_safety_factor=self._safety,
             ceiling_margin=self._ceiling_margin,
         )
@@ -1535,7 +1657,7 @@ class MissionRoutine:
             probe_gain=pitch_probe_gain,
             near_field_height_m=self._near_field_height,
             leg_clearance_m=self._leg_clearance,
-            control_period_sec=self._stability_dt,
+            stability_dt_sec=self._lateral_stability_dt,
             ceiling_safety_factor=self._safety,
             ceiling_margin=self._ceiling_margin,
         )
@@ -1640,7 +1762,7 @@ class MissionRoutine:
         self._center_trim.update(
             inputs.offset_x, inputs.offset_y, inputs.target_found, inputs.dt
         )
-        geom_x, geom_y = self._far_field_geometric_tilt_offset(inputs)
+        geom_x, geom_y = self._geometric_tilt_offset(inputs)
         self._center_physical_trim.update(
             float(inputs.offset_x) - geom_x,
             float(inputs.offset_y) - geom_y,
@@ -1657,10 +1779,22 @@ class MissionRoutine:
     def _commit_descent_lateral_trim(self, inputs: MissionInputs) -> None:
         """Commit the FINAL_PROBE static acceleration trim into DESCENT.
 
-        Lateral P authority is already zero throughout FINAL_PROBE, so there is
-        no image-offset/feedforward pair to re-parameterise at the descent
-        boundary.  The bumpless choice is to start DESCENT from the exact static
-        feedforward FINAL_PROBE was already flying.
+        FINAL_PROBE flies a small residual image-position P on top of the static
+        trim, and DESCENT drops it.  No re-parameterisation is needed anyway:
+        the wind-trim EMA has been integrating the REALIZED command all through
+        the hold, so the mean of that P contribution is already inside the
+        static term.  Starting DESCENT from the exact feedforward FINAL_PROBE
+        was flying therefore remains the bumpless choice -- what is lost at the
+        boundary is P's response to the residual centring error, not the steady
+        force, which has already migrated.
+
+        DESCENT drops P because image offset stops being a position measurement
+        near contact.  On the 2026-08-19 09:42 run the centroid tracked truth to
+        within 7% for the whole of FINAL_PROBE, degraded past area_fraction
+        ~0.74 about 2.6 s before touchdown, and read +0.000 while the vehicle
+        was still 10.6 cm off.  ``fov_saturated`` fired 1.5 s AFTER that, so it
+        is a lagging indicator and cannot serve as the trigger; the phase
+        boundary is used instead.
 
         The committed value is also retained as a telemetry anchor.  If descent
         adaptation is enabled, subsequent ticks may refine the live bias while

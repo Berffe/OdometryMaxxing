@@ -27,18 +27,6 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
 
     elapsed = t - routine._t_approach_entry
 
-    lateral_frac = (
-        1.0 if routine._lateral_ramp <= 1e-9
-        else min(1.0, elapsed / routine._lateral_ramp)
-    )
-    lateral_blend = raised_cosine01(lateral_frac)
-    lateral_p = routine._center_lateral_p_scale + (
-        routine._probe_lateral_p_scale - routine._center_lateral_p_scale
-    ) * lateral_blend
-    lateral_d = routine._center_lateral_d_scale + (
-        routine._probe_lateral_d_scale - routine._center_lateral_d_scale
-    ) * lateral_blend
-
     # Keep the adaptive visual-centre finder online throughout APPROACH.
     # The lateral P schedule is allowed to change the equilibrium naturally;
     # the outer adaptation then follows the resulting physical centring error
@@ -89,6 +77,39 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
         k_explore=routine._k_explore,
     )
 
+    # Lateral D rides the SAME accumulated integral, per axis, so it reaches its
+    # near-field value exactly when the vertical gain reaches k_probe.  The
+    # endpoint is derived from the lateral ceiling rather than configured; when
+    # the far-field gain is already admissible at the handoff height the two
+    # endpoints coincide and this is flat, which is the correct answer for a
+    # platform whose lateral authority is not the binding constraint.
+    roll_kd_far = routine._roll_d_gain * routine._center_lateral_d_scale
+    pitch_kd_far = routine._pitch_d_gain * routine._center_lateral_d_scale
+    roll_kd = scheduled_gain_from_integral(
+        commanded_divergence_integral=routine._approach_divergence_integral,
+        k_floor=routine.roll_probe_lateral_gain,
+        k_explore=roll_kd_far,
+    )
+    pitch_kd = scheduled_gain_from_integral(
+        commanded_divergence_integral=routine._approach_divergence_integral,
+        k_floor=routine.pitch_probe_lateral_gain,
+        k_explore=pitch_kd_far,
+    )
+    roll_d = roll_kd / routine._roll_d_gain if routine._roll_d_gain > 1e-9 else 0.0
+    pitch_d = pitch_kd / routine._pitch_d_gain if routine._pitch_d_gain > 1e-9 else 0.0
+    lateral_d = max(roll_d, pitch_d)
+
+    # P is not the flow loop the de Croon bound constrains, so it has no derived
+    # endpoint.  It rides the same decay curve as D -- ``1 - exp(-integral)`` --
+    # rather than the D endpoints themselves, because those coincide whenever
+    # the ceiling is not binding and would leave P with no progress signal.
+    lateral_blend = clamp(
+        1.0 - math.exp(-max(0.0, routine._approach_divergence_integral)), 0.0, 1.0
+    )
+    lateral_p = routine._center_lateral_p_scale + (
+        routine._probe_lateral_p_scale - routine._center_lateral_p_scale
+    ) * lateral_blend
+
     # APPROACH probes are diagnostics only.  FINAL_PROBE resets these envelopes
     # before collecting any evidence used by a feasibility gate.
     routine._update_visual_mismatch(inputs)
@@ -122,17 +143,37 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
         routine._substate = FINAL_PROBE
         routine._begin_final_probe_measurement(t, inputs)
 
+        # This is the FIRST FINAL_PROBE command, so it must already BE a
+        # FINAL_PROBE command. It duplicates the lateral contract in
+        # phases/final_probe.py rather than delegating, because delegating
+        # would re-run the probe update this tick has already performed --
+        # keep the two blocks in step.
+        handoff_roll_sp, handoff_pitch_sp = routine._near_field_lateral_setpoint(
+            inputs
+        )
+
         return MissionControl(
             divergence_setpoint=0.0,
             thrust_gain_override=routine._compute_probe_gain(),
-            # Near-field handoff: image-position authority disappears
-            # completely on the FIRST FINAL_PROBE command. The passive
-            # APPROACH acceleration mean is activated as the initial static
-            # term; subsequent FINAL_PROBE ticks keep adapting it.
-            lateral_p_scale=0.0,
-            lateral_d_scale=routine._probe_lateral_d_scale,
+            # Near-field handoff, three simultaneous changes on ONE tick:
+            # image-position P collapses from the APPROACH value to the small
+            # residual, the visual setpoint drops the learned wind bias and
+            # keeps only geometric tilt, and the passive APPROACH acceleration
+            # mean is activated as the initial static term. The steady wind
+            # force therefore moves from the P error to the feedforward
+            # without ever passing through zero.
+            lateral_p_scale=routine._final_probe_lateral_p_scale,
+            lateral_d_scale=max(
+                routine.roll_probe_lateral_d_scale,
+                routine.pitch_probe_lateral_d_scale,
+            ),
+            roll_d_scale=routine.roll_probe_lateral_d_scale,
+            pitch_d_scale=routine.pitch_probe_lateral_d_scale,
+            roll_offset_setpoint=handoff_roll_sp,
+            pitch_offset_setpoint=handoff_pitch_sp,
             roll_accel_feedforward_m_s2=routine._final_probe_roll_accel_bias,
             pitch_accel_feedforward_m_s2=routine._final_probe_pitch_accel_bias,
+            scale_lateral_d_with_offset=False,
             enable_integral=True,
             substate=FINAL_PROBE,
             info={
@@ -144,6 +185,7 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
                 "approach_measured_divergence": inputs.divergence_1_s,
                 "approach_hold_condition": True,
                 "approach_hold_dwell_sec": hold_dwell,
+                "lateral_p_scale": routine._final_probe_lateral_p_scale,
             },
         )
 
@@ -152,6 +194,10 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
         thrust_gain_override=k_approach,
         lateral_p_scale=lateral_p,
         lateral_d_scale=lateral_d,
+        # Per-axis, because the two ceilings differ on a non-square lens.
+        # lateral_d_scale above stays populated as the most demanding axis.
+        roll_d_scale=roll_d,
+        pitch_d_scale=pitch_d,
         roll_offset_setpoint=roll_offset_setpoint,
         pitch_offset_setpoint=pitch_offset_setpoint,
         roll_accel_feedforward_m_s2=roll_accel_feedforward,

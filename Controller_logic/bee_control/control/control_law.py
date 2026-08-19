@@ -288,6 +288,7 @@ class ControlLaw:
         pitch_offset_setpoint: float = 0.0,
         roll_accel_feedforward_m_s2: float = 0.0,
         pitch_accel_feedforward_m_s2: float = 0.0,
+        scale_lateral_d_with_offset: bool = True,
         enable_integral: bool = True,
     ) -> AttitudeSetpoint:
         """Desired roll/pitch/yaw/thrust from visual data only.
@@ -308,6 +309,12 @@ class ControlLaw:
         roll_offset_setpoint / pitch_offset_setpoint:
             normalized image trim about which the lateral P feedback acts. Zero
             preserves the legacy controller.
+        scale_lateral_d_with_offset:
+            When True (far field), the large-offset blend attenuates the D
+            branch alongside P.  FINAL_PROBE passes False so its optical-flow
+            damping -- the quantity the lateral gates are measured against --
+            stays exactly at the commanded d_scale.
+
         roll_accel_feedforward_m_s2 / pitch_accel_feedforward_m_s2:
             acceleration-domain static trim carried separately from the scheduled
             dynamic feedback. Zero preserves the legacy controller.
@@ -351,17 +358,26 @@ class ControlLaw:
 
             # The large-offset blend exists to keep the FAR-FIELD compound P+D
             # request out of the collapsing-gain part of the angle soft limit.
-            # Once a mission phase disables position P (FINAL_PROBE onward),
-            # image offset is intentionally no longer trusted.  Do not let that
-            # same saturated/unreliable offset attenuate the optical-flow D
-            # branch that now owns lateral tracking.
+            #
+            # Whether it also attenuates D is now the CALLER's decision, not an
+            # inference from ``p_scale > 0``.  That proxy meant "the near field
+            # has switched position feedback off", and it stopped being true
+            # when FINAL_PROBE kept a small residual P: the flag would have
+            # silently started attenuating D again.
+            #
+            # FINAL_PROBE passes False.  Its D branch is the measurement the
+            # lateral feasibility gates are computed against, so an offset-
+            # dependent multiplier on it would make the gates claim damping
+            # authority the vehicle does not have -- optimistic in the unsafe
+            # direction.  P is still attenuated there; only D is exempt.
             roll_p_active = roll_p > 1e-12
             pitch_p_active = pitch_p > 1e-12
+            attenuate_d = bool(scale_lateral_d_with_offset)
             roll_p *= err_scale
             pitch_p *= err_scale
-            if roll_p_active:
+            if roll_p_active and attenuate_d:
                 roll_d *= err_scale
-            if pitch_p_active:
+            if pitch_p_active and attenuate_d:
                 pitch_d *= err_scale
 
             roll_accel_cmd = float(roll_accel_feedforward_m_s2) + (

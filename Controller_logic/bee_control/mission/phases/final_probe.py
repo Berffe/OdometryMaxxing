@@ -3,6 +3,16 @@
 Stationary near-field probe at D*=0 and k_probe.  APPROACH_PROBE has already
 established the visual-height hold; every acceleration and mismatch sample used
 by the feasibility gates is collected fresh in this phase.
+
+Lateral law here is three terms:
+
+    a_cmd = a_static + a_P(offset - e_geom) + a_D(flow)
+
+``a_static`` carries the steady wind (see routine's wind-trim section), ``a_P``
+is a small residual centring term at ``final_probe_lateral_p_scale`` about the
+GEOMETRIC tilt setpoint only, and ``a_D`` is the optical-flow damping the
+feasibility gates are measured against -- which is why this phase asks the
+control law NOT to attenuate D with the large-offset blend.
 """
 from __future__ import annotations
 
@@ -40,7 +50,7 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
             peak_accel=routine.probe_result.peak_accel,
             descent_divergence_setpoint=routine._d_star,
             initial_thrust_gain=routine._initial_thrust_gain,
-            control_period_sec=routine._stability_dt,
+            stability_dt_sec=routine._vertical_stability_dt,
             leg_clearance_m=routine._leg_clearance,
             ceiling_safety_factor=routine._safety,
             ceiling_margin=routine._ceiling_margin,
@@ -69,17 +79,36 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
         routine._substate = INFEASIBLE
         return infeasible.run(routine, inputs, just_entered=True)
 
+    # Geometric tilt compensation ONLY -- deliberately not the adaptive
+    # far-field bias, which would double-count the wind the static feedforward
+    # is already supplying.  See MissionRoutine._near_field_lateral_setpoint.
+    roll_offset_setpoint, pitch_offset_setpoint = (
+        routine._near_field_lateral_setpoint(inputs)
+    )
+
     return MissionControl(
         divergence_setpoint=0.0,
         thrust_gain_override=routine._compute_probe_gain(),
-        lateral_p_scale=0.0,
-        lateral_d_scale=routine._probe_lateral_d_scale,
+        lateral_p_scale=routine._final_probe_lateral_p_scale,
+        lateral_d_scale=max(
+            routine.roll_probe_lateral_d_scale,
+            routine.pitch_probe_lateral_d_scale,
+        ),
+        roll_d_scale=routine.roll_probe_lateral_d_scale,
+        pitch_d_scale=routine.pitch_probe_lateral_d_scale,
+        roll_offset_setpoint=roll_offset_setpoint,
+        pitch_offset_setpoint=pitch_offset_setpoint,
         roll_accel_feedforward_m_s2=routine._final_probe_roll_accel_bias,
         pitch_accel_feedforward_m_s2=routine._final_probe_pitch_accel_bias,
+        # The gates rest on this phase's D branch. Leave it at exactly
+        # lateral_d_scale so the measured damping authority is the commanded
+        # one, not an offset-dependent fraction of it.
+        scale_lateral_d_with_offset=False,
         enable_integral=True,
         substate=FINAL_PROBE,
         info={
             "event": "final_probe_hold",
+            "lateral_p_scale": routine._final_probe_lateral_p_scale,
             "k": routine._compute_probe_gain(),
             "peak_accel": routine.probe_result.peak_accel,
             "roll_peak_accel": routine.roll_probe_result.peak_accel,
