@@ -342,7 +342,8 @@ def test_final_probe_starts_from_fresh_gate_evidence_without_integral_reset():
 
 
 def _fly_to_descend(routine, *, trim_x=0.10, trim_y=-0.05, osc=0.05,
-                    freq_hz=0.15, dt=1 / 30.0, max_sec=140.0):
+                    freq_hz=0.15, dt=1 / 30.0, max_sec=140.0,
+                    capture_controls=None):
     """Synthetic whole-sequence flight with adaptive physical centring.
 
     ``trim_x/y`` represent the steady P error required to reject wind.  The
@@ -378,6 +379,8 @@ def _fly_to_descend(routine, *, trim_x=0.10, trim_y=-0.05, osc=0.05,
                 last_roll_accel_cmd=-kp_eff * (offset_x - prev_sp_x),
                 last_pitch_accel_cmd=-kp_eff * (offset_y - prev_sp_y))))
         rows.setdefault(routine.substate, routine.telemetry())
+        if capture_controls is not None:
+            capture_controls.setdefault(routine.substate, routine.last_control)
     return rows
 
 def test_lateral_trim_is_logged_in_every_visual_phase():
@@ -949,6 +952,76 @@ def test_approach_lateral_d_rides_the_commanded_divergence_integral():
     assert seq == sorted(seq, reverse=True)
     assert math.isclose(seq[0], far_gain)
     assert math.isclose(seq[-1], probe_gain)
+
+
+def test_gain_blend_ignores_the_learned_wind_bias():
+    """The blend must read PHYSICAL off-centredness, not the P error.
+
+    Under wind the far-field setpoint carries a bias that IS the steady image
+    error the P loop holds to generate the counter-force. Counting it as being
+    off centre attenuates the lateral gain hardest exactly when the wind is
+    strongest.
+    """
+    def realized(blend_setpoint):
+        law = ControlLaw(command_filter_alpha=1.0, enable_slew_rate_limits=False)
+        law.compute(
+            TargetEstimate(found=True, offset_x=0.0, offset_y=0.0),
+            FlowResult(valid=True, mean_flow_x_norm=0.0, mean_flow_y_norm=0.0),
+            1 / 60.0,
+            lateral_p_scale=0.75,
+            lateral_d_scale=0.65,
+            roll_offset_setpoint=0.50,          # geometric 0.0 minus bias -0.50
+            roll_gain_blend_setpoint=blend_setpoint,
+            enable_integral=False,
+        )
+        return law.last_roll_accel_cmd
+
+    # Physically centred (offset == geometric reference == 0), so the blend must
+    # be at full gain and the whole steady P request must survive.
+    physical = realized(0.0)
+    # Measuring from the P setpoint instead reads |0 - 0.50| and attenuates.
+    p_error_based = realized(None)
+
+    assert abs(physical) > abs(p_error_based)
+    # The blend floor is 0.45, so the attenuated command cannot be more than
+    # a little over half the un-attenuated one.
+    assert abs(p_error_based) < 0.75 * abs(physical)
+
+
+def test_gain_blend_still_attenuates_a_genuine_offset():
+    """Excluding the bias must not disable the protection it exists to give."""
+    def realized(offset):
+        law = ControlLaw(command_filter_alpha=1.0, enable_slew_rate_limits=False)
+        law.compute(
+            TargetEstimate(found=True, offset_x=offset, offset_y=0.0),
+            FlowResult(valid=True, mean_flow_x_norm=0.0, mean_flow_y_norm=0.0),
+            1 / 60.0,
+            lateral_p_scale=0.75,
+            lateral_d_scale=0.65,
+            roll_offset_setpoint=0.0,
+            roll_gain_blend_setpoint=0.0,
+            enable_integral=False,
+        )
+        return abs(law.last_roll_accel_cmd) / max(abs(offset), 1e-9)
+
+    # Effective gain per unit offset must fall as the target moves off centre.
+    assert realized(0.60) < realized(0.10)
+
+
+def test_far_field_phases_blend_on_the_geometric_reference():
+    routine = MissionRoutine(hover_thrust=0.73, config=MissionConfig())
+    routine.start(0.0, 5.0)
+    rows = _fly_to_descend(routine, capture_controls=(controls := {}))
+
+    for phase in ("center", "approach_probe"):
+        control = controls[phase]
+        assert control.roll_gain_blend_setpoint is not None, phase
+        assert math.isclose(
+            control.roll_gain_blend_setpoint, rows[phase]["center_geometric_offset_x"]
+        )
+    # FINAL_PROBE's P setpoint already IS the geometric offset, so it needs no
+    # override and must keep the default.
+    assert controls["final_probe"].roll_gain_blend_setpoint is None
 
 
 def test_final_probe_keeps_a_small_residual_lateral_p():

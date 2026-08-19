@@ -189,6 +189,17 @@ class MissionControl:
     pitch_offset_setpoint: float = 0.0
     roll_accel_feedforward_m_s2: float = 0.0
     pitch_accel_feedforward_m_s2: float = 0.0
+    # Reference the large-offset gain blend measures "off centre" FROM.
+    #
+    # Defaults to the offset setpoint above, which is the previous behaviour.
+    # CENTER and APPROACH override it with the geometric tilt offset ALONE,
+    # deliberately excluding the learned wind bias: that bias is the steady
+    # image error the P loop must hold to reject wind, so counting it as
+    # off-centredness attenuates the lateral gain hardest exactly when the wind
+    # is strongest. The blend should read how far the vehicle is from being
+    # PHYSICALLY over the platform, which is what the geometric offset marks.
+    roll_gain_blend_setpoint: Optional[float] = None
+    pitch_gain_blend_setpoint: Optional[float] = None
     # False keeps the optical-flow D branch at exactly ``lateral_d_scale``,
     # unattenuated by the large-offset blend. FINAL_PROBE needs this because
     # its D branch is the evidence the lateral feasibility gates rest on.
@@ -217,6 +228,8 @@ class MissionControl:
             "pitch_offset_setpoint": self.pitch_offset_setpoint,
             "roll_accel_feedforward_m_s2": self.roll_accel_feedforward_m_s2,
             "pitch_accel_feedforward_m_s2": self.pitch_accel_feedforward_m_s2,
+            "roll_gain_blend_setpoint": self.roll_gain_blend_setpoint,
+            "pitch_gain_blend_setpoint": self.pitch_gain_blend_setpoint,
             "scale_lateral_d_with_offset": self.scale_lateral_d_with_offset,
             "enable_integral": self.enable_integral,
         }

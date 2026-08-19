@@ -1082,16 +1082,24 @@ def plot_drone_platform_position(data: AnalysisData, out: Path) -> None:
 def _offset_magnitude_gain_scale(c: pd.DataFrame) -> np.ndarray:
 	"""Reproduce ControlLaw's large-offset blend from the logged offsets.
 
-	The blend is a raised cosine on the RADIAL error the P branch sees -- the
-	measured offset minus the phase's visual setpoint, both axes together -- and
-	it multiplies the phase scales before they ever reach the gains. It is not
+	The blend is a raised cosine on the radial PHYSICAL CENTRING error, and it
+	multiplies the phase scales before they ever reach the gains. It is not
 	logged, so a plot of the phase scale alone overstates the applied gain
 	wherever the target sits off centre. CENTER is the obvious case: it commands
 	scale 1.0 while the vehicle is still capturing a large offset, so the gain it
 	actually applies can be barely half of what the schedule says.
+
+	The reference is the GEOMETRIC tilt offset, not the P setpoint. Those differ
+	in CENTER and APPROACH, where the P setpoint additionally carries the
+	learned wind bias -- the steady image error the loop holds to generate the
+	counter-force. Measuring off-centredness from the P setpoint would read a
+	physically centred vehicle as far off centre whenever the wind is strong,
+	which is exactly when the lateral gain is least worth attenuating.
 	"""
-	error_x = _num(c, "target_offset_x") - _num(c, "mission_roll_offset_setpoint").fillna(0.0)
-	error_y = _num(c, "target_offset_y") - _num(c, "mission_pitch_offset_setpoint").fillna(0.0)
+	reference_x = _num(c, "mission_center_geometric_offset_x").fillna(0.0)
+	reference_y = _num(c, "mission_center_geometric_offset_y").fillna(0.0)
+	error_x = _num(c, "target_offset_x") - reference_x
+	error_y = _num(c, "target_offset_y") - reference_y
 	err = np.hypot(error_x.to_numpy(float), error_y.to_numpy(float))
 
 	span = max(OFFSET_BLEND_LARGE_THRESHOLD - OFFSET_BLEND_SMALL_THRESHOLD, 1e-9)
@@ -1228,13 +1236,31 @@ def plot_lateral_p_gain(data: AnalysisData, out: Path) -> None:
 	)
 	axes[2].axhline(1.0, linestyle=":", linewidth=0.9, alpha=0.55)
 
-	error_x = _num(c, "target_offset_x") - _num(c, "mission_roll_offset_setpoint").fillna(0.0)
-	error_y = _num(c, "target_offset_y") - _num(c, "mission_pitch_offset_setpoint").fillna(0.0)
-	radial = np.hypot(error_x.to_numpy(float), error_y.to_numpy(float))
+	radial = np.hypot(
+		(_num(c, "target_offset_x")
+			- _num(c, "mission_center_geometric_offset_x").fillna(0.0)).to_numpy(float),
+		(_num(c, "target_offset_y")
+			- _num(c, "mission_center_geometric_offset_y").fillna(0.0)).to_numpy(float),
+	)
 	axes[2].plot(
 		t, radial, alpha=0.75, linewidth=1.4,
-		label="Radial P error |offset - setpoint|",
+		label="Radial centring error |offset - geometric|",
 	)
+	# The P error the gain acts ON is a different quantity wherever the learned
+	# wind bias is non-zero; showing both makes that separation visible.
+	p_error = np.hypot(
+		(_num(c, "target_offset_x")
+			- _num(c, "mission_roll_offset_setpoint").fillna(0.0)).to_numpy(float),
+		(_num(c, "target_offset_y")
+			- _num(c, "mission_pitch_offset_setpoint").fillna(0.0)).to_numpy(float),
+	)
+	if np.isfinite(p_error).any() and not np.allclose(
+		p_error[np.isfinite(p_error)], radial[np.isfinite(p_error)], atol=1e-6
+	):
+		axes[2].plot(
+			t, p_error, alpha=0.6, linewidth=1.2, linestyle="--",
+			label="Radial P error |offset - P setpoint| (not the blend input)",
+		)
 	for threshold, name in (
 		(OFFSET_BLEND_SMALL_THRESHOLD, "full gain below"),
 		(OFFSET_BLEND_LARGE_THRESHOLD, "floor at/above"),

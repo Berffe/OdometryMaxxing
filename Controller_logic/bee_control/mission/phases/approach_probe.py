@@ -200,6 +200,10 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
         pitch_d_scale=pitch_d,
         roll_offset_setpoint=roll_offset_setpoint,
         pitch_offset_setpoint=pitch_offset_setpoint,
+        # Blend on the PHYSICAL centring error: geometric tilt only, with
+        # the learned wind bias excluded. See MissionControl.
+        roll_gain_blend_setpoint=routine._center_geometric_offset_x,
+        pitch_gain_blend_setpoint=routine._center_geometric_offset_y,
         roll_accel_feedforward_m_s2=roll_accel_feedforward,
         pitch_accel_feedforward_m_s2=pitch_accel_feedforward,
         enable_integral=True,

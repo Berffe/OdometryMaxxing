@@ -288,6 +288,8 @@ class ControlLaw:
         pitch_offset_setpoint: float = 0.0,
         roll_accel_feedforward_m_s2: float = 0.0,
         pitch_accel_feedforward_m_s2: float = 0.0,
+        roll_gain_blend_setpoint: Optional[float] = None,
+        pitch_gain_blend_setpoint: Optional[float] = None,
         scale_lateral_d_with_offset: bool = True,
         enable_integral: bool = True,
     ) -> AttitudeSetpoint:
@@ -315,6 +317,12 @@ class ControlLaw:
             damping -- the quantity the lateral gates are measured against --
             stays exactly at the commanded d_scale.
 
+        roll_gain_blend_setpoint / pitch_gain_blend_setpoint:
+            Reference the large-offset gain blend measures off-centredness
+            from. Defaults to the P offset setpoint. CENTER/APPROACH pass the
+            geometric tilt offset alone so the learned wind bias does not read
+            as being off centre -- see the note at the blend call site.
+
         roll_accel_feedforward_m_s2 / pitch_accel_feedforward_m_s2:
             acceleration-domain static trim carried separately from the scheduled
             dynamic feedback. Zero preserves the legacy controller.
@@ -339,10 +347,34 @@ class ControlLaw:
             roll_error = offset_x - float(roll_offset_setpoint)
             pitch_error = offset_y - float(pitch_offset_setpoint)
 
-            # Error-magnitude blend protects both axes against authority
-            # saturation, while the mission may now schedule roll and pitch
-            # independently after the three-axis feasibility probe.
-            err_scale = self._offset_magnitude_gain_scale(roll_error, pitch_error)
+            # The blend measures "how far off centre are we", and that is NOT
+            # always the same as the P error. Under wind the far-field setpoint
+            # carries a learned bias -- the steady image error the P loop has to
+            # hold to generate the counter-force -- so a vehicle sitting
+            # perfectly over the platform still shows a large P error. Reading
+            # that as off-centredness attenuates the lateral gain hardest
+            # exactly when the wind is strongest.
+            #
+            # The caller therefore supplies its own reference. CENTER and
+            # APPROACH pass the geometric tilt offset alone, which marks where
+            # the target appears when the vehicle IS physically overhead.
+            # Phases that pass nothing fall back to the P setpoint, which is the
+            # previous behaviour and is already correct for them: FINAL_PROBE's
+            # setpoint is the geometric offset, and DESCEND has no P.
+            blend_roll_reference = (
+                float(roll_offset_setpoint)
+                if roll_gain_blend_setpoint is None
+                else float(roll_gain_blend_setpoint)
+            )
+            blend_pitch_reference = (
+                float(pitch_offset_setpoint)
+                if pitch_gain_blend_setpoint is None
+                else float(pitch_gain_blend_setpoint)
+            )
+            err_scale = self._centring_error_gain_scale(
+                offset_x - blend_roll_reference,
+                offset_y - blend_pitch_reference,
+            )
             roll_p = max(0.0, float(
                 lateral_p_scale if roll_p_scale is None else roll_p_scale
             ))
@@ -607,16 +639,23 @@ class ControlLaw:
         w = self._raw_divergence_weight
         return (1.0 - w) * filtered + w * raw
 
-    def _offset_magnitude_gain_scale(self, offset_x: float, offset_y: float) -> float:
-        """1.0 (full gain) when the radial offset is small; smoothly falls to
+    def _centring_error_gain_scale(
+        self, roll_centring_error: float, pitch_centring_error: float
+    ) -> float:
+        """1.0 (full gain) when the radial CENTRING ERROR is small; falls to
         large_offset_gain_scale as it grows past small_offset_threshold,
         reaching that floor at large_offset_threshold. Raised-cosine blend
         (same shape/reasoning as the D* ramp): zero slope at both ends, no
         derivative-discontinuity kick at either threshold. Applied to BOTH
         lateral_p_scale and lateral_d_scale equally (compound pre-saturation
         signal protection, not a P/D balance concern -- see compute()'s
-        docstring for that distinction) -- upstream of _soft_limit."""
-        err = math.hypot(float(offset_x), float(offset_y))
+        docstring for that distinction) -- upstream of _soft_limit.
+
+        The argument is a CENTRING error, not a raw image offset and not
+        necessarily the P error: the caller chooses the reference it is measured
+        from. The threshold names still say "offset" because they are public
+        constructor arguments; they bound this error."""
+        err = math.hypot(float(roll_centring_error), float(pitch_centring_error))
         if err <= self._small_offset_threshold:
             return 1.0
         if err >= self._large_offset_threshold:
