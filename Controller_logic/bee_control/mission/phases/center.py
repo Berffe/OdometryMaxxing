@@ -185,10 +185,12 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
             lateral_d_scale=routine._center_lateral_d_scale,
             roll_offset_setpoint=roll_offset_setpoint,
             pitch_offset_setpoint=pitch_offset_setpoint,
-            # Blend on the PHYSICAL centring error: geometric tilt only, with
-            # the learned wind bias excluded. See MissionControl.
-            roll_gain_blend_setpoint=routine._center_geometric_offset_x,
-            pitch_gain_blend_setpoint=routine._center_geometric_offset_y,
+            # This control already belongs to APPROACH_PROBE -- it is the first
+            # tick of that phase, merely constructed here -- so it drops the
+            # large-offset blend along with the rest of APPROACH. Setting it
+            # here rather than in approach_probe.py is what keeps the blend
+            # from surviving one extra tick past the handoff.
+            apply_offset_gain_blend=False,
             roll_accel_feedforward_m_s2=roll_accel_feedforward,
             pitch_accel_feedforward_m_s2=pitch_accel_feedforward,
             enable_integral=True,
@@ -225,8 +227,15 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
         lateral_d_scale=routine._center_lateral_d_scale,
         roll_offset_setpoint=roll_offset_setpoint,
         pitch_offset_setpoint=pitch_offset_setpoint,
-        # Blend on the PHYSICAL centring error: geometric tilt only, with
-        # the learned wind bias excluded. See MissionControl.
+        # CENTER is the ONLY phase that runs the large-offset gain blend. The
+        # capture transient it guards -- a compound P+D request large enough to
+        # reach the collapsing-gain part of the angle soft limit -- happens
+        # here and nowhere else, because every later phase entered through the
+        # CENTER gate and therefore starts already centred.
+        #
+        # Blend on the PHYSICAL centring error: geometric tilt only, with the
+        # learned wind bias excluded. See MissionControl.
+        apply_offset_gain_blend=True,
         roll_gain_blend_setpoint=routine._center_geometric_offset_x,
         pitch_gain_blend_setpoint=routine._center_geometric_offset_y,
         roll_accel_feedforward_m_s2=roll_accel_feedforward,

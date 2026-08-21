@@ -391,12 +391,12 @@ class MissionConfig:
     # tilt-corrected physical centring error tends to zero. The estimator is
     # frozen only when FINAL_PROBE removes lateral P authority. This outer
     # adaptation must remain slower than the lateral P/D loop.
-    center_visual_adaptation_tau_sec: float = 5.0
-    center_visual_adaptation_max_bias_norm: float = 0.75
+    center_visual_adaptation_tau_sec: float = 3.0
+    center_visual_adaptation_max_bias_norm: float = 0.90
     # Smooth motion gate: at this optical-flow radius adaptation runs at 50%.
     center_visual_adaptation_flow_scale_norm_s: float = 0.10
     # Independent per-axis slew protection for the moving visual reference.
-    center_visual_adaptation_max_rate_norm_s: float = 0.05
+    center_visual_adaptation_max_rate_norm_s: float = 0.10
 
     # ======================================================================
     # 3. APPROACH_PROBE -- descend to the visual-height hold
@@ -409,7 +409,7 @@ class MissionConfig:
     # q = 0.5*ln(area_fraction) is a log-linear range coordinate and q_dot is
     # the same expansion-rate quantity regulated by the inner vertical PI.
     approach_hold_area_fraction: float = 0.75
-    approach_visual_p_gain_1_s: float = 0.40
+    approach_visual_p_gain_1_s: float = 0.30
     approach_retreat_divergence_limit: float = 0.03
     approach_hold_log_scale_tolerance: float = 0.05
     approach_hold_divergence_tolerance_1_s: float = 0.1
@@ -421,31 +421,6 @@ class MissionConfig:
     # FINAL_PROBE starts only after APPROACH has already established the visual
     # height hold and near-zero divergence.  Its measurements alone feed gates.
     final_probe_duration_sec: float = 3.0 * PROBE_DESIGN_PERIOD_SEC
-
-    # --- Residual lateral centring ----------------------------------------
-    # FINAL_PROBE keeps a small image-position P term instead of removing it.
-    #
-    # P on image position is INTEGRAL action on optical flow, because position
-    # is the integral of velocity.  It is the only term in the lateral loop
-    # that can observe a bias in the flow measurement.  With P at exactly zero
-    # the loop holds VELOCITY, so a constant flow bias integrates without bound:
-    # the 2026-08-19 09:42 run drifted at ~12 mm/s for the whole 20 s hold and
-    # touched down 15.5 cm off, 85% of leg_clearance_m.  The measured bias of
-    # ~0.013 norm/s implies a steady offset of only ~2.5 cm at this scale.
-    #
-    # It is cheap.  In that run the image offset was 26x quieter than the flow
-    # in command units, so this P adds ~2% to the D branch's noise while
-    # restoring a bounded position error.
-    #
-    # Small on purpose.  The steady wind force is NOT this term's job -- the
-    # static acceleration trim (section 8) carries it, and the wind-trim EMA
-    # absorbs whatever mean force P contributes, so DESCENT inherits it in the
-    # feedforward when P is dropped.  P here handles the residual centring
-    # error only.  Raising it toward the APPROACH value would start competing
-    # with the feedforward for the same disturbance.
-    #
-    # Set to 0.0 to restore the previous velocity-hold behaviour exactly.
-    final_probe_lateral_p_scale: float = 0.3
 
     # ======================================================================
     # 5. DESCENT -- scheduled-gain terminal segment
@@ -542,7 +517,7 @@ class MissionConfig:
     # remain slower than the lateral D loop so the static estimate cannot chase
     # the oscillatory flow -- that is the loop's stability condition, not a
     # preference.
-    wind_trim_tau_sec: float = 5.0 * PROBE_DESIGN_PERIOD_SEC
+    wind_trim_tau_sec: float = 8.0 * PROBE_DESIGN_PERIOD_SEC
     # Hard bound around the passive APPROACH seed, shared across FINAL_PROBE and
     # DESCENT.  ONE neighbourhood for both phases: continuing to adapt after the
     # descent commitment does not buy a second deviation allowance.
@@ -552,7 +527,7 @@ class MissionConfig:
     # terminal segment.  False: DESCENT flies the committed value frozen.
     # Post-commit adaptation changes commands only; it can never re-open a
     # feasibility decision.
-    wind_trim_adapt_in_descent: bool = True
+    wind_trim_adapt_in_descent: bool = False
 
     # ======================================================================
     # 9. Lateral gain schedule
@@ -587,11 +562,12 @@ class MissionConfig:
     # are computed against is the Kd actually flown.
     #
     # P has no ceiling analogue -- it is not the flow loop the de Croon bound
-    # applies to -- so its endpoint stays configured and it rides the same
-    # decay curve as D.
+    # applies to -- so its near-field floor stays configured.  During APPROACH
+    # it is scheduled by the SAME commanded-divergence integral and the SAME
+    # exponential floor law as D; FINAL_PROBE then holds this floor directly.
     center_lateral_p_scale: float = 1.00
     center_lateral_d_scale: float = 0.80
-    probe_lateral_p_scale: float = 0.75
+    probe_lateral_p_scale: float = 0.30
 
     # ======================================================================
     # 10. Visual synchronisation (tracking) gate

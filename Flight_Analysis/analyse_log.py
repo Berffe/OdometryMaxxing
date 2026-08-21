@@ -1185,8 +1185,15 @@ def _applied_lateral_gains(
 	d_scale = _effective_axis_scale(c, axis, "d")
 	blend = _offset_magnitude_gain_scale(c)
 
+
+	# Older logs predate the opt-out flag; they always attenuated when P was on.
+	if "mission_lateral_offset_blend_active" in c.columns:
+		p_attenuated = _bool(c, "mission_lateral_offset_blend_active").to_numpy()
+	else:
+		p_attenuated = np.ones(len(c), dtype=bool)
+	p_blend = np.where(p_attenuated & (p_scale > 1e-12), blend, 1.0)
 	p_scheduled = base_kp * p_scale
-	p_applied = p_scheduled * blend
+	p_applied = p_scheduled * p_blend
 
 	# Older logs predate the opt-out flag; they always attenuated when P was on.
 	if "mission_lateral_d_offset_attenuated" in c.columns:
@@ -1194,9 +1201,9 @@ def _applied_lateral_gains(
 	else:
 		d_attenuated = np.ones(len(c), dtype=bool)
 	d_blend = np.where(d_attenuated & (p_scale > 1e-12), blend, 1.0)
-
 	d_scheduled = base_kd * d_scale
 	d_applied = d_scheduled * d_blend
+
 	return p_scheduled, p_applied, d_scheduled, d_applied
 
 

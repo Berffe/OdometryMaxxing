@@ -290,6 +290,7 @@ class ControlLaw:
         pitch_accel_feedforward_m_s2: float = 0.0,
         roll_gain_blend_setpoint: Optional[float] = None,
         pitch_gain_blend_setpoint: Optional[float] = None,
+        apply_offset_gain_blend: bool = True,
         scale_lateral_d_with_offset: bool = True,
         enable_integral: bool = True,
     ) -> AttitudeSetpoint:
@@ -311,17 +312,30 @@ class ControlLaw:
         roll_offset_setpoint / pitch_offset_setpoint:
             normalized image trim about which the lateral P feedback acts. Zero
             preserves the legacy controller.
+        apply_offset_gain_blend:
+            Master switch for the large-offset gain blend. False pins the blend
+            multiplier at 1.0, so lateral P and lateral D both keep exactly the
+            scales the caller commanded and the blend references below are not
+            read.  Only CENTER passes True: the blend guards the large-offset
+            capture transient, which is a CENTER phenomenon, and everywhere
+            later it can only remove lateral authority as the residual centring
+            error grows -- i.e. in proportion to the wind.
+
         scale_lateral_d_with_offset:
-            When True (far field), the large-offset blend attenuates the D
-            branch alongside P.  FINAL_PROBE passes False so its optical-flow
-            damping -- the quantity the lateral gates are measured against --
-            stays exactly at the commanded d_scale.
+            Consulted only while the blend is ON. True lets the blend attenuate
+            the D branch alongside P; FINAL_PROBE passed False so its
+            optical-flow damping -- the quantity the lateral gates are measured
+            against -- stayed exactly at the commanded d_scale.  With the blend
+            now CENTER-only this no longer changes any flown command, and is
+            retained for the log schema and for any future phase that turns the
+            blend back on.
 
         roll_gain_blend_setpoint / pitch_gain_blend_setpoint:
             Reference the large-offset gain blend measures off-centredness
-            from. Defaults to the P offset setpoint. CENTER/APPROACH pass the
+            from. Defaults to the P offset setpoint. CENTER passes the
             geometric tilt offset alone so the learned wind bias does not read
             as being off centre -- see the note at the blend call site.
+            Ignored when ``apply_offset_gain_blend`` is False.
 
         roll_accel_feedforward_m_s2 / pitch_accel_feedforward_m_s2:
             acceleration-domain static trim carried separately from the scheduled
@@ -371,9 +385,19 @@ class ControlLaw:
                 if pitch_gain_blend_setpoint is None
                 else float(pitch_gain_blend_setpoint)
             )
-            err_scale = self._centring_error_gain_scale(
-                offset_x - blend_roll_reference,
-                offset_y - blend_pitch_reference,
+            # ``apply_offset_gain_blend`` is the master switch. When the caller
+            # turns the blend off, the multiplier is exactly 1.0 and BOTH
+            # lateral branches keep the scales that were commanded -- the
+            # references computed just above are then unused, which is fine:
+            # computing them unconditionally keeps this branch free of a second
+            # code path that could drift from the first.
+            err_scale = (
+                self._centring_error_gain_scale(
+                    offset_x - blend_roll_reference,
+                    offset_y - blend_pitch_reference,
+                )
+                if bool(apply_offset_gain_blend)
+                else 1.0
             )
             roll_p = max(0.0, float(
                 lateral_p_scale if roll_p_scale is None else roll_p_scale
@@ -388,16 +412,22 @@ class ControlLaw:
                 lateral_d_scale if pitch_d_scale is None else pitch_d_scale
             ))
 
-            # The large-offset blend exists to keep the FAR-FIELD compound P+D
-            # request out of the collapsing-gain part of the angle soft limit.
+            # The large-offset blend exists to keep the CAPTURE-transient
+            # compound P+D request out of the collapsing-gain part of the angle
+            # soft limit.  That transient belongs to CENTER, so CENTER is the
+            # only phase that now passes ``apply_offset_gain_blend=True``;
+            # everywhere else ``err_scale`` is pinned at 1.0 above and the two
+            # ``attenuate_d`` branches below are inert.
             #
-            # Whether it also attenuates D is now the CALLER's decision, not an
+            # Whether it also attenuates D is the CALLER's decision, not an
             # inference from ``p_scale > 0``.  That proxy meant "the near field
             # has switched position feedback off", and it stopped being true
             # when FINAL_PROBE kept a small residual P: the flag would have
-            # silently started attenuating D again.
+            # silently started attenuating D again.  The same reasoning is why
+            # the master switch above is a caller flag and not a substate test
+            # down here.
             #
-            # FINAL_PROBE passes False.  Its D branch is the measurement the
+            # FINAL_PROBE passed False.  Its D branch is the measurement the
             # lateral feasibility gates are computed against, so an offset-
             # dependent multiplier on it would make the gates claim damping
             # authority the vehicle does not have -- optimistic in the unsafe

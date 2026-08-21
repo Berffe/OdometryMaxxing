@@ -200,9 +200,40 @@ class MissionControl:
     # PHYSICALLY over the platform, which is what the geometric offset marks.
     roll_gain_blend_setpoint: Optional[float] = None
     pitch_gain_blend_setpoint: Optional[float] = None
+    # False disables the large-offset gain blend ENTIRELY for this tick: both
+    # the lateral P and the lateral D branch keep their commanded scales, and
+    # the blend reference fields above are not consulted.
+    #
+    # The blend exists to keep the FAR-FIELD compound P+D request out of the
+    # collapsing-gain part of the angle soft limit during a large-offset
+    # capture transient. That transient is a CENTER phenomenon. Every later
+    # phase either has a small centring error by construction (it passed the
+    # CENTER gate to get there) or has no lateral P at all, so from
+    # APPROACH_PROBE onward the blend can only subtract lateral authority --
+    # and it subtracts most as the residual centring error grows, which is
+    # exactly when the wind is strongest and the authority is most needed.
+    #
+    # Like ``scale_lateral_d_with_offset``, this is the CALLER's decision and
+    # not an inference inside ControlLaw. A substate test down there would be
+    # the same trap that the ``p_scale > 0`` proxy already sprang once.
+    #
+    # NOTE the transition ticks: the first APPROACH_PROBE control is built in
+    # ``phases/center.py`` and the first FINAL_PROBE control in
+    # ``phases/approach_probe.py``, so "CENTER only" is four construction
+    # sites, not one file. Phases that leave this at the default and command
+    # ``lateral_p_scale=0.0`` (DESCEND, PROBE_HOLD, INFEASIBLE, LANDED,
+    # ABORTED) are unaffected: the blend multiplies a zero P and the D branch
+    # is already gated on P being active.
+    apply_offset_gain_blend: bool = True
     # False keeps the optical-flow D branch at exactly ``lateral_d_scale``,
     # unattenuated by the large-offset blend. FINAL_PROBE needs this because
     # its D branch is the evidence the lateral feasibility gates rest on.
+    #
+    # Now largely vestigial: it is only consulted when the blend is ON, and
+    # after the change above the only phase with the blend on is CENTER, which
+    # wants D attenuated. Kept so the log schema and the FINAL_PROBE contract
+    # it documents stay stable, and so a future phase that re-enables the
+    # blend still gets to exempt its D branch.
     scale_lateral_d_with_offset: bool = True
     enable_integral: bool = True
     substate: str = CENTER
@@ -230,6 +261,7 @@ class MissionControl:
             "pitch_accel_feedforward_m_s2": self.pitch_accel_feedforward_m_s2,
             "roll_gain_blend_setpoint": self.roll_gain_blend_setpoint,
             "pitch_gain_blend_setpoint": self.pitch_gain_blend_setpoint,
+            "apply_offset_gain_blend": self.apply_offset_gain_blend,
             "scale_lateral_d_with_offset": self.scale_lateral_d_with_offset,
             "enable_integral": self.enable_integral,
         }

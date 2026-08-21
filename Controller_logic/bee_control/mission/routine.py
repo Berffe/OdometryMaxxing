@@ -244,13 +244,9 @@ class MissionRoutine:
 
         self._center_lateral_p_scale = max(0.0, float(cfg.center_lateral_p_scale))
         self._center_lateral_d_scale = max(0.0, float(cfg.center_lateral_d_scale))
+        # Near-field P floor shared by the APPROACH schedule and FINAL_PROBE.
+        # Unlike lateral D this endpoint is configured, not ceiling-derived.
         self._probe_lateral_p_scale = max(0.0, float(cfg.probe_lateral_p_scale))
-        # Residual image-position P retained through FINAL_PROBE.  Small by
-        # design: the static acceleration trim owns the steady wind force, so
-        # this term only closes the centring error the flow branch cannot see.
-        self._final_probe_lateral_p_scale = max(
-            0.0, float(cfg.final_probe_lateral_p_scale)
-        )
 
         self._tm = ThrustModel(hover_thrust)
 
@@ -568,7 +564,7 @@ class MissionRoutine:
         # 1 when the large-offset blend is allowed to attenuate the D branch.
         # FINAL_PROBE logs 0: its damping must equal the commanded d_scale,
         # because that is the number the lateral feasibility gates rest on.
-        "lateral_d_offset_attenuated",
+        "lateral_d_offset_attenuated", "lateral_offset_blend_active",
         "roll_p_scale", "roll_d_scale", "pitch_p_scale", "pitch_d_scale",
         "roll_offset_setpoint", "pitch_offset_setpoint",
         "roll_accel_feedforward_m_s2", "pitch_accel_feedforward_m_s2",
@@ -734,6 +730,7 @@ class MissionRoutine:
             "lateral_p_scale": mc.lateral_p_scale,
             "lateral_d_scale": mc.lateral_d_scale,
             "lateral_d_offset_attenuated": int(bool(mc.scale_lateral_d_with_offset)),
+            "lateral_offset_blend_active": int(bool(mc.apply_offset_gain_blend)),
             "roll_p_scale": blank(mc.roll_p_scale),
             "roll_d_scale": blank(mc.roll_d_scale),
             "pitch_p_scale": blank(mc.pitch_p_scale),
@@ -1275,9 +1272,10 @@ class MissionRoutine:
 
         APPROACH_PROBE passively estimates the steady command through the
         existing roll/pitch PlatformProbe means.  At the FINAL_PROBE handoff that
-        estimate is activated as feedforward, and lateral image-position P drops
-        from its APPROACH value to a small residual
-        (``final_probe_lateral_p_scale``).  The near-field law is then
+        estimate is activated as feedforward.  Lateral image-position P has
+        already decayed to its configured near-field floor during APPROACH and
+        FINAL_PROBE holds that same ``probe_lateral_p_scale``.  The near-field
+        law is then
 
             a_cmd = a_static + a_P(offset - e_geom) + a_D(flow)
 

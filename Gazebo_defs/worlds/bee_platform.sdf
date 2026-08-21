@@ -193,7 +193,7 @@
 	<plugin filename="libWindController.so"
 			name="custom::WindController">
 
-		<enabled>false</enabled>
+		<enabled>true</enabled>
 		<seed>42</seed>
 
 		<!-- prevailing wind -->
@@ -367,7 +367,7 @@
 		<position_gain>20.0</position_gain>
 		<max_linear_velocity>5.0</max_linear_velocity>
 
-		<angular_enabled>false</angular_enabled>
+		<angular_enabled>true</angular_enabled>
 		<angular_gain>10.0</angular_gain>
 		<max_angular_velocity>1.0</max_angular_velocity>
 

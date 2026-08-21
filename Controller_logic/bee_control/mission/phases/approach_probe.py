@@ -99,16 +99,14 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
     pitch_d = pitch_kd / routine._pitch_d_gain if routine._pitch_d_gain > 1e-9 else 0.0
     lateral_d = max(roll_d, pitch_d)
 
-    # P is not the flow loop the de Croon bound constrains, so it has no derived
-    # endpoint.  It rides the same decay curve as D -- ``1 - exp(-integral)`` --
-    # rather than the D endpoints themselves, because those coincide whenever
-    # the ceiling is not binding and would leave P with no progress signal.
-    lateral_blend = clamp(
-        1.0 - math.exp(-max(0.0, routine._approach_divergence_integral)), 0.0, 1.0
+    # P is not the flow loop the de Croon bound constrains, so its floor is
+    # configured rather than derived.  Otherwise it uses exactly the same
+    # commanded-divergence-integral schedule as lateral D.
+    lateral_p = scheduled_gain_from_integral(
+        commanded_divergence_integral=routine._approach_divergence_integral,
+        k_floor=routine._probe_lateral_p_scale,
+        k_explore=routine._center_lateral_p_scale,
     )
-    lateral_p = routine._center_lateral_p_scale + (
-        routine._probe_lateral_p_scale - routine._center_lateral_p_scale
-    ) * lateral_blend
 
     # APPROACH probes are diagnostics only.  FINAL_PROBE resets these envelopes
     # before collecting any evidence used by a feasibility gate.
@@ -155,14 +153,12 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
         return MissionControl(
             divergence_setpoint=0.0,
             thrust_gain_override=routine._compute_probe_gain(),
-            # Near-field handoff, three simultaneous changes on ONE tick:
-            # image-position P collapses from the APPROACH value to the small
-            # residual, the visual setpoint drops the learned wind bias and
-            # keeps only geometric tilt, and the passive APPROACH acceleration
-            # mean is activated as the initial static term. The steady wind
-            # force therefore moves from the P error to the feedforward
-            # without ever passing through zero.
-            lateral_p_scale=routine._final_probe_lateral_p_scale,
+            # Near-field handoff: P is already on its configured probe floor,
+            # the visual setpoint drops the learned wind bias and keeps only
+            # geometric tilt, and the passive APPROACH acceleration mean is
+            # activated as the initial static term.  The steady wind force
+            # therefore moves to the feedforward without a P-gain discontinuity.
+            lateral_p_scale=routine._probe_lateral_p_scale,
             lateral_d_scale=max(
                 routine.roll_probe_lateral_d_scale,
                 routine.pitch_probe_lateral_d_scale,
@@ -173,6 +169,10 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
             pitch_offset_setpoint=handoff_pitch_sp,
             roll_accel_feedforward_m_s2=routine._final_probe_roll_accel_bias,
             pitch_accel_feedforward_m_s2=routine._final_probe_pitch_accel_bias,
+            # First tick of FINAL_PROBE, constructed here. The large-offset
+            # blend is CENTER-only, so it is off for the whole near field --
+            # which subsumes the D exemption below, kept for the log schema.
+            apply_offset_gain_blend=False,
             scale_lateral_d_with_offset=False,
             enable_integral=True,
             substate=FINAL_PROBE,
@@ -185,7 +185,7 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
                 "approach_measured_divergence": inputs.divergence_1_s,
                 "approach_hold_condition": True,
                 "approach_hold_dwell_sec": hold_dwell,
-                "lateral_p_scale": routine._final_probe_lateral_p_scale,
+                "lateral_p_scale": routine._probe_lateral_p_scale,
             },
         )
 
@@ -200,10 +200,14 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
         pitch_d_scale=pitch_d,
         roll_offset_setpoint=roll_offset_setpoint,
         pitch_offset_setpoint=pitch_offset_setpoint,
-        # Blend on the PHYSICAL centring error: geometric tilt only, with
-        # the learned wind bias excluded. See MissionControl.
-        roll_gain_blend_setpoint=routine._center_geometric_offset_x,
-        pitch_gain_blend_setpoint=routine._center_geometric_offset_y,
+        # No large-offset blend from APPROACH onward. This phase is entered
+        # already centred -- passing the CENTER gate is the precondition -- so
+        # the blend has no capture transient left to protect. What it does have
+        # is a residual physical centring error that grows with wind speed, and
+        # attenuating lateral gain in proportion to that error removes
+        # authority exactly where the schedule is least able to spare it.
+        apply_offset_gain_blend=False,
+        scale_lateral_d_with_offset=False,
         roll_accel_feedforward_m_s2=roll_accel_feedforward,
         pitch_accel_feedforward_m_s2=pitch_accel_feedforward,
         enable_integral=True,
@@ -222,7 +226,6 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
             "approach_hold_condition": hold_condition,
             "approach_hold_dwell_sec": hold_dwell,
             "approach_ramp_frac": approach_blend,
-            "lateral_ramp_frac": lateral_blend,
             "peak_accel": routine.probe_result.peak_accel,
             "roll_peak_accel": routine.roll_probe_result.peak_accel,
             "pitch_peak_accel": routine.pitch_probe_result.peak_accel,
