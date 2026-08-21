@@ -310,18 +310,18 @@
 		<!-- HEAVE: strongest translational wave response -->
 		<axis_z>
 			<component>
-				<amplitude>0.10</amplitude>
+				<amplitude>0.20</amplitude>
 				<frequency>0.10</frequency>
 				<phase>0.50</phase>
 			</component>
 			<component>
-				<amplitude>0.18</amplitude>
-				<frequency>0.16</frequency>
+				<amplitude>0.50</amplitude>
+				<frequency>0.20</frequency>
 				<phase>2.10</phase>
 			</component>
 			<component>
-				<amplitude>0.06</amplitude>
-				<frequency>0.22</frequency>
+				<amplitude>0.10</amplitude>
+				<frequency>0.25</frequency>
 				<phase>4.50</phase>
 			</component>
 		</axis_z>
@@ -384,7 +384,7 @@
 		<target>bee_x500</target>
 		<namespace>bee_platform</namespace>
 		<time>0.01</time>
-		<enabled>true</enabled>
+		<enabled>false</enabled>
 	</plugin>
 
 	</model>

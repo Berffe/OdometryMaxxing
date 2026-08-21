@@ -464,7 +464,7 @@ class MissionConfig:
     # FINAL_PROBE resets all three acceleration probes before applying these
     # near-field constants, so no APPROACH envelope can enter a gate.
     near_probe_window_sec: float = 0.6 * PROBE_DESIGN_PERIOD_SEC
-    near_probe_decay_tau_sec: float = 1.5 * PROBE_DESIGN_PERIOD_SEC
+    near_probe_decay_tau_sec: float = 4.0 * PROBE_DESIGN_PERIOD_SEC
     near_probe_highpass_tau_sec: float = 2.0 * PROBE_DESIGN_PERIOD_SEC
 
     # --- Envelope protection ---
@@ -479,8 +479,8 @@ class MissionConfig:
     # They remain passive: lateral acceleration feedforward is handled
     # separately by the wind-trim section below.  Set the tau multipliers to
     # match the corresponding far/near probe conditioning windows.
-    far_trim_tau_sec: float = 4.0 * PROBE_DESIGN_PERIOD_SEC
-    near_trim_tau_sec: float = 2.0 * PROBE_DESIGN_PERIOD_SEC
+    far_trim_tau_sec: float = 5.0 * PROBE_DESIGN_PERIOD_SEC
+    near_trim_tau_sec: float = 4.0 * PROBE_DESIGN_PERIOD_SEC
     # False restores the previous behaviour: DESCENT freezes the single
     # instantaneous image offset from the decision tick. Kept as a one-line
     # revert for A/B comparison against earlier logs.
@@ -591,7 +591,7 @@ class MissionConfig:
     # The z field was ``tracking_chi_limit_1_s2``; the unqualified name read
     # like a shared limit while x and y were explicit.  The CSV column keeps
     # its legacy unqualified name -- only the config field is renamed.
-    tracking_chi_z_limit_1_s2: float = 0.5
+    tracking_chi_z_limit_1_s2: float = 0.3
     tracking_chi_x_limit_1_s2: float = 0.5
     tracking_chi_y_limit_1_s2: float = 0.5
     # Ddot is the slope of a causal least-squares fit through this much recent
@@ -602,7 +602,7 @@ class MissionConfig:
     # Minimum FINAL_PROBE-hold observation before chi is allowed to veto. The
     # robust chi envelope is restarted at hold entry while the derivative
     # history stays warm from the preceding visual samples.
-    tracking_min_observation_sec: float = 2.0 * PROBE_DESIGN_PERIOD_SEC
+    tracking_min_observation_sec: float = 1.0 * PROBE_DESIGN_PERIOD_SEC
 
     # ======================================================================
     # 11. Mode switches
