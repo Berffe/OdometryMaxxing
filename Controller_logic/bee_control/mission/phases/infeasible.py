@@ -1,7 +1,17 @@
 """INFEASIBLE phase.
 
-Active visual hover at probe gains after any feasibility rejection: stability
-ceiling, disturbance-authority floor/gain margin, or visual mismatch bandwidth.
+Terminal. The gates ran on fresh FINAL_PROBE evidence and refused the landing:
+stability ceiling, disturbance-authority floor/gain margin, or visual mismatch
+bandwidth.
+
+This is the affordance decision, and it is deliberately a different outcome
+from ABORTED, which covers everything that stopped the flight before the gates
+could return a verdict. They must not share a counter: a run that never centred
+is not a refusal, because the feasibility test never evaluated it.
+
+The tick still commands an active visual hover rather than a freeze, so the
+short window before the node ends the run keeps vertical platform tracking and
+lateral damping. It emits a ``TerminalRequest``; the node applies it.
 
 Phase contract
 --------------
@@ -18,7 +28,7 @@ The body is unchanged from the single-file revision apart from the mechanical
 """
 from __future__ import annotations
 
-from ..types import INFEASIBLE, MissionControl, PhaseSpec
+from ..types import INFEASIBLE, MissionControl, PhaseSpec, TerminalRequest
 
 
 def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
@@ -30,6 +40,8 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
     reason = "; ".join(reasons) if reasons else "unknown feasibility failure"
     failed_axes = routine._failed_axes()
     failed_criteria = routine._failed_criteria()
+    if just_entered:
+        routine._terminal_reason = reason
     return MissionControl(
         divergence_setpoint=0.0,
         thrust_gain_override=routine._compute_probe_gain(),
@@ -44,6 +56,7 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
         pitch_accel_feedforward_m_s2=routine._final_probe_pitch_accel_bias,
         enable_integral=True,
         substate=INFEASIBLE,
+        terminal_request=TerminalRequest(outcome=INFEASIBLE, reason=reason),
         info={
             "just_entered": just_entered,
             "reason": reason,
@@ -75,6 +88,13 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
             "vertical_tracking_ok": routine.vertical_tracking_ok,
             "roll_tracking_ok": routine.roll_tracking_ok,
             "pitch_tracking_ok": routine.pitch_tracking_ok,
+            # rho = k_min / k_ceiling(h_gear) per axis: the dimensionless margin
+            # the affordance argument rests on. Reported on every verdict, not
+            # only the refusals, so the two conditions are directly comparable.
+            "vertical_rho": routine.vertical_rho,
+            "roll_rho": routine.roll_rho,
+            "pitch_rho": routine.pitch_rho,
+            "predicted_crossing_height_m": routine.gate.h_crit,
         },
     )
 
@@ -83,9 +103,9 @@ SPEC = PhaseSpec(
     name=INFEASIBLE,
     display_name="INFEASIBLE",
     description=(
-        "Active visual hover after stability, authority/margin, or visual "
-        "tracking-bandwidth rejection."
+        "Terminal. The gates refused the landing on stability, "
+        "authority/margin, or visual tracking-bandwidth grounds."
     ),
-    terminal=False,
+    terminal=True,
     handler=run,
 )

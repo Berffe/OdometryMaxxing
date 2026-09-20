@@ -17,7 +17,9 @@ px4_msgs, so it runs on a laptop with no ROS install.
 """
 from __future__ import annotations
 
+import json
 import math
+import os
 import time
 import tempfile
 import warnings
@@ -41,9 +43,12 @@ from bee_control.interfaces.flight_sequencer import (
 )
 from bee_control.mission.schedule import scheduled_gain_from_integral
 from bee_control.mission.gates import (
+    GateResult,
+    compute_gate,
     compute_tracking_gate,
     lateral_ceiling_gain_at_height,
 )
+from bee_control.mission.phases import TERMINAL_SUBSTATES
 from bee_control.mission.routine import MissionRoutine
 from bee_control.mission.visual_center_adaptation import VisualCenterAdaptation
 from bee_control.mission.trim import VisualTrim
@@ -226,12 +231,14 @@ def test_every_mission_field_declares_its_unit():
         "center_visual_adaptation_max_bias_norm",
         "center_lateral_p_scale", "center_lateral_d_scale",
         "probe_lateral_p_scale",
-        "final_probe_lateral_p_scale",
+        "probe_lateral_p_scale",
     }
     offenders = [
         f.name for f in fields(MissionConfig())
-        if not f.name.startswith(("enable_", "probe_only", "descent_trim_use",
-                                  "center_timeout_allows", "wind_trim_adapt"))
+        # Booleans are exempt by TYPE, not by a whitelist of name prefixes: a
+        # prefix list silently fails open for every flag that does not happen
+        # to start with one of them.
+        if f.type not in ("bool", bool)
         and f.name not in dimensionless
         and not f.name.endswith(unit_suffixes)
     ]
@@ -330,7 +337,7 @@ def test_final_probe_starts_from_fresh_gate_evidence_without_integral_reset():
     # The handoff tick is already a FINAL_PROBE command: residual P, geometric
     # setpoint, and an unattenuated D branch, all on the same tick that
     # activates the static term.
-    assert math.isclose(control.lateral_p_scale, cfg.final_probe_lateral_p_scale)
+    assert math.isclose(control.lateral_p_scale, cfg.probe_lateral_p_scale)
     assert control.scale_lateral_d_with_offset is False
     assert routine.peak_accel_at_handoff > 1.0
     assert routine.probe_result.peak_accel == 0.0
@@ -429,7 +436,7 @@ def test_descent_handoff_keeps_the_last_final_probe_static_feedforward():
     # FINAL_PROBE keeps a small residual P; only DESCENT removes it entirely.
     assert math.isclose(
         rows["final_probe"]["lateral_p_scale"],
-        MissionConfig().final_probe_lateral_p_scale,
+        MissionConfig().probe_lateral_p_scale,
     )
     assert rows["descend"]["lateral_p_scale"] == 0.0
     assert rows["descend"]["roll_p_scale"] == 0.0
@@ -1008,20 +1015,36 @@ def test_gain_blend_still_attenuates_a_genuine_offset():
     assert realized(0.60) < realized(0.10)
 
 
-def test_far_field_phases_blend_on_the_geometric_reference():
+def test_only_center_blends_and_it_blends_on_the_geometric_reference():
+    """CENTER runs the large-offset gain blend; no later phase does.
+
+    The blend guards the capture transient, which is a CENTER phenomenon: every
+    later phase entered through the CENTER gate and so starts already centred.
+    Leaving it on from APPROACH onward can only subtract lateral authority, and
+    it subtracts most as the residual centring error grows -- which is exactly
+    when the wind is strongest.
+    """
     routine = MissionRoutine(hover_thrust=0.73, config=MissionConfig())
     routine.start(0.0, 5.0)
     rows = _fly_to_descend(routine, capture_controls=(controls := {}))
 
-    for phase in ("center", "approach_probe"):
-        control = controls[phase]
-        assert control.roll_gain_blend_setpoint is not None, phase
-        assert math.isclose(
-            control.roll_gain_blend_setpoint, rows[phase]["center_geometric_offset_x"]
-        )
-    # FINAL_PROBE's P setpoint already IS the geometric offset, so it needs no
-    # override and must keep the default.
-    assert controls["final_probe"].roll_gain_blend_setpoint is None
+    center = controls["center"]
+    assert center.apply_offset_gain_blend is True
+    assert center.roll_gain_blend_setpoint is not None
+    assert math.isclose(
+        center.roll_gain_blend_setpoint, rows["center"]["center_geometric_offset_x"]
+    )
+
+    # The phases that still fly lateral P must switch the blend off outright.
+    for phase in ("approach_probe", "final_probe"):
+        assert controls[phase].apply_offset_gain_blend is False, phase
+
+    # DESCEND may leave the flag at its default only because it commands no
+    # lateral P for the blend to attenuate. If that ever changes, the blend
+    # comes back silently -- so pin both halves of the equivalence.
+    descend = controls["descend"]
+    assert (descend.apply_offset_gain_blend is False
+            or descend.lateral_p_scale == 0.0)
 
 
 def test_final_probe_keeps_a_small_residual_lateral_p():
@@ -1033,14 +1056,14 @@ def test_final_probe_keeps_a_small_residual_lateral_p():
 
     p_scale = rows["final_probe"]["lateral_p_scale"]
     assert 0.0 < p_scale < rows["approach_probe"]["lateral_p_scale"]
-    assert math.isclose(p_scale, MissionConfig().final_probe_lateral_p_scale)
+    assert math.isclose(p_scale, MissionConfig().probe_lateral_p_scale)
     # DESCENT still drops it: image offset stops measuring position near contact.
     assert rows["descend"]["lateral_p_scale"] == 0.0
 
 
 def test_final_probe_lateral_p_can_be_switched_off():
     """The knob must restore the previous velocity-hold behaviour exactly."""
-    cfg = MissionConfig().with_overrides(final_probe_lateral_p_scale=0.0)
+    cfg = MissionConfig().with_overrides(probe_lateral_p_scale=0.0)
     routine = MissionRoutine(hover_thrust=0.73, config=cfg)
     routine.start(0.0, 5.0)
     rows = _fly_to_descend(routine)
@@ -1310,6 +1333,200 @@ def test_terminal_substates_are_latched_not_overwritten():
     assert aborted.telemetry()["substate"] == "aborted"
     aborted.mark_aborted(9.0)                     # idempotent
     assert aborted._t_aborted == 1.0
+
+
+def test_the_three_outcomes_are_distinct_terminals():
+    """landed / infeasible / aborted are three outcomes, not two.
+
+    INFEASIBLE is the affordance decision; ABORTED is everything that stopped
+    the flight before the gates could return a verdict. They must not share a
+    counter, and INFEASIBLE being terminal is what stops a late operational
+    failure from relabelling a refusal as an abort.
+    """
+    assert set(TERMINAL_SUBSTATES) == {"landed", "infeasible", "aborted"}
+
+
+def test_a_refusal_cannot_be_relabelled_as_an_abort():
+    cfg = BeeConfig.default().mission
+    routine = MissionRoutine(hover_thrust=0.73, config=cfg)
+    routine.start(0.0, 5.0)
+    routine._substate = "infeasible"
+
+    # A target lost while the refusal is being flown out must not overwrite it.
+    routine.mark_aborted(4.0, "target/flow timeout")
+    assert routine.substate == "infeasible"
+    assert routine._t_aborted is None
+
+
+def test_every_terminal_phase_asks_the_node_to_end_the_run():
+    """The kill lives in the phase, not in a node-side table of phase names."""
+    cfg = BeeConfig.default().mission
+
+    landed = MissionRoutine(hover_thrust=0.73, config=cfg)
+    landed.mark_landed(1.0, "truth contact confirmed")
+    assert landed.last_control.terminal_request.outcome == "landed"
+
+    aborted = MissionRoutine(hover_thrust=0.73, config=cfg)
+    aborted.mark_aborted(1.0, "offboard dropout")
+    request = aborted.last_control.terminal_request
+    assert request.outcome == "aborted"
+    assert request.reason == "offboard dropout"
+
+
+def test_center_timeout_ends_the_run_as_an_abort():
+    """An uncentred run never reaches a verdict, so it is not a refusal."""
+    cfg = replace(BeeConfig.default().mission, center_timeout_sec=3.0)
+    routine = MissionRoutine(hover_thrust=0.73, config=cfg)
+    routine.start(0.0, 5.0)
+
+    control, t = None, 0.0
+    while t < 20.0:
+        t += 1 / 30.0
+        control = routine.update(MissionInputs(
+            t=t, dt=1 / 30.0,
+            # Far off centre and staying there: the gate can never be met.
+            target=TargetEstimate(timestamp=t, found=True, offset_x=0.6,
+                                  offset_y=0.6, area_fraction=0.05),
+            flow=FlowResult(timestamp=t, valid=True)))
+        if control.terminal_request is not None:
+            break
+
+    assert routine.substate == "aborted"
+    assert control.terminal_request.outcome == "aborted"
+    assert routine.terminal_origin_substate == "center"
+    assert t < 20.0, "CENTER hovered past its timeout instead of ending the run"
+
+
+def test_approach_timeout_ends_the_run_as_an_abort():
+    cfg = replace(BeeConfig.default().mission,
+                  enable_center=False, approach_timeout_sec=4.0)
+    routine = MissionRoutine(hover_thrust=0.73, config=cfg)
+    routine.start(0.0, 5.0)
+
+    control, t = None, 0.0
+    while t < 20.0:
+        t += 1 / 30.0
+        control = routine.update(MissionInputs(
+            t=t, dt=1 / 30.0,
+            # Centred, but the visual scale never reaches the hold fraction.
+            target=TargetEstimate(timestamp=t, found=True, offset_x=0.0,
+                                  offset_y=0.0, area_fraction=0.02),
+            flow=FlowResult(timestamp=t, valid=True)))
+        if control.terminal_request is not None:
+            break
+
+    assert routine.substate == "aborted"
+    assert routine.terminal_origin_substate == "approach_probe"
+
+
+def test_gate_off_imposes_k_min_above_the_ceiling():
+    """The ablation must actually change the flown gain in severe runs.
+
+    k_floor is normally clamped to the gain the schedule starts from, because
+    the descent is a monotone decay. Keeping that clamp with the gate disabled
+    would return the gated schedule in exactly the severe cases the ablation
+    exists to expose, and the paired comparison would show nothing.
+    """
+    common = dict(
+        descent_divergence_setpoint=0.30, initial_thrust_gain=6.5,
+        stability_dt_sec=0.048, leg_clearance_m=0.182,
+        ceiling_safety_factor=0.5, ceiling_margin=0.8,
+        descend_start_gain=3.0, near_field_height_m=0.40,
+    )
+    severe = 2.0
+    on = compute_gate(peak_accel=severe, impose_ceiling_floor=True, **common)
+    off = compute_gate(peak_accel=severe, impose_ceiling_floor=False, **common)
+
+    assert on.k_min > on.k_ceiling_leg, "not a severe case; test is vacuous"
+    assert on.k_floor < on.k_min                  # clamped, region empty
+    assert off.k_floor == on.k_min                # imposed, ceiling violated
+    assert off.k_floor > off.k_ceiling_leg
+
+    # The verdict itself must survive the ablation, or the runs cannot be paired.
+    assert on.feasible is False and off.feasible is False
+    assert math.isclose(on.h_crit, off.h_crit)
+
+
+def test_gate_off_does_not_change_the_probe_gain():
+    """The near-field probe stays ceiling-limited in both arms.
+
+    Probing above the ceiling feeds self-induced oscillation into peak_accel,
+    which is the one number both arms are compared on.
+    """
+    gated = MissionRoutine(hover_thrust=0.73, config=BeeConfig.default().mission)
+    ablated = MissionRoutine(
+        hover_thrust=0.73,
+        config=replace(BeeConfig.default().mission, enable_commit_gate=False))
+    assert gated.probe_gain == ablated.probe_gain
+
+
+def test_rho_is_the_ratio_the_affordance_argument_reports():
+    routine = MissionRoutine(hover_thrust=0.73, config=BeeConfig.default().mission)
+    routine.gate = compute_gate(
+        peak_accel=0.35, descent_divergence_setpoint=0.30,
+        initial_thrust_gain=6.5, stability_dt_sec=0.048,
+        leg_clearance_m=0.182, ceiling_safety_factor=0.5,
+        ceiling_margin=0.8, descend_start_gain=3.0, near_field_height_m=0.40)
+    assert math.isclose(
+        routine.vertical_rho, routine.gate.k_min / routine.gate.k_ceiling_leg)
+
+    # An unmeasurable ceiling must not read as a comfortable margin.
+    routine.gate = GateResult()
+    assert routine.vertical_rho == float("inf")
+
+
+def test_an_abort_contributes_no_refusal_reasons():
+    """The gate results default to all-False, so an unguarded read reports a
+    full set of rejections for a run the gates never evaluated -- which is the
+    counter contamination the three-way outcome exists to prevent."""
+    routine = MissionRoutine(hover_thrust=0.73, config=BeeConfig.default().mission)
+    routine.start(0.0, 5.0)
+    routine.mark_aborted(4.0, "target/flow timeout during center")
+
+    assert routine.verdict_reached is False
+    assert routine.refusal_criteria == ""
+    assert routine.refusal_axes == ""
+    # The private helper still reports, because after a real verdict it must.
+    assert routine._failed_criteria() != ""
+
+
+def test_outcome_record_is_atomic_and_strictly_parseable():
+    """The runner keys resumability on this file existing, so a half-written
+    record must never be left behind -- and rho is legitimately inf, which
+    json.dump emits as bare Infinity unless it is handled."""
+    routine = MissionRoutine(hover_thrust=0.73, config=BeeConfig.default().mission)
+    with tempfile.TemporaryDirectory() as directory:
+        writer = DiagnosticsWriter(sources=[routine], output_dir=directory)
+        path = writer.write_outcome({
+            "status": "aborted",
+            "vertical_rho": float("inf"),
+            "some_unseeded_estimate": float("nan"),
+        })
+        writer.close()
+
+        with open(path, encoding="utf-8") as handle:
+            record = json.loads(handle.read())     # strict: rejects Infinity/NaN
+
+        assert record["vertical_rho"] is None
+        assert record["some_unseeded_estimate"] is None
+        assert record["postprocessed"] is False
+        assert record["run_id"] == writer.run_id
+        # The post-run pass finds its inputs from the record itself.
+        assert record["truth_csv"] == writer.truth_filepath
+        assert not any(name.endswith(".partial")
+                       for name in os.listdir(directory))
+
+
+def test_the_outcome_record_shares_the_run_id_of_the_three_csvs():
+    routine = MissionRoutine(hover_thrust=0.73, config=BeeConfig.default().mission)
+    with tempfile.TemporaryDirectory() as directory:
+        writer = DiagnosticsWriter(sources=[routine], output_dir=directory)
+        writer.write_outcome({"status": "landed"})
+        writer.close()
+        suffix = writer.run_id
+        for path in (writer.filepath, writer.truth_filepath,
+                     writer.wind_filepath, writer.outcome_filepath):
+            assert suffix in path, path
 
 
 # --------------------------------------------------------------------------

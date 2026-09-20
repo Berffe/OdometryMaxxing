@@ -137,6 +137,23 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
         routine._approach_hold_since = None
         hold_dwell = 0.0
 
+    # Operational gate, the APPROACH twin of the CENTER timeout: the visual
+    # scale never settled, so FINAL_PROBE is never entered and no verdict is
+    # possible. Terminate as ABORTED rather than descend or hover forever.
+    if (
+        routine._approach_timeout_aborts
+        and routine._approach_timeout > 0.0
+        and elapsed >= routine._approach_timeout
+        and not (hold_condition and hold_dwell >= routine._approach_hold_dwell)
+    ):
+        return routine.abort(
+            inputs,
+            f"APPROACH did not reach the visual-height hold within "
+            f"{routine._approach_timeout:.1f} s "
+            f"(log scale error {log_scale_error:+.3f}, "
+            f"tolerance {routine._approach_hold_log_scale_tol:.3f})",
+        )
+
     if hold_condition and hold_dwell >= routine._approach_hold_dwell:
         routine._substate = FINAL_PROBE
         routine._begin_final_probe_measurement(t, inputs)

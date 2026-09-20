@@ -27,8 +27,12 @@ wrong place.
 """
 from __future__ import annotations
 
+from dataclasses import replace
+
+import argparse
 import multiprocessing as mp
 import queue
+import sys
 import threading
 import time
 
@@ -57,7 +61,12 @@ from bee_control.interfaces.flight_sequencer import FlightSequencer, SequencerPo
 from bee_control.interfaces.mavsdk_worker import MavsdkWorker
 from bee_control.mission import display_name as mission_display_name
 from bee_control.mission.routine import MissionRoutine
-from bee_control.mission.types import ActuationFeedback, ControlEffect, MissionInputs
+from bee_control.mission.types import (
+	ActuationFeedback,
+	ControlEffect,
+	LANDED,
+	MissionInputs,
+)
 from bee_control.interfaces.px4_interface import PX4Interface
 from bee_control.core.state import AttitudeSetpoint, ContactState
 from bee_control.diagnostics.truth_layout import decode_truth_array
@@ -66,9 +75,19 @@ from bee_control.vision.vision_worker import run_vision_worker
 
 
 class BeeLandNode(Node):
-	def __init__(self, config: BeeConfig | None = None):
+	def __init__(self, config: BeeConfig | None = None, *,
+	             output_dir: str = "logs",
+	             enable_commit_gate: bool | None = None,
+	             seed: int | None = None):
 		super().__init__("bee_land_node")
 		self.config = config or BeeConfig.default()
+		if enable_commit_gate is not None:
+			self.config = replace(
+				self.config,
+				mission=replace(self.config.mission,
+				                enable_commit_gate=bool(enable_commit_gate)))
+		self._output_dir = str(output_dir)
+		self._seed = seed
 		cfg = self.config
 
 		self.time = TimeManager(
@@ -129,7 +148,7 @@ class BeeLandNode(Node):
 				self.mission,
 				self.vision_telemetry,
 			],
-			output_dir="logs",
+			output_dir=self._output_dir,
 		)
 
 		# ------------------------------------------------------ control state
@@ -148,6 +167,9 @@ class BeeLandNode(Node):
 		self._motor_stop_requested = False
 		self._undeclared_timing_logged = False
 		self._shutdown = False
+		# Armed by a terminal outcome; the supervisor timer then ends the run.
+		self._shutdown_due_mono = None
+		self.terminal_outcome = None
 
 		# --------------------------------------------------------------- ROS
 		sensor_qos = QoSProfile(
@@ -239,7 +261,7 @@ class BeeLandNode(Node):
 
 	def _on_landed(self, reason: str) -> None:
 		self.state.setpoint = self.state.zero_thrust()
-		self.mission.mark_landed(self.state.flow_timestamp)
+		self.mission.mark_landed(self.state.flow_timestamp, reason)
 		previous = self._last_mission_substate or "none"
 		self._last_mission_substate = self.mission.substate
 		self.get_logger().info(
@@ -247,10 +269,108 @@ class BeeLandNode(Node):
 		if self.config.mavsdk.enable_touchdown_motor_stop and not self._motor_stop_requested:
 			self._motor_stop_requested = True
 			self.mavsdk.request_motor_stop()
+		self._record_outcome()
+		self._arm_shutdown(self.config.scheduling.post_landing_shutdown_sec)
 
 	def _on_aborted(self, reason: str) -> None:
-		self.mission.mark_aborted(self.state.flow_timestamp)
+		# mark_aborted is a no-op once the mission has latched its own terminal,
+		# so an INFEASIBLE verdict keeps its substate while the OUTER lifecycle
+		# still reports the abort. The run's outcome is the mission substate.
+		self.mission.mark_aborted(self.state.flow_timestamp, reason)
 		self._last_mission_substate = self.mission.substate
+		if (self.config.mavsdk.enable_terminal_motor_stop
+				and not self._motor_stop_requested):
+			self._motor_stop_requested = True
+			self.mavsdk.request_motor_stop()
+		self._record_outcome()
+		self._arm_shutdown(self.config.scheduling.terminal_shutdown_grace_sec)
+
+	def _apply_terminal_request(self, request) -> None:
+		"""End the run the way the phase asked.
+
+		The phase owns the decision and the reason; this owns what ending a run
+		means. LANDED routes to the sequencer's touchdown latch, everything else
+		to its abort latch -- the OUTER lifecycle has two terminals, while the
+		three-way outcome (landed / infeasible / aborted) lives in the mission
+		substate, which is what the campaign record reports.
+		"""
+		if self.sequencer.is_terminal:
+			return
+		detail = f"{request.outcome}: {request.reason}" if request.reason else request.outcome
+		if request.outcome == LANDED:
+			self.sequencer.enter_landed(request.reason or "mission latched landed")
+		else:
+			self.sequencer.abort(detail)
+
+	def _record_outcome(self) -> None:
+		"""Freeze how the run ended, for the campaign record.
+
+		Read from the mission rather than from whoever latched, so both entry
+		paths -- a phase that ended itself and a failure the node detected --
+		produce the same fields. The three-way status is the mission substate;
+		``abort_phase`` is the substate that was running when it ended.
+		"""
+		if self.terminal_outcome is not None:
+			return
+		self.terminal_outcome = {
+			"seed": self._seed,
+			"status": self.mission.substate,
+			"abort_phase": self.mission.terminal_origin_substate or None,
+			"reason": self.mission.terminal_reason,
+			"controller_phase": self.sequencer.phase,
+			"verdict_reached": self.mission.verdict_reached,
+			"refusal_criteria": self.mission.refusal_criteria or None,
+			"refusal_axes": self.mission.refusal_axes or None,
+			"commit_gate_enabled": bool(self.config.mission.enable_commit_gate),
+			"vertical_rho": self.mission.vertical_rho,
+			"roll_rho": self.mission.roll_rho,
+			"pitch_rho": self.mission.pitch_rho,
+			"predicted_crossing_height_m": self.mission.gate.h_crit,
+			"probed_peak_accel_m_s2": self.mission.probe_result.peak_accel,
+			"k_min": self.mission.gate.k_min,
+			"k_floor": self.mission.gate.k_floor,
+			"k_ceiling_leg": self.mission.gate.k_ceiling_leg,
+		}
+
+	def _outcome_record(self) -> dict:
+		"""The run's verdict, including for a run that never reached one.
+
+		A campaign directory with no record is indistinguishable from a run that
+		never started, so this always returns something. ``crashed`` is the
+		honest status for a process that died mid-flight; ``timeout`` is not
+		ours to report, because a run the harness had to kill never reaches this
+		code at all.
+		"""
+		if self.terminal_outcome is not None:
+			return self.terminal_outcome
+		return {
+			"seed": self._seed,
+			"status": "crashed",
+			"abort_phase": self.mission.substate,
+			"reason": "node shut down before reaching a terminal outcome",
+			"controller_phase": self.sequencer.phase,
+			"verdict_reached": self.mission.verdict_reached,
+			"refusal_criteria": self.mission.refusal_criteria or None,
+			"refusal_axes": self.mission.refusal_axes or None,
+			"commit_gate_enabled": bool(self.config.mission.enable_commit_gate),
+			"vertical_rho": self.mission.vertical_rho,
+			"roll_rho": self.mission.roll_rho,
+			"pitch_rho": self.mission.pitch_rho,
+			"predicted_crossing_height_m": self.mission.gate.h_crit,
+			"probed_peak_accel_m_s2": self.mission.probe_result.peak_accel,
+			"k_min": self.mission.gate.k_min,
+			"k_floor": self.mission.gate.k_floor,
+			"k_ceiling_leg": self.mission.gate.k_ceiling_leg,
+		}
+
+	def _arm_shutdown(self, grace_sec: float) -> None:
+		"""Schedule the process exit. First arming wins."""
+		if self._shutdown_due_mono is not None:
+			return
+		self._shutdown_due_mono = self.time.monotonic_sec() + max(0.0, float(grace_sec))
+		self.get_logger().info(
+			f"Run terminal ({self.mission.substate}); shutting down in "
+			f"{max(0.0, float(grace_sec)):.1f} s.")
 
 	def _latch_zero_thrust(self) -> None:
 		self.state.setpoint = self.state.zero_thrust()
@@ -451,6 +571,10 @@ class BeeLandNode(Node):
 				"are unaffected, but the host time source should be fixed")
 			self._log_event("clock_step", detail)
 		self.sequencer.update()
+		if (self._shutdown_due_mono is not None
+				and self.time.monotonic_sec() >= self._shutdown_due_mono):
+			self._log_event("run_complete", self.mission.substate)
+			rclpy.shutdown()
 
 	def on_control_timer(self):
 		if not self.sequencer.is_closed_loop:
@@ -470,7 +594,8 @@ class BeeLandNode(Node):
 			self._lost_target_since_mono = self._lost_target_since_mono or now_mono
 			if (now_mono - self._lost_target_since_mono
 					>= self.config.vision.lost_target_timeout_sec):
-				self.sequencer.abort("target/flow timeout")
+				self.sequencer.abort(
+					f"target/flow timeout during {self.mission.substate}")
 			return
 		self._lost_target_since_mono = None
 
@@ -490,6 +615,9 @@ class BeeLandNode(Node):
 			),
 		))
 		self._announce_mission_substate(mc)
+
+		if mc.terminal_request is not None:
+			self._apply_terminal_request(mc.terminal_request)
 
 		# Apply whatever side effects the phase asked for. This node does not
 		# know, and must not know, which phases want which effect.
@@ -610,14 +738,46 @@ class BeeLandNode(Node):
 			self._vision_worker.join(timeout=2.0)
 		if self._vision_worker.is_alive():
 			self._vision_worker.terminate()
+		# Before closing the CSVs, and guarded: a record that fails to write
+		# must not also cost us the three logs it points at.
+		try:
+			path = self.diagnostics.write_outcome(self._outcome_record())
+			self.get_logger().info(f"Run outcome: {path}")
+		except Exception as exc:
+			self.get_logger().error(f"Failed to write the outcome record: {exc}")
 		self.diagnostics.close()
 		if self.config.vision.show_camera:
 			cv2.destroyAllWindows()
 
 
+def _parse_cli(argv):
+	"""Campaign arguments. Everything else stays in core/config.py.
+
+	Only three things vary per run: where the logs go, whether the commit gate
+	decides, and which seed produced the scenario. The seed is recorded rather
+	than used -- the scenario is baked into the world file before the node ever
+	starts -- so that a run's outcome names the scenario that produced it.
+	"""
+	parser = argparse.ArgumentParser(prog="bee_node", add_help=True)
+	parser.add_argument("--outdir", default="logs",
+		help="Directory for the three CSVs and the outcome record.")
+	parser.add_argument("--gate", choices=("on", "off"), default="on",
+		help="'off' disables the COMMIT decision only: the probe still runs, "
+		     "K_min is still imposed, every verdict is still logged.")
+	parser.add_argument("--seed", type=int, default=None,
+		help="Recorded in the outcome record; does not alter the controller.")
+	known, _ = parser.parse_known_args(argv)
+	return known
+
+
 def main(args=None):
 	rclpy.init(args=args)
-	node = BeeLandNode()
+	cli = _parse_cli(sys.argv[1:] if args is None else args)
+	node = BeeLandNode(
+		output_dir=cli.outdir,
+		enable_commit_gate=(cli.gate == "on"),
+		seed=cli.seed,
+	)
 	try:
 		rclpy.spin(node)
 	except KeyboardInterrupt:
@@ -625,7 +785,11 @@ def main(args=None):
 	finally:
 		node.close()
 		node.destroy_node()
-		rclpy.shutdown()
+		try:
+			rclpy.shutdown()
+		except Exception:
+			# Already shut down by the terminal watchdog; nothing left to do.
+			pass
 
 
 if __name__ == "__main__":

@@ -6,6 +6,11 @@ The wind CSV records every bridged WindController diagnostic packet.
 All three files share a run id and are merged later by ``analyse_log.py`` on
 Gazebo SIM time.
 
+Alongside them sits one JSON outcome record: not a time series but a single
+verdict per run, which is why it is neither a fourth CSV nor a row appended to
+an existing one. It carries the same run id, so the post-run pass that fills in
+the truth-derived fields finds its inputs from the record itself.
+
 Schema ownership
 ----------------
 This module no longer knows what a mission phase, a probe or an optical-flow
@@ -26,6 +31,9 @@ Neither schema is mixed into the controller log.
 from __future__ import annotations
 
 import csv
+import json
+import math
+import os
 import queue
 import threading
 import time
@@ -88,12 +96,26 @@ class _AsyncCsvSink:
             handle.flush()
 
 
+def _json_safe(value):
+    """Map a non-finite float to None.
+
+    ``rho`` is legitimately ``inf`` when the ceiling is unmeasurable, and NaN
+    reaches these fields wherever an estimator never seeded. Both are real
+    states worth recording, but neither is representable in JSON, so they are
+    written as null rather than as a number that would read as a measurement.
+    """
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
 class DiagnosticsWriter:
     #: Bumped by hand when the MEANING of the base columns changes. The
     #: per-run fingerprint below covers accidental column drift automatically.
     CONTROLLER_SCHEMA_VERSION = "6.0-controller"
     TRUTH_LOG_SCHEMA_VERSION = "1.0-truth-log"
     WIND_LOG_SCHEMA_VERSION = "1.0-wind-log"
+    OUTCOME_SCHEMA_VERSION = "1.0-outcome"
 
     #: Columns this writer owns outright. Everything else comes from sources.
     BASE_FIELDS = (
@@ -136,10 +158,17 @@ class DiagnosticsWriter:
             wind_name = f"bee_wind_{run_id}.csv"
         truth_path = root / truth_name
         wind_path = root / wind_name
+        if filename.startswith("bee_controller_"):
+            outcome_name = "bee_outcome_" + Path(suffix).stem + ".json"
+        else:
+            outcome_name = f"bee_outcome_{run_id}.json"
+        outcome_path = root / outcome_name
 
+        self.run_id = run_id
         self.filepath = str(controller_path)
         self.truth_filepath = str(truth_path)
         self.wind_filepath = str(wind_path)
+        self.outcome_filepath = str(outcome_path)
         self._start_wall = time.time()
         self._start_mono = time.monotonic()
         self._controller_flush_every_rows = max(1, int(controller_flush_every_rows))
@@ -201,6 +230,46 @@ class DiagnosticsWriter:
         }
         row.update(wind)
         self._wind_sink.submit(row)
+
+    def write_outcome(self, record: Mapping) -> str:
+        """Write the run's outcome record. Returns the path written.
+
+        Written atomically -- a temporary file then ``os.replace`` -- because
+        the campaign runner keys resumability on this file's existence. A
+        partially written record left behind by a crash mid-write would look
+        like a finished run and the run would be skipped forever.
+
+        ``postprocessed`` is False: this is the controller's half. The fields
+        that come from the truth and controller CSVs (contact velocities, the
+        realised peak relative acceleration, the measured loop period) are
+        filled in by an offline pass, so nothing here has to compute physics
+        from truth data mid-flight.
+        """
+        payload = {
+            "outcome_schema_version": self.OUTCOME_SCHEMA_VERSION,
+            "run_id": self.run_id,
+            "postprocessed": False,
+            "controller_csv": self.filepath,
+            "truth_csv": self.truth_filepath,
+            "wind_csv": self.wind_filepath,
+        }
+        payload.update(dict(record))
+        payload = {k: _json_safe(v) for k, v in payload.items()}
+
+        path = Path(self.outcome_filepath)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(path.suffix + ".partial")
+        with open(tmp, "w", encoding="utf-8") as handle:
+            # allow_nan=False so a non-finite value that escaped _json_safe
+            # raises here rather than emitting bare Infinity, which json.dump
+            # accepts by default and strict parsers reject.
+            json.dump(payload, handle, indent=2, sort_keys=False,
+                      allow_nan=False, default=str)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, path)
+        return str(path)
 
     def write(self, *, event: str = "", event_detail: str = "",
               controller_phase: str = ""):

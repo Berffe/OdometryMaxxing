@@ -49,6 +49,24 @@ LANDED = "landed"
 ABORTED = "aborted"
 
 
+@dataclass(frozen=True)
+class TerminalRequest:
+    """A phase's request to end the run.
+
+    Phases own the decision and the reason; ``bee_node`` owns what ending a run
+    means (sequencer latch, motor stop, process shutdown). The field is declared
+    on :class:`MissionControl` for the same reason ``effects`` is: the node
+    applies whatever it is handed and never has to recognise a phase name.
+
+    ``outcome`` is the terminal mission substate that caused it -- LANDED,
+    ABORTED or INFEASIBLE -- which is also what the campaign outcome record
+    reports as the run's status.
+    """
+
+    outcome: str
+    reason: str = ""
+
+
 class ControlEffect(Enum):
     """A side effect on ``ControlLaw`` that a phase transition requests.
 
@@ -238,6 +256,8 @@ class MissionControl:
     enable_integral: bool = True
     substate: str = CENTER
     effects: tuple[ControlEffect, ...] = ()
+    # Set by a terminal phase to end the run. None means "keep flying".
+    terminal_request: Optional[TerminalRequest] = None
     info: dict = field(default_factory=dict)
 
     def control_kwargs(self) -> dict:

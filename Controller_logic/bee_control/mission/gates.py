@@ -108,8 +108,12 @@ def compute_lateral_gate(
     stability_dt_sec: float,
     ceiling_safety_factor: float = 0.5,
     ceiling_margin: float = 0.8,
+    impose_ceiling_floor: bool = True,
 ) -> LateralGateResult:
-    """Build an independent lateral gain floor and verify its gain window."""
+    """Build an independent lateral gain floor and verify its gain window.
+
+    ``impose_ceiling_floor`` has the same meaning as in :func:`compute_gate`.
+    """
     kappa = max(1e-6, float(kappa))
     omega_adm = max(1e-6, float(flow_admissible_norm_s))
     c_max = max(0.0, float(max_closing_speed_m_s))
@@ -127,10 +131,13 @@ def compute_lateral_gate(
     )
 
     k_target = margin * k_ceiling_leg
-    k_floor = max(k_min, k_target)
-    # A scheduled floor may never exceed the gain at descent entry: the
-    # trajectory is a monotone decay from the FINAL_PROBE gain.
-    k_floor = min(k_floor, k_probe) if k_probe > 0.0 else k_floor
+    if impose_ceiling_floor:
+        k_floor = max(k_min, k_target)
+        # A scheduled floor may never exceed the gain at descent entry: the
+        # trajectory is a monotone decay from the FINAL_PROBE gain.
+        k_floor = min(k_floor, k_probe) if k_probe > 0.0 else k_floor
+    else:
+        k_floor = float(k_min)
     k_touchdown = k_floor
 
     probe_within_ceiling = k_probe <= k_ceiling_probe
@@ -202,6 +209,7 @@ def compute_gate(
     ceiling_margin: float = 0.8,
     descend_start_gain: Optional[float] = None,
     near_field_height_m: Optional[float] = None,
+    impose_ceiling_floor: bool = True,
 ) -> GateResult:
     """Turn a probed peak_accel into the descent gain window.
 
@@ -216,6 +224,15 @@ def compute_gate(
     feasible mission (k_min close to k_ceiling_leg, where margin<1 would place
     k_target below the disturbance-rejection floor) safely falls back to the old
     conservative behavior instead of under-gaining.
+
+    impose_ceiling_floor: False makes k_floor exactly k_min and drops the
+        "never above the gain the schedule starts from" clamp. The disturbance
+        requirement is then honoured at whatever gain it demands, including one
+        above the sampled-data ceiling and above k_probe -- which is a step up
+        at descent entry rather than a decay, and is the point. Every verdict
+        field below is still computed and returned unchanged; only the floor
+        moves. Keeping the clamp here would silently return the gated schedule
+        in exactly the severe cases the ablation exists to expose.
     """
     d_star = max(float(min_divergence_setpoint), float(descent_divergence_setpoint))
     s = max(1e-3, float(ceiling_safety_factor))
@@ -247,8 +264,11 @@ def compute_gate(
     # Never below the Herisse floor, and never above the gain the schedule starts
     # from (it only ever decays -- a k_floor above the start would turn the
     # "decay" into a step up, which is not what the trajectory means).
-    k_floor = max(float(k_min), float(k_target))
-    k_floor = min(k_floor, k_start) if k_start > 0.0 else k_floor
+    if impose_ceiling_floor:
+        k_floor = max(float(k_min), float(k_target))
+        k_floor = min(k_floor, k_start) if k_start > 0.0 else k_floor
+    else:
+        k_floor = float(k_min)
     floor_within_ceiling = k_floor <= k_ceiling_leg
     feasible = (
         probe_within_ceiling

@@ -17,7 +17,7 @@ The body is unchanged from the single-file revision apart from the mechanical
 """
 from __future__ import annotations
 
-from ..types import LANDED, MissionControl, PhaseSpec
+from ..types import LANDED, MissionControl, PhaseSpec, TerminalRequest
 
 
 def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
@@ -38,6 +38,10 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
         lateral_d_scale=0.0,
         enable_integral=False,
         substate=LANDED,
+        terminal_request=TerminalRequest(
+            outcome=LANDED,
+            reason=routine.terminal_reason or "truth contact confirmed",
+        ),
         info={
             "event": "landed",
             "landed_since_sec": (t - routine._t_landed) if routine._t_landed is not None else 0.0,

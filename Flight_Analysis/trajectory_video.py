@@ -1,16 +1,100 @@
+"""BEE_LAND 3-panel trajectory video.
+
+Renders the drone/platform trajectory from a run's truth log, with the mission
+substate from the controller log annotated on every frame.
+
+The command line mirrors ``analyse_log.py``::
+
+    python3 trajectory_video.py RUN_DIR OUTPUT_DIR
+    python3 trajectory_video.py CSV_A CSV_B OUTPUT_DIR
+
+In folder mode the two CSVs are discovered by their ``bee_controller_*`` /
+``bee_truth_*`` prefixes and matching run suffix. In explicit mode the two CSVs
+are order-independent: each is classified by its columns. ``bee_wind_*`` is not
+used here and is ignored if present.
+"""
 
 import argparse
+import os
+import shutil
+import sys
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
+import matplotlib
 import matplotlib.pyplot as plt
 from matplotlib.animation import FFMpegWriter
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
 import matplotlib.animation as animation
 
+DEFAULT_VIDEO_NAME = "trajectory.mp4"
+
+
+def _candidate_ffmpeg_paths():
+	"""Places an ffmpeg binary is plausibly installed, best first.
+
+	matplotlib only looks for ``ffmpeg`` on the PATH. On Windows, winget and
+	Chocolatey installs are often not on the PATH of an already-open shell, so
+	the usual locations are probed before giving up.
+	"""
+	for var in ("BEE_FFMPEG", "FFMPEG_PATH", "FFMPEG_BINARY"):
+		value = os.environ.get(var)
+		if value:
+			yield Path(value)
+
+	found = shutil.which("ffmpeg")
+	if found:
+		yield Path(found)
+
+	local = os.environ.get("LOCALAPPDATA")
+	if local:
+		yield Path(local) / "Microsoft" / "WinGet" / "Links" / "ffmpeg.exe"
+		packages = Path(local) / "Microsoft" / "WinGet" / "Packages"
+		if packages.is_dir():
+			yield from sorted(packages.glob("*FFmpeg*/**/bin/ffmpeg.exe"))
+
+	for fixed in (
+		r"C:\ProgramData\chocolatey\bin\ffmpeg.exe",
+		r"C:\ffmpeg\bin\ffmpeg.exe",
+		r"C:\Program Files\ffmpeg\bin\ffmpeg.exe",
+		"/usr/bin/ffmpeg",
+		"/usr/local/bin/ffmpeg",
+		"/opt/homebrew/bin/ffmpeg",
+	):
+		yield Path(fixed)
+
+
+def ensure_ffmpeg():
+	"""Make matplotlib's FFmpeg writer usable, or explain how to install it."""
+	if animation.writers.is_available("ffmpeg"):
+		return
+
+	for candidate in _candidate_ffmpeg_paths():
+		if candidate.is_file():
+			matplotlib.rcParams["animation.ffmpeg_path"] = str(candidate)
+			if animation.writers.is_available("ffmpeg"):
+				print(f"ffmpeg     : {candidate}")
+				return
+
+	raise RuntimeError(
+		"FFmpeg was not found. The MP4 writer is FFmpeg, and it is a separate "
+		"program, not a Python package -- pip install will not provide it.\n"
+		"  Windows : winget install Gyan.FFmpeg    (then open a NEW terminal)\n"
+		"  Conda   : conda install -c conda-forge ffmpeg\n"
+		"  macOS   : brew install ffmpeg\n"
+		"  Debian  : sudo apt install ffmpeg\n"
+		"Check with 'ffmpeg -version'. If it is installed but not on the PATH, "
+		"point this script at it with the BEE_FFMPEG environment variable, e.g. "
+		'$env:BEE_FFMPEG = "C:\\ffmpeg\\bin\\ffmpeg.exe"'
+	)
+
+
 LANDING_GEAR = 0.182
 DRONE_RADIUS = 0.2
 
 PHASE_LABELS = {
+	"prepare": "PREPARE",
 	"center": "CENTER",
 	"approach_probe": "APPROACH_PROBE",
 	"final_probe": "FINAL_PROBE",
@@ -26,6 +110,107 @@ def num(df, name):
 	if name not in df.columns:
 		return pd.Series(np.nan, index=df.index, dtype=float)
 	return pd.to_numeric(df[name], errors="coerce")
+
+
+def classify_csv(path):
+	"""Classify a CSV as controller, truth or wind from its columns alone."""
+	cols = set(pd.read_csv(path, nrows=2, low_memory=False).columns)
+	if "truth_sim_time_sec" in cols and "truth_drone_position_z_m" in cols:
+		return "truth"
+	if "wind_sim_time_sec" in cols and "wind_command_x_enu_m_s" in cols:
+		return "wind"
+	if "flow_sim_timestamp_sec" in cols and "controller_phase" in cols:
+		return "controller"
+	return "unknown"
+
+
+def discover_run_pair(run_dir):
+	"""Find exactly one complete controller/truth pair inside ``run_dir``.
+
+	The diagnostics files of a run share the same suffix, e.g.::
+
+	    bee_controller_20260817_145438.csv
+	    bee_truth_20260817_145438.csv
+
+	Folder mode refuses to guess when more than one complete run is present:
+	put one run per folder, or pass the two CSVs explicitly. ``bee_wind_*`` is
+	not needed by this script and is ignored.
+	"""
+	run_dir = Path(run_dir).expanduser()
+	if not run_dir.is_dir():
+		raise ValueError(f"Run path is not a directory: {run_dir}")
+
+	prefixes = {"controller": "bee_controller_", "truth": "bee_truth_"}
+	runs = {}
+	for kind, prefix in prefixes.items():
+		for path in run_dir.glob(f"{prefix}*.csv"):
+			suffix = path.name[len(prefix):]
+			runs.setdefault(suffix, {})[kind] = path
+
+	complete = [
+		(suffix, files)
+		for suffix, files in runs.items()
+		if all(kind in files for kind in prefixes)
+	]
+
+	if not complete:
+		found = {
+			kind: len(list(run_dir.glob(f"{prefix}*.csv")))
+			for kind, prefix in prefixes.items()
+		}
+		raise ValueError(
+			f"No complete controller/truth pair found in {run_dir}. "
+			f"Found controller={found['controller']}, truth={found['truth']} CSV(s)."
+		)
+
+	if len(complete) > 1:
+		run_ids = ", ".join(sorted(s.removesuffix(".csv") for s, _ in complete))
+		raise ValueError(
+			f"More than one complete run found in {run_dir}: {run_ids}. "
+			"Use one run per folder, or pass the two CSV files explicitly."
+		)
+
+	_, files = complete[0]
+	return files["controller"], files["truth"]
+
+
+def resolve_input_paths(paths):
+	"""Resolve folder mode or explicit-two-CSV mode.
+
+	Returns ``(controller_csv, truth_csv, output_mp4)``. The output positional
+	is a directory unless it ends in ``.mp4``; a directory gets
+	``trajectory.mp4`` written inside it, like ``analyse_log.py`` writes its
+	plots into the output folder.
+	"""
+	if len(paths) == 2:
+		run_dir, output = paths
+		controller_csv, truth_csv = discover_run_pair(run_dir)
+	elif len(paths) == 3:
+		csv_a, csv_b, output = paths
+		by_kind = {}
+		for path in (csv_a, csv_b):
+			if not Path(path).is_file():
+				raise ValueError(f"CSV path does not exist or is not a file: {path}")
+			kind = classify_csv(path)
+			if kind == "unknown":
+				raise ValueError(f"Could not classify {Path(path).name} as controller or truth.")
+			if kind in by_kind:
+				raise ValueError(f"Received more than one {kind} CSV.")
+			by_kind[kind] = Path(path)
+		missing = [k for k in ("controller", "truth") if k not in by_kind]
+		if missing:
+			raise ValueError(
+				f"Missing required CSV stream(s): {', '.join(missing)}. "
+				f"Got: {', '.join(sorted(by_kind))}."
+			)
+		controller_csv, truth_csv = by_kind["controller"], by_kind["truth"]
+	else:
+		raise ValueError("Expected either RUN_DIR OUTPUT, or CSV_A CSV_B OUTPUT.")
+
+	output = Path(output).expanduser()
+	output_mp4 = output if output.suffix.lower() == ".mp4" else output / DEFAULT_VIDEO_NAME
+	output_mp4.parent.mkdir(parents=True, exist_ok=True)
+	return Path(controller_csv), Path(truth_csv), output_mp4
 
 
 def clean_string(series):
@@ -98,7 +283,7 @@ def load_truth_data(truth_csv, stop_at_contact=False):
 	# the entire frame from the animation.
 	for prefix in ("d", "p"):
 		cols = [f"qx_{prefix}", f"qy_{prefix}", f"qz_{prefix}", f"qw_{prefix}"]
-		q = data[cols].to_numpy(float)
+		q = np.array(data[cols].to_numpy(float), copy=True)
 		q_norm = np.linalg.norm(q, axis=1)
 		q_good = np.all(np.isfinite(q), axis=1) & (q_norm > 1e-12)
 		q[~q_good] = np.array([0.0, 0.0, 0.0, 1.0])
@@ -114,9 +299,57 @@ def load_truth_data(truth_csv, stop_at_contact=False):
 	return data, t0
 
 
-def load_controller_phases(controller_csv, truth_t0_abs, truth_t_end_abs):
-	if controller_csv is None:
+def truthy(df, name):
+	"""Boolean column tolerant of 1/0, True/False and "true"/"false" logs."""
+	if name not in df.columns:
+		return pd.Series(False, index=df.index)
+	numeric = pd.to_numeric(df[name], errors="coerce")
+	text = clean_string(df[name])
+	return (numeric.fillna(0.0) > 0.5) | text.isin(["true", "yes"])
+
+
+def controller_start_time(df, sim_time):
+	"""SIM time at which the controller actually takes over the flight.
+
+	Every run begins with the MAVSDK worker lifting the drone to the starting
+	altitude. During that leg the mission FSM already reports its initial
+	substate, so labelling frames from ``mission_substate`` alone paints the
+	whole takeoff as CENTER. The real handover is the first *control* row: a
+	row produced by a fresh, valid visual result rather than by an event.
+
+	This is the same rule ``analyse_log.py`` uses for ``t0``, which is why its
+	plots start at the handover and ignore the preparation leg entirely.
+	Returns ``None`` when no control row can be identified, in which case the
+	caller keeps the old behaviour of labelling from the first controller row.
+	"""
+	event = clean_string(df["event"]) if "event" in df.columns else pd.Series("", index=df.index)
+	valid = np.isfinite(sim_time) & truthy(df, "flow_valid")
+
+	mask = valid & (event == "")
+	if "vision_sequence" in df.columns:
+		mask &= pd.to_numeric(df["vision_sequence"], errors="coerce").notna()
+
+	if not mask.any():
+		# Compatibility fallback for logs whose control rows carry an explicit
+		# "control" event, and for logs without flow_valid at all.
+		mask = valid & event.isin(["", "control"])
+	if not mask.any():
+		mask = np.isfinite(sim_time) & (event == "")
+	if not mask.any():
 		return None
+
+	return float(sim_time[mask].min())
+
+
+def load_controller_phases(controller_csv, truth_t0_abs, truth_t_end_abs):
+	"""Return (phase_df, handover_abs).
+
+	``phase_df`` holds the mission labels from the handover onwards.
+	``handover_abs`` is the absolute SIM time at which the controller took
+	over, or ``None`` if it could not be determined.
+	"""
+	if controller_csv is None:
+		return None, None
 
 	df = pd.read_csv(controller_csv, low_memory=False)
 
@@ -138,17 +371,24 @@ def load_controller_phases(controller_csv, truth_t0_abs, truth_t_end_abs):
 	empty = label == ""
 	label.loc[empty] = event.loc[empty]
 
+	handover_abs = controller_start_time(df, sim_time)
+
 	phase_df = pd.DataFrame({"t_abs": sim_time, "phase": label})
 	phase_df = phase_df[np.isfinite(phase_df["t_abs"])].copy()
 	phase_df = phase_df[(phase_df["t_abs"] >= truth_t0_abs) & (phase_df["t_abs"] <= truth_t_end_abs)].copy()
 	phase_df = phase_df[phase_df["phase"] != ""].copy()
 
+	# Mission labels logged before the handover describe an FSM that is not
+	# flying the drone yet: drop them so the takeoff leg reads PREPARE.
+	if handover_abs is not None:
+		phase_df = phase_df[phase_df["t_abs"] >= handover_abs].copy()
+
 	if phase_df.empty:
-		return None
+		return None, handover_abs
 
 	phase_df = phase_df.sort_values("t_abs").drop_duplicates("t_abs", keep="last").reset_index(drop=True)
 	phase_df["t"] = phase_df["t_abs"] - truth_t0_abs
-	return phase_df
+	return phase_df, handover_abs
 
 
 def choose_animation_sampling(data, speed=1.0, video_fps=15.0):
@@ -167,13 +407,21 @@ def choose_animation_sampling(data, speed=1.0, video_fps=15.0):
 	return anim, source_fps, source_dt, sim_dt_per_video_frame, step
 
 
-def phase_at_time(phase_df, t_rel):
+def phase_at_time(phase_df, t_rel, prepare_until=None):
+	"""Mission label at ``t_rel``, or PREPARE before the controller took over.
+
+	``prepare_until`` is the handover time expressed in plot-relative seconds.
+	Frames before it belong to the MAVSDK takeoff leg, which has no mission
+	substate of its own.
+	"""
+	if prepare_until is not None and t_rel < prepare_until:
+		return PHASE_LABELS["prepare"]
 	if phase_df is None or phase_df.empty:
-		return ""
+		return PHASE_LABELS["prepare"] if prepare_until is not None else ""
 	times = phase_df["t"].to_numpy(float)
 	idx = np.searchsorted(times, t_rel, side="right") - 1
 	if idx < 0:
-		return ""
+		return PHASE_LABELS["prepare"]
 	phase = str(phase_df["phase"].iloc[idx]).strip().lower()
 	return PHASE_LABELS.get(phase, phase.upper())
 
@@ -273,16 +521,37 @@ def create_mp4(
 	trail_seconds=6.0,
 	video_fps=15.0,
 	stop_at_contact=False,
+	max_time=None,
 	elev=24.0,
 	azim=-56.0,
 	dpi=110,
 ):
-	if not animation.writers.is_available("ffmpeg"):
-		raise RuntimeError("FFmpeg is not available in this Python environment.")
+	ensure_ffmpeg()
 
 	data, truth_t0_abs = load_truth_data(truth_csv, stop_at_contact=stop_at_contact)
+
+	# Same convention as analyse_log.py --max-time: simulated seconds counted
+	# from the first plotted sample, not absolute SIM time.
+	if max_time is not None:
+		data = data[data["t"] <= float(max_time)].reset_index(drop=True)
+		if len(data) < 2:
+			raise ValueError(
+				f"--max-time {max_time} leaves fewer than two truth samples."
+			)
+
 	truth_t_end_abs = float(data["t_abs"].iloc[-1])
-	phase_df = load_controller_phases(controller_csv, truth_t0_abs, truth_t_end_abs)
+	phase_df, handover_abs = load_controller_phases(
+		controller_csv, truth_t0_abs, truth_t_end_abs
+	)
+
+	# Everything before the handover is the MAVSDK worker lifting the drone to
+	# the starting altitude. A handover at or before the first truth sample
+	# means the run has no preparation leg to label.
+	prepare_until = None
+	if handover_abs is not None:
+		relative = handover_abs - truth_t0_abs
+		if relative > 0.0:
+			prepare_until = relative
 
 	anim, source_fps, source_dt, sim_dt_per_video_frame, step = choose_animation_sampling(
 		data, speed=speed, video_fps=video_fps
@@ -339,7 +608,7 @@ def create_mp4(
 
 			row = anim.iloc[k]
 			t_rel = float(row["t"])
-			phase_text = phase_at_time(phase_df, t_rel)
+			phase_text = phase_at_time(phase_df, t_rel, prepare_until)
 
 			xd = anim["x_d"].iloc[:k+1].to_numpy()
 			yd = anim["y_d"].iloc[:k+1].to_numpy()
@@ -470,37 +739,146 @@ def create_mp4(
 		"step": step,
 		"sim_dt_per_video_frame": sim_dt_per_video_frame,
 		"trail_frames": trail_frames,
+		"prepare_until": prepare_until,
 		"truth_t0_abs": truth_t0_abs,
 		"output_mp4": output_mp4,
 	}
 
 
-if __name__ == "__main__":
-	parser = argparse.ArgumentParser()
-	parser.add_argument("--truth-csv", type=str, default="/mnt/data/bee_truth_20260720_135806.csv")
-	parser.add_argument("--controller-csv", type=str, default="/mnt/data/bee_controller_20260720_135806.csv")
-	parser.add_argument("--output-mp4", type=str, default="/mnt/data/drone_platform_trajectory.mp4")
-	parser.add_argument("--platform-radius", type=float, default=0.5)
-	parser.add_argument("--speed", type=float, default=1.0, help="Playback speed multiplier: 0.25, 0.5, 1.5, etc.")
-	parser.add_argument("--trail-seconds", type=float, default=6.0)
-	parser.add_argument("--video-fps", type=float, default=15.0, help="Intended output MP4 fps.")
-	parser.add_argument("--no-stop-at-contact", action="store_true")
-	parser.add_argument("--elev", type=float, default=24.0)
-	parser.add_argument("--azim", type=float, default=-56.0)
-	parser.add_argument("--dpi", type=int, default=110)
-	args = parser.parse_args()
+def parse_args(argv=None):
+	parser = argparse.ArgumentParser(
+		description=(
+			"Render the BEE_LAND 3-panel trajectory video (3D, side, top) from a "
+			"run's truth log, annotated with the controller mission substate."
+		),
+		epilog=(
+			"Examples:\n"
+			"  python3 trajectory_video.py logs/run results/run\n"
+			"  python3 trajectory_video.py logs/run results/run --speed 0.5 --max-time 55\n"
+			"  python3 trajectory_video.py bee_truth_RUN.csv bee_controller_RUN.csv results/run"
+		),
+		formatter_class=argparse.RawDescriptionHelpFormatter,
+	)
+	parser.add_argument(
+		"paths",
+		type=Path,
+		nargs="+",
+		metavar="PATH",
+		help=(
+			"Either RUN_DIR OUTPUT, or CSV_A CSV_B OUTPUT (order-independent). "
+			"OUTPUT is a directory, in which case trajectory.mp4 is written "
+			"inside it, or an explicit *.mp4 file."
+		),
+	)
+	parser.add_argument(
+		"--platform-radius",
+		type=float,
+		default=0.5,
+		metavar="METRES",
+		help="Deck radius drawn in the three views (default: 0.5).",
+	)
+	parser.add_argument(
+		"--speed",
+		type=float,
+		default=1.0,
+		metavar="X",
+		help="Playback speed multiplier in SIM time: 0.25, 0.5, 1.5 (default: 1.0).",
+	)
+	parser.add_argument(
+		"--trail-seconds",
+		type=float,
+		default=6.0,
+		metavar="SECONDS",
+		help="Length of the fading motion trail (default: 6.0).",
+	)
+	parser.add_argument(
+		"--video-fps",
+		type=float,
+		default=15.0,
+		metavar="FPS",
+		help="Output MP4 frame rate (default: 15.0).",
+	)
+	parser.add_argument(
+		"--max-time",
+		type=float,
+		default=None,
+		metavar="SECONDS",
+		help=(
+			"Stop the video this many simulated seconds after the first truth "
+			"sample. Same convention as analyse_log.py --max-time."
+		),
+	)
+	parser.add_argument(
+		"--no-stop-at-contact",
+		action="store_true",
+		help="Keep rendering past the first contact instead of stopping there.",
+	)
+	parser.add_argument(
+		"--elev",
+		type=float,
+		default=24.0,
+		metavar="DEG",
+		help="3-D view elevation (default: 24).",
+	)
+	parser.add_argument(
+		"--azim",
+		type=float,
+		default=-56.0,
+		metavar="DEG",
+		help="3-D view azimuth (default: -56).",
+	)
+	parser.add_argument(
+		"--dpi",
+		type=int,
+		default=110,
+		metavar="DPI",
+		help="Output resolution (default: 110).",
+	)
+	return parser.parse_args(argv)
+
+
+def main(argv=None):
+	args = parse_args(argv)
+	controller_csv, truth_csv, output_mp4 = resolve_input_paths(args.paths)
+
+	print(f"controller : {controller_csv}")
+	print(f"truth      : {truth_csv}")
+	print(f"output     : {output_mp4}")
 
 	result = create_mp4(
-		truth_csv=args.truth_csv,
-		output_mp4=args.output_mp4,
-		controller_csv=args.controller_csv,
+		truth_csv=str(truth_csv),
+		output_mp4=str(output_mp4),
+		controller_csv=str(controller_csv),
 		platform_radius=args.platform_radius,
 		speed=args.speed,
 		trail_seconds=args.trail_seconds,
 		video_fps=args.video_fps,
-		stop_at_contact=not args.no_stop_at_contact,
+		stop_at_contact= args.no_stop_at_contact,
+		max_time=args.max_time,
 		elev=args.elev,
 		azim=args.azim,
 		dpi=args.dpi,
 	)
-	print(result)
+
+	if result["prepare_until"] is not None:
+		print(
+			f"PREPARE leg: first {result['prepare_until']:.2f} s of the video "
+			"(MAVSDK takeoff, before the controller takes over)"
+		)
+	else:
+		print("PREPARE leg: none (the controller was already flying at the first truth sample)")
+
+	print(
+		f"saved {output_mp4} "
+		f"({result['frames']} frames at {result['video_fps']:.1f} fps, "
+		f"source {result['source_fps']:.1f} Hz, 1 frame per {result['step']} truth samples)"
+	)
+	return 0
+
+
+if __name__ == "__main__":
+	try:
+		raise SystemExit(main())
+	except (ValueError, RuntimeError) as exc:
+		print(f"ERROR: {exc}", file=sys.stderr)
+		raise SystemExit(1)

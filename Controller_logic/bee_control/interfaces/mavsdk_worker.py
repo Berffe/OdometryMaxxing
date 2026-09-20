@@ -46,17 +46,17 @@ contact and motors actually stopping (see bee_node.py's touchdown handling +
 platform_motion.py's PLATFORM_TOP_SURFACE_OFFSET_M for how that gap was
 found: ~19cm of apparent leg interpenetration in one logged landing). Fixed
 here two ways:
-1. An asyncio.Event wakes the worker loop the instant request_motor_stop()
-    fires, instead of waiting out the next poll tick -- see _wake_event.
-2. When enable_kill_fallback is set (the SITL/moving-platform case this
-    whole mechanism exists for), the doomed disarm() attempt is skipped
-    entirely and kill() is issued directly -- see _try_motor_stop.
-3. Every stage now gets a monotonic timestamp (self.timing_*), so the next
-    landing log can show which stage actually dominates rather than assume
-    it -- these are diagnostics-only, read by nothing in this file, plain
-    time.monotonic() (not clock.py's WALL/SIM/PX4 family: this is a
-    same-process duration measurement, not a cross-system correlation, so
-    it doesn't need that taxonomy).
+  1. An asyncio.Event wakes the worker loop the instant request_motor_stop()
+     fires, instead of waiting out the next poll tick -- see _wake_event.
+  2. When enable_kill_fallback is set (the SITL/moving-platform case this
+     whole mechanism exists for), the doomed disarm() attempt is skipped
+     entirely and kill() is issued directly -- see _try_motor_stop.
+  3. Every stage now gets a monotonic timestamp (self.timing_*), so the next
+     landing log can show which stage actually dominates rather than assume
+     it -- these are diagnostics-only, read by nothing in this file, plain
+     time.monotonic() (not clock.py's WALL/SIM/PX4 family: this is a
+     same-process duration measurement, not a cross-system correlation, so
+     it doesn't need that taxonomy).
 """
 
 import asyncio
@@ -134,16 +134,6 @@ class MavsdkWorker:
         self.timing_kill_attempted = None
         self.timing_kill_result = None
 
-        # Takeoff-side milestones on the same monotonic clock. These let the CSV
-        # separate MAVSDK connection/health/settling/climb time from the later ROS
-        # offboard handoff without mixing in PX4, SIM, or epoch-wall timestamps.
-        self.timing_start_requested = None
-        self.timing_worker_loop_started = None
-        self.timing_connected = None
-        self.timing_health_ready = None
-        self.timing_takeoff_commanded = None
-        self.timing_takeoff_done = None
-
     # ---- node-facing controls ------------------------------------------------
     def start(self) -> None:
         """Spawn the worker thread (idempotent). Sets takeoff_error instead of
@@ -154,7 +144,6 @@ class MavsdkWorker:
             self.takeoff_error = "mavsdk is not installed in this Python environment"
             return
         self.takeoff_started = True
-        self.timing_start_requested = time.monotonic()
         self._logger.info(f"Starting MAVSDK takeoff to {self._takeoff_altitude_m:.2f} m.")
         self._thread = threading.Thread(
             target=self._run_thread, name="mavsdk_takeoff", daemon=True
@@ -171,15 +160,29 @@ class MavsdkWorker:
         self._wake()
 
     def _wake(self) -> None:
-        """Nudge the worker's poll loop to check intents immediately, from
-        whatever thread this is called on (the node's thread, normally).
-        Best-effort: the flags above remain the actual source of truth, so a
-        missed wake (e.g. called before the worker's loop exists yet) just
-        falls back to the loop's own short timeout poll -- never incorrect,
-        only possibly up to one poll period slower. See _worker_async."""
+        """Nudge the worker's poll loop to check intents immediately.
+
+        Best-effort only: the request flags remain the source of truth. The
+        worker may already have completed and asyncio.run() may have closed its
+        event loop by the time shutdown calls request_stop(). In that case
+        there is nothing left to wake, so return silently.
+        """
         loop, event = self._loop, self._wake_event
-        if loop is not None and event is not None:
+        if loop is None or event is None:
+            return
+
+        # Normal post-worker shutdown path: asyncio.run() closes the loop after
+        # _worker_async() returns. Avoid calling into a known-closed loop.
+        if loop.is_closed():
+            return
+
+        try:
             loop.call_soon_threadsafe(event.set)
+        except RuntimeError:
+            # Race-safe fallback: the loop can close between is_closed() and
+            # call_soon_threadsafe(). A missed wake is harmless because the
+            # intent flag has already been set and no live worker remains.
+            pass
 
     # ---- worker thread -------------------------------------------------------
     def _run_thread(self) -> None:
@@ -190,6 +193,12 @@ class MavsdkWorker:
                 self.takeoff_error = repr(exc)
             else:
                 self.motor_stop_error = repr(exc)
+        finally:
+            # asyncio.run() owns and closes the loop. Once it returns, these
+            # cross-thread wake handles are stale and must not be reused by the
+            # node's later close() path.
+            self._loop = None
+            self._wake_event = None
 
     async def _worker_async(self) -> None:
         # Created here (not in __init__) so it's bound to THIS running loop --
@@ -197,7 +206,6 @@ class MavsdkWorker:
         # from the node's thread (see _wake()).
         self._wake_event = asyncio.Event()
         self._loop = asyncio.get_running_loop()
-        self.timing_worker_loop_started = time.monotonic()
 
         self._free_port(self._port_to_free)
         drone = System()
@@ -211,7 +219,6 @@ class MavsdkWorker:
             "MAVSDK connection",
         )
         self._logger.info("MAVSDK: connected.")
-        self.timing_connected = time.monotonic()
 
         self._logger.info("MAVSDK: waiting for global/home/local position estimates...")
         await self._wait_for_condition(
@@ -221,7 +228,6 @@ class MavsdkWorker:
             "global/home/local position health",
         )
         self._logger.info("MAVSDK: all position estimates OK.")
-        self.timing_health_ready = time.monotonic()
 
         await asyncio.sleep(self._ekf2_settle)
         home_position = await self._wait_for_condition(
@@ -241,7 +247,6 @@ class MavsdkWorker:
         await drone.action.arm()
         self._logger.info("MAVSDK: takeoff command.")
         await drone.action.takeoff()
-        self.timing_takeoff_commanded = time.monotonic()
 
         await self._wait_for_condition(
             drone.telemetry.position(),
@@ -255,7 +260,6 @@ class MavsdkWorker:
         )
         self._logger.info("MAVSDK: reached takeoff altitude; hovering.")
         self.takeoff_done = True
-        self.timing_takeoff_done = time.monotonic()
 
         # MAVSDK is kept only for takeoff and terminal motor-stop actions.
         # Closed-loop attitude/thrust setpoints are published directly to PX4 via

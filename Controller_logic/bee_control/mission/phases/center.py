@@ -145,6 +145,18 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
     timeout_handoff = timed_out and routine._center_timeout_allows_handoff
     handoff_ready = settled_and_centered and dwell >= required_dwell
 
+    # Operational gate. A vehicle that has not centred within the timeout will
+    # not produce a feasibility verdict, so the run is over: ABORTED, not a
+    # refusal. Without this the phase hovers on a valid target indefinitely,
+    # which is what an unattended campaign cannot afford.
+    if timed_out and not timeout_handoff and routine._center_timeout_aborts:
+        return routine.abort(
+            inputs,
+            f"CENTER did not converge within {routine._center_timeout:.1f} s "
+            f"(physical centring radius {physical_mean_radius:.3f} > "
+            f"{routine._center_offset_radius_max:.3f})",
+        )
+
     if handoff_ready or timeout_handoff:
         for probe in (routine._probe, routine._roll_probe, routine._pitch_probe):
             probe.reset()

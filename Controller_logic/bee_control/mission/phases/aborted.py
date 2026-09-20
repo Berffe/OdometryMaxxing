@@ -1,6 +1,12 @@
 """ABORTED phase.
 
-Terminal. Latched by the node on an outer-loop failure.
+Terminal. An operational failure stopped the flight before the feasibility
+gates could return a verdict: loss of the target, a CENTER or APPROACH gate
+that never converged, an offboard dropout, a MAVSDK failure.
+
+This is deliberately NOT the phase for "the gates ran and refused". That is
+INFEASIBLE, and keeping the two apart is what stops a run the gate never
+evaluated from being counted as a rejection.
 
 Phase contract
 --------------
@@ -8,32 +14,27 @@ Phase contract
 one tick, and may latch ``routine._substate`` when it hands off. ``SPEC`` is
 what the registry in ``mission/routine.py`` picks up.
 
-Adding a phase means writing a file shaped like this one and listing it in
-``phases/__init__.py``. Nothing outside ``mission/`` changes -- not the node,
-not the diagnostics writer, not the log schema.
-
-The body is unchanged from the single-file revision apart from the mechanical
-``self`` -> ``routine`` rename that comes with being a free function.
+Ending the run
+--------------
+This phase emits a ``TerminalRequest``; the node applies it. The phase owns the
+decision and the reason, the node owns what ending a run means, and neither has
+to know the other's vocabulary.
 """
 from __future__ import annotations
 
-from ..types import ABORTED, MissionControl, PhaseSpec
+from ..types import ABORTED, MissionControl, PhaseSpec, TerminalRequest
 
 
 def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
-    """Terminal hold after an outer-loop abort.
+    """Terminal hold after an operational failure.
 
-        Like LANDED, this emits no gain and no divergence setpoint:
-        ``thrust_gain_override`` is None ("no opinion"), because by this point the
-        node is publishing its own neutral hold and any number here would be a
-        fiction that only ever shows up in the log.
-
-        This method is the worked example of what adding a phase now costs: one
-        handler, one ``PhaseSpec`` in :attr:`PHASES`, and -- because the substate
-        string already flows through ``telemetry()`` -- nothing at all in
-        ``bee_node`` or ``diagnostics_writer``.
+    Emits no gain and no divergence setpoint: ``thrust_gain_override`` is None
+    ("no opinion"), because by this point the node is publishing its own neutral
+    hold and any number here would be a fiction that only ever shows up in the
+    log.
     """
     t = inputs.t
+    reason = routine.terminal_reason or "unspecified operational failure"
 
     return MissionControl(
         divergence_setpoint=0.0,
@@ -42,8 +43,12 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
         lateral_d_scale=0.0,
         enable_integral=False,
         substate=ABORTED,
+        terminal_request=TerminalRequest(outcome=ABORTED, reason=reason),
         info={
             "event": "aborted" if just_entered else "",
+            "reason": reason,
+            "terminal_reason": reason,
+            "abort_phase": routine.terminal_origin_substate,
             "aborted_since_sec": (
                 (t - routine._t_aborted) if routine._t_aborted is not None else 0.0
             ),
@@ -56,7 +61,7 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
 SPEC = PhaseSpec(
     name=ABORTED,
     display_name="ABORTED",
-    description="Terminal. Latched by the node on an outer-loop failure.",
+    description="Terminal. Operational failure before the gates returned a verdict.",
     terminal=True,
     handler=run,
 )

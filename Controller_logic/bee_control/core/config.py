@@ -115,6 +115,17 @@ class SchedulingConfig:
     supervisor_period_sec: float = 0.1
     post_landing_log_period_sec: float = 0.10
 
+    # --- Terminal shutdown -------------------------------------------------
+    # How long the node keeps running after a terminal outcome before it shuts
+    # itself down. Every run ends by itself; nothing waits for an operator.
+    #
+    # LANDED gets the longer window because the truth stream is still arriving
+    # and the post-touchdown rows are the contact-velocity evidence. A dead run
+    # (ABORTED / INFEASIBLE) has nothing left to record, so it gets just enough
+    # to flush the CSVs and let the motor stop land.
+    post_landing_shutdown_sec: float = 5.0
+    terminal_shutdown_grace_sec: float = 2.0
+
     # --- Offboard handshake -----------------------------------------------
     offboard_prestream_sec: float = 2.0
     px4_offboard_switch_settle_sec: float = 0.5
@@ -269,6 +280,11 @@ class MavsdkConfig:
     health_timeout_sec: float = 30.0
     takeoff_altitude_timeout_sec: float = 130.0
     enable_touchdown_motor_stop: bool = True
+    # Dead runs (ABORTED / INFEASIBLE) end in the air. Stopping the motors
+    # guarantees PX4 disarms, so the next run in a campaign starts against a
+    # clean SITL instead of one still hovering under a failsafe. This is a
+    # TESTER policy: a real landing system would command a descent here.
+    enable_terminal_motor_stop: bool = True
     enable_kill_fallback: bool = True
 
 
@@ -324,8 +340,8 @@ class MissionConfig:
     # <- BeeConfig.vertical_stability_delay() / lateral_stability_delay()
     vertical_stability_dt_sec: float = 1.0 / 30.0
     lateral_stability_dt_sec: float = 1.0 / 30.0
-    roll_d_gain: float = 3.5              # <- ControlConfig.roll_kd
-    pitch_d_gain: float = 3.5             # <- ControlConfig.pitch_kd
+    roll_d_gain: float = 3              # <- ControlConfig.roll_kd
+    pitch_d_gain: float = 3             # <- ControlConfig.pitch_kd
     # Control tick period, used ONLY as the stability_dt fallback.  The mission
     # itself is driven by camera SIM timestamps, never by a fixed rate.
     # <- SchedulingConfig.control_period_sec.  Renamed from
@@ -352,10 +368,14 @@ class MissionConfig:
     # underneath the vehicle.
     center_offset_radius_max: float = 0.05
     center_flow_radius_max_norm_s: float = 0.10
-    center_timeout_sec: float = 20.0
-    # Timeout stays diagnostic by default: never leave CENTER merely because
-    # the clock expired while the target is still moving / off-centre.
+    center_timeout_sec: float = 25.0
+    # Timeout never hands off: do not leave CENTER merely because the clock
+    # expired while the target is still moving / off-centre.
     center_timeout_allows_handoff: bool = False
+    # ... but do not hover on it forever either. The expiry terminates the run
+    # as ABORTED, because a vehicle that never centred never reaches a
+    # feasibility verdict and must not be counted as a refusal.
+    center_timeout_aborts: bool = True
 
     # --- Handoff condition (legacy box gate) ------------------------------
     # Used only when ``enable_center_condition_gate`` is False.  Renamed from
@@ -414,6 +434,23 @@ class MissionConfig:
     approach_hold_log_scale_tolerance: float = 0.05
     approach_hold_divergence_tolerance_1_s: float = 0.1
     approach_hold_dwell_sec: float = 0.75
+    # The APPROACH twin of center_timeout_sec. Generous relative to the nominal
+    # approach: it is a stuck-run detector, not a performance bound.
+    approach_timeout_sec: float = 60.0
+    approach_timeout_aborts: bool = True
+
+    # False disables only the COMMIT decision, never the measurement: the
+    # probes run, k_min is computed, every gate verdict is evaluated, attributed
+    # to an axis and a criterion, and logged. The descent then proceeds
+    # regardless, with k_min imposed as the schedule floor and the sampled-data
+    # ceiling deliberately violated. This is the ablation the campaign pairs
+    # against the gated runs on the same seed; it is not a "gates off" mode in
+    # the sense of an unconstrained gain.
+    #
+    # The near-field PROBE gain stays ceiling-limited either way. Probing above
+    # the ceiling feeds self-induced oscillation into peak_accel, which would
+    # corrupt the very number both arms of the ablation are compared on.
+    enable_commit_gate: bool = True
 
     # ======================================================================
     # 4. FINAL_PROBE -- the only phase whose evidence reaches the gates
@@ -464,7 +501,7 @@ class MissionConfig:
     # FINAL_PROBE resets all three acceleration probes before applying these
     # near-field constants, so no APPROACH envelope can enter a gate.
     near_probe_window_sec: float = 0.6 * PROBE_DESIGN_PERIOD_SEC
-    near_probe_decay_tau_sec: float = 4.0 * PROBE_DESIGN_PERIOD_SEC
+    near_probe_decay_tau_sec: float = 5.0 * PROBE_DESIGN_PERIOD_SEC
     near_probe_highpass_tau_sec: float = 2.0 * PROBE_DESIGN_PERIOD_SEC
 
     # --- Envelope protection ---

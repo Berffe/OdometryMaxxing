@@ -1,139 +1,127 @@
+"""Figure 1 - admissible gain region against relative height.
+
+Two panels sharing the height axis: a calm platform whose probed floor leaves
+the region non-empty at gear height, and a severe one whose floor crosses the
+ceiling above it. The contribution is legible from the figure alone.
+
+Both ceilings are straight lines through the origin, and so is the schedule:
+with k = k_exp exp(-w t) and h = h0 exp(-w t), the scheduled gain is
+k = (k_exp / h0) h until it clamps. That is why it stays inside the wedge.
+"""
+
 import numpy as np
 import matplotlib.pyplot as plt
-import math
 
-# z range
-z = np.linspace(0, 7, 500)
+import ieee_figure_style as style
 
-# Gains
-k_min_s = 1
-k_min = k_min_s * np.ones_like(z)
-k_z = 26 * z
+# --- Configuration. Replace with the values used in the campaign. ----------
+T_SAMPLE_S = 0.077          # controller sampling interval
+H_GEAR_M = 0.18             # landing-gear height
+H0_M = 3.0                  # height at which the schedule starts
+K_EXPLORE = 6.5             # initial exploratory gain
+CEILING_MARGIN = 0.8        # contraction factor s < 1
 
-# Critical height
-h_crit = 0.18
+D_MAX_CALM = 1.0            # probed floor, calm platform
+D_MAX_SEVERE = 6.0          # probed floor, severe platform
 
-# Intersection point: 1 = 26*z
-z_intersection_stable = h_crit
-k_intersection_stable = h_crit*26
+H_MAX_M = 0.5
+K_MAX_PLOT = 8.0
 
-# Intersection point: 1 = 13*z
-z_intersection_osci = h_crit
-k_intersection_osci = h_crit*13
+# Okabe-Ito: distinguishable in colour and separated in greyscale value.
+C_STABILITY = "#333333"
+C_NO_OSCILLATION = "#0072B2"
+C_STABLE = "#B2006B"
+C_FLOOR = "#D55E00"
+C_SCHEDULE = "#009E73"
+C_WEDGE = "#DCE9F2"
 
-fig, axes = plt.subplots(1, 2, figsize=(13, 5))
 
-# -----------------------
-# Full plot
-# -----------------------
-axes[0].plot(z, k_min, label="Gain minimal", color='b')
-axes[0].plot(z, k_z/2, label="Gain maximal - sans oscillations", color='g')
-axes[0].plot(z, k_z, label="Gain maximal - stabilité", color='r')
+def ceilings(h):
+    """Stability ceiling 2h/T and the stricter no-oscillation ceiling h/T."""
+    return 2.0 * h / T_SAMPLE_S, h / T_SAMPLE_S
 
-axes[0].axvline(h_crit, linestyle="--", label="Hauteur train d'atterrissage")
-# axes[0].scatter(z_intersection_stable, k_intersection, zorder=5)
 
-axes[0].set_xlabel("coordonés z [m]")
-axes[0].set_ylabel("Gain k")
-axes[0].set_title("Évolution gain")
-axes[0].set_xlim(0, 7)
-axes[0].set_ylim(0, 75)
-axes[0].grid(True)
-axes[0].legend()
+def scheduled_gain(h, k_floor):
+    """k = (k_exp / h0) h, clamped from below at the asymptote."""
+    return np.maximum(K_EXPLORE * h / H0_M, k_floor)
 
-# -----------------------
-# Zoomed plot
-# -----------------------
-axes[1].plot(z, k_min, label="Gain minimal", color='b')
-axes[1].plot(z, k_z/2, label="Gain maximal - sans oscillations", color='g')
-axes[1].plot(z, k_z, label="Gain maximal - stabilité", color='r')
 
-axes[1].axvline(h_crit, linestyle="--", label="Hauteur train d'atterrissage")
-axes[1].scatter(h_crit, k_intersection_osci, zorder=5, color='g')
-axes[1].scatter(h_crit, k_intersection_stable, zorder=5, color='r')
+def draw_panel(ax, k_min, title, show_ylabel, show_schedule=True):
+    h = np.linspace(0, H_MAX_M, 400)
+    k_stability, k_no_osc = ceilings(h)
+    k_floor_line = np.full_like(h, k_min)
 
-axes[1].text(
-    z_intersection_stable + 0.015,
-    k_intersection_stable - 0.5,
-    f"Gain max stable\nk_z= {k_intersection_stable:.2f}"
-)
+    admissible = np.minimum(k_no_osc, K_MAX_PLOT)
+    ax.fill_between(h, k_floor_line, admissible,
+                    where=admissible > k_floor_line,
+                    color=C_WEDGE, linewidth=0, zorder=0)
 
-axes[1].text(
-    z_intersection_osci + 0.015,
-    k_intersection_osci - 0.5,
-    f"Gain max sans oscillations\nk_z = {k_intersection_osci:.2f}"
-)
+    ax.plot(h, k_stability, color=C_STABILITY, linestyle="-", zorder=3)
+    ax.plot(h, k_no_osc, color=C_NO_OSCILLATION, linestyle="--", zorder=3)
+    ax.plot(h, k_floor_line, color=C_FLOOR, linestyle="-", zorder=3)
 
-axes[1].set_xlabel("coordonés z [m]")
-axes[1].set_ylabel("Gain k")
-axes[1].set_title("Zoom: z de 0 à 0.5 m")
-axes[1].set_xlim(0, 0.5)
-axes[1].set_ylim(0, 6)
-axes[1].grid(True)
-# axes[1].legend()
+    # Only drawn where a descent is actually committed to.
+    if show_schedule:
+        k_floor_asymptote = max(CEILING_MARGIN * H_GEAR_M / T_SAMPLE_S, k_min)
+        ax.plot(h, scheduled_gain(h, k_floor_asymptote),
+                color=C_SCHEDULE, linestyle="-.", linewidth=0.9, zorder=4)
 
-plt.tight_layout()
+    ax.axvline(H_GEAR_M, color="0.45", linestyle=":", linewidth=0.8, zorder=2)
 
-# -----------------------
-# PAR RAPPORT AU TEMPS
-# -----------------------
-# Parameters
-omega = 0.5
-z0 = 3.0
-k_exp = 6.5
+    # The decision: is the region still non-empty at gear height?
+    k_gear = H_GEAR_M / T_SAMPLE_S
+    feasible = k_min <= k_gear
+    ax.plot(H_GEAR_M, k_gear, marker="o", markersize=3.5,
+            color=C_NO_OSCILLATION, zorder=5)
+    ax.plot(H_GEAR_M, k_min, marker="o" if feasible else "x", markersize=3.5,
+            color=C_FLOOR, zorder=5)
+    if feasible:
+        ax.annotate("", xy=(H_GEAR_M, k_gear), xytext=(H_GEAR_M, k_min),
+                    arrowprops=dict(arrowstyle="<->", color="0.25",
+                                    linewidth=0.7, shrinkA=2, shrinkB=2),
+                    zorder=6)
 
-# Time range
-t = np.linspace(0, 12, 500)
+    ax.set_xlim(0, H_MAX_M)
+    ax.set_ylim(0, K_MAX_PLOT)
+    ax.set_xlabel(r"Relative height $h$ [m]")
+    if show_ylabel:
+        ax.set_ylabel(r"Vertical gain $K_z$ [m/s]")
+    else:
+        ax.tick_params(labelleft=False)
 
-# Exponential descent
-z_t = z0 * np.exp(-omega * t)
+    ax.grid(True, axis="y", color="0.9", linewidth=0.4)
+    ax.set_axisbelow(True)
+    # ax.text(0.04, 0.93, title, transform=ax.transAxes,
+    #         fontsize=style.BASE_FONT_PT - 1, va="top")
 
-# Gains as functions of time
-k_min_t = 1 * np.ones_like(t)
-k_z_t = 26 * z_t
-k_floor = max(0.8*k_intersection_osci, k_min_s)
-k_z_prog = lambda time : np.maximum(k_exp*np.exp(-omega*time), k_floor)
 
-# Important times
-t_hcrit = np.log(z0 / h_crit) / omega
-# t_intersection_stable = np.log(z0 / z_intersection_stable) / omega
-# t_intersection_osci = np.log(z0 / z_intersection_stable) / omega
+def main() -> None:
+    style.use_ieee_style()
+    width = style.COLUMN_WIDTH_IN
+    fig, axes = plt.subplots(1, 2, figsize=(width, width * 0.46),
+                             sharey=True)
 
-fig_time, ax = plt.subplots(figsize=(8, 5))
+    draw_panel(axes[0], D_MAX_CALM, "(a) afforded", show_ylabel=True, show_schedule=False)
+    draw_panel(axes[1], D_MAX_SEVERE, "(b) refused", show_ylabel=False,
+               show_schedule=False)
 
-ax.plot(t, k_min_t, label="Gain minimal", color='b')
-ax.plot(t, k_z_t/2, label="Gain maximal - sans oscillations", color='g')
-ax.plot(t, k_z_t, label="Gain maximal - stable", color='r')
-ax.plot(t, k_z_prog(t), label="Gain programmé - k_z(t)", linestyle='--', color='c')
+    # Inline labels instead of a legend: at this width a legend box costs
+    # more area than the curves it explains. Positions are chosen to sit in
+    # gaps between curves; re-check them if the configuration changes.
+    small = style.BASE_FONT_PT - 1.5
+    axes[0].text(0.205, 7.15, r"$K^{\max}$", color=C_STABILITY, fontsize=small)
+    axes[0].text(0.315, 2.0, "no osc.", color=C_NO_OSCILLATION, fontsize=small)
+    axes[0].text(0.25, 6.1, "stable w/ osc.", color=C_STABLE, fontsize=small)
+    axes[0].text(0.315, 0.35, r"$K^{\min}$", color=C_FLOOR, fontsize=small)
+    # axes[0].text(0.275, 2.15, "schedule", color=C_SCHEDULE, fontsize=small)
+    axes[0].text(0.196, 1.22, r"$\rho\leq1$", color="0.25", fontsize=small)
+    axes[1].text(0.195, 0.35, r"$h_{\rm gear}$", color="0.35", fontsize=small)
+    axes[1].text(0.245, 6.25, "region empty", color=C_FLOOR, fontsize=small)
 
-ax.axvline(
-    t_hcrit,
-    linestyle="--",
-    label="Passage hauteur train d'atterrissage"
-)
+    fig.get_layout_engine().set(wspace=0.02)
+    plt.show()
+    style.save(fig, "gain_window.pdf")
 
-ax.scatter(t_hcrit, k_intersection_osci, zorder=5, color='g')
-ax.scatter(t_hcrit, k_intersection_stable, zorder=5, color='r')
 
-ax.text(
-    t_hcrit + 0.15,
-    k_intersection_stable + 0.5,
-    f"Gain max stabilité \nk_z= {k_intersection_stable:.2f} s"
-)
-
-ax.text(
-    t_hcrit + 0.15,
-    k_intersection_osci - 0.1,
-    f"Gain max sans oscillations\nk_z = {k_intersection_osci:.2f} s"
-)
-
-ax.set_xlabel("Temps [s]")
-ax.set_ylabel("Gain k")
-ax.set_title("Évolution du gain en fonction du temps")
-ax.set_xlim(0, 8)
-ax.set_ylim(0, 35)
-ax.grid(True)
-ax.legend()
-
-plt.tight_layout()
-plt.show()
+if __name__ == "__main__":
+    main()

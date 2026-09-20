@@ -56,18 +56,16 @@ def run(routine, inputs, *, just_entered: bool = False) -> MissionControl:
             ceiling_margin=routine._ceiling_margin,
             descend_start_gain=routine._compute_probe_gain(),
             near_field_height_m=routine._near_field_height,
+            impose_ceiling_floor=routine._enable_commit_gate,
         )
         routine._compute_lateral_gates()
         routine._refresh_tracking_gate()
-
-        vertical_ok = routine.vertical_landing_feasible
-        roll_ok = routine.roll_landing_feasible
-        pitch_ok = routine.pitch_landing_feasible
+        routine._verdict_reached = True
 
         if routine._probe_only:
             routine._substate = PROBE_HOLD
             return probe_hold.run(routine, inputs, just_entered=True)
-        if vertical_ok and roll_ok and pitch_ok and routine._enable_descent:
+        if routine._enable_descent and routine._commit_gate_permits_descent():
             # FINAL_PROBE has kept the static term live. Commit its CURRENT
             # value only after every feasibility gate has passed; DESCENT starts
             # from that exact point and may keep adapting it slowly online.

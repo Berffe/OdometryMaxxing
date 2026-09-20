@@ -15,6 +15,10 @@ Diagrams are shipped both inline (as Mermaid blocks) and as standalone `.mermaid
 > wind-rejection work. Three ideas it previously documented were **abandoned**,
 > not merely retuned — see §7.8–§7.11. If you remember the old behaviour, read
 > those four entries first; the rest of the document assumes the new one.
+>
+> **Campaign-automation revision.** Every run now ends by itself. `INFEASIBLE`
+> became a terminal outcome, CENTER and APPROACH gained operational gates that
+> end a stuck run, and the commit gate gained an ablation switch. See §9.
 
 ---
 
@@ -319,6 +323,9 @@ conceptual lives here.
 | `on_control_timer` | executor | **The main loop** — mission tick → effects → control law → log row |
 | `on_px4_timer` | executor | Apply the sequencer's setpoint policy and publish |
 | `_announce_mission_substate` | executor | Log a mission phase transition exactly once |
+| `_apply_terminal_request` | executor | Latch the outcome a phase asked for |
+| `_record_outcome` | executor | Freeze the campaign record for the run |
+| `_arm_shutdown` | executor | Schedule the process exit; first arming wins |
 | `close` | shutdown | Stop MAVSDK, stop vision worker/thread, close CSVs |
 
 **The effects table** (`self._control_effects`) is the one place mission events map to
@@ -331,6 +338,12 @@ control-law side effects:
 
 A phase *declares* the effect it wants; the node just applies whatever it is handed. It
 does not know — and must not know — which phase wants which effect.
+
+**The terminal request** is the same idea pointing the other way. A phase that
+decides the run is over returns a `TerminalRequest(outcome, reason)` on its
+`MissionControl`; the node latches the sequencer, stops the motors and arms the
+shutdown. The phase owns the decision and the reason, the node owns what ending
+a run *means*, and neither carries a table of the other's phase names. See §9.
 
 **The atomic bundle.** `_latest_vision_bundle` is a single tuple, replaced wholesale by
 the drain thread. This prevents a control tick from pairing a *new* target with an *old*
@@ -728,21 +741,28 @@ stateDiagram-v2
     }
 
     final_probe --> probe_hold: probe_only
-    final_probe --> descend: all axes feasible<br/>AND enable_descent<br/>[RESET_DIVERGENCE_INTEGRAL]
+    final_probe --> descend: all axes feasible<br/>AND enable_descent<br/>OR commit gate disabled<br/>[RESET_DIVERGENCE_INTEGRAL]
     final_probe --> infeasible: any axis rejected
 
     descend --> landed: node latches<br/>(truth contact)
     probe_hold --> landed: node latches
-    infeasible --> landed: node latches
 
-    center --> aborted: node latches
-    approach_probe --> aborted: node latches
+    center --> aborted: CENTER timeout<br/>OR node latches
+    approach_probe --> aborted: APPROACH timeout<br/>OR node latches
     final_probe --> aborted: node latches
     descend --> aborted: node latches
 
     landed --> [*]
+    infeasible --> [*]
     aborted --> [*]
 ```
+
+**Three outcomes, three terminals.** `landed`, `infeasible` and `aborted` are
+the run's status, and they are deliberately not two. `infeasible` means the
+gates ran on fresh FINAL_PROBE evidence and refused; `aborted` means the flight
+stopped before any verdict was possible. A run that never centred is not a
+refusal, and counting it as one inflates the refusal rate with cases the
+feasibility test never evaluated.
 
 | Substate | Terminal | `D*` | `k` | Notes |
 |---|---|---|---|---|
@@ -751,22 +771,29 @@ stateDiagram-v2
 | `final_probe` | no | flat 0 | flat `k_probe` | The measurement that decides everything. Lateral P is exactly 0 from its first tick |
 | `probe_hold` | no | 0 | `k_probe` | `probe_only` mode — hold indefinitely |
 | `descend` | no | ramp → `d_star` | scheduled per-axis | Commitment already made |
-| `infeasible` | no | 0 | `k_probe` | **Active visual hover**, not a freeze |
-| `landed` | **yes** | 0 | `None` | Latched by the node |
-| `aborted` | **yes** | 0 | `None` | Latched by the node |
+| `infeasible` | **yes** | 0 | `k_probe` | The refusal. Active visual hover for the shutdown grace, not a freeze |
+| `landed` | **yes** | 0 | `None` | Latched by the node on truth contact |
+| `aborted` | **yes** | 0 | `None` | Operational failure before any verdict |
 
 `landed` and `aborted` emit `thrust_gain_override = None` on purpose — "no opinion". The
 node is publishing its own zero-thrust / neutral hold by then, so any number here would be
 a fiction that shows up only in the log and the gain-schedule plot.
 
-`infeasible` is **not** a freeze and **not** an abort: `MissionRoutine` latches an active
-visual hover with `D*=0` and a near-field-admissible gain, and `bee_node` keeps running
-the normal control path. This preserves vertical platform tracking and lateral damping.
+`infeasible` is **not** a freeze and **not** an abort. It latches an active
+visual hover with `D*=0` and a near-field-admissible gain, and `bee_node` keeps
+running the normal control path through the shutdown grace, which preserves
+vertical platform tracking and lateral damping while the run winds up.
 
-One caveat worth knowing about `infeasible` and `probe_hold`: both fly
-`lateral_p_scale = 0` with the **frozen** static wind term, and neither adapts it.
-That is correct for seconds and questionable for minutes — see
-`docs/CODE_REVIEW.md` §3.
+It is now **terminal**, and that flag does real work: `mark_aborted` refuses to
+overwrite a terminal substate, so a target lost while the refusal is being flown
+out cannot relabel a refusal as an abort. `test_a_refusal_cannot_be_relabelled_as_an_abort`
+pins it.
+
+One caveat that used to matter more: `infeasible` and `probe_hold` both fly
+`lateral_p_scale = 0` with the **frozen** static wind term and neither adapts
+it. That is correct for seconds and questionable for minutes — and `infeasible`
+is now bounded by `terminal_shutdown_grace_sec`, so only `probe_hold` still
+holds it indefinitely. See `docs/CODE_REVIEW.md` §3.
 
 ### 4.3 Dispatch
 
@@ -1267,6 +1294,199 @@ The preserving path in `retune()` still exists and is still correct in
 isolation, but has no live caller. Its docstring now says so, rather than
 describing a handoff that no longer happens.
 
+---
+
+## Part 9 — Ending a run without an operator
+
+The campaign is ~230 runs. Every one of them has to start, decide and stop by
+itself, so the controller owns three things it previously left to a human: a
+three-way outcome, gates that end a stuck run, and a process exit.
+
+### 9.1 The three outcomes
+
+```
+landed      contact confirmed from Gazebo truth
+infeasible  reached FINAL_PROBE, the gates evaluated, the verdict was false
+aborted     the flight stopped before any verdict was possible
+```
+
+The status is the **mission substate**, not the controller phase. The outer
+`FlightSequencer` still has two terminals (`landed` / `aborted`), because from
+the PX4 lifecycle's point of view a refusal and an operational failure end the
+same way — offboard stops, the motors stop. The distinction is a mission-level
+claim, so it lives in the mission-level column.
+
+`aborted` additionally reports `abort_phase`: the substate that was running
+when the run ended, which is what separates a target lost during CENTER from
+one lost during the descent.
+
+### 9.2 How a phase ends a run
+
+A terminal phase returns a `TerminalRequest(outcome, reason)` on its
+`MissionControl`, alongside `effects`. `bee_node._apply_terminal_request` reads
+it, latches the sequencer, and arms the shutdown.
+
+This is the same seam as `ControlEffect` and exists for the same reason. The
+alternative — a node-side table mapping phase names to shutdown behaviour —
+would put mission vocabulary back inside `bee_node`, which is what §8's first
+rule of thumb forbids. Adding a terminal phase requires no edit there.
+
+Both entry paths converge:
+
+| Path | Who decides | Route |
+|---|---|---|
+| Mission-detected | the phase (`routine.abort`, or FINAL_PROBE's verdict) | `TerminalRequest` → `_apply_terminal_request` → `sequencer` |
+| Node-detected | the node (target timeout, offboard dropout, MAVSDK failure) | `sequencer.abort` → `_on_aborted` → `mark_aborted` |
+
+`_on_landed` / `_on_aborted` are where both meet, so `_record_outcome` and
+`_arm_shutdown` are called exactly once regardless of who started it.
+
+### 9.3 The operational gates
+
+Two phases could previously hover forever on a perfectly valid target:
+
+| Gate | Knob | Ends as |
+|---|---|---|
+| CENTER never converged | `center_timeout_sec`, `center_timeout_aborts` | `aborted`, `abort_phase=center` |
+| APPROACH never reached the visual-height hold | `approach_timeout_sec`, `approach_timeout_aborts` | `aborted`, `abort_phase=approach_probe` |
+
+`center_timeout_allows_handoff` still wins if it is set: a timeout that is
+allowed to hand off does, and only an expiry with no handoff terminates. Both
+timeouts are stuck-run detectors, not performance bounds — set them generously.
+
+### 9.4 Shutdown
+
+`_arm_shutdown` records a deadline; the supervisor timer calls
+`rclpy.shutdown()` when it passes, and `main()`'s `finally` runs `close()`.
+A crash therefore reaches the same teardown as a clean end.
+
+| Outcome | Grace | Why |
+|---|---|---|
+| `landed` | `post_landing_shutdown_sec` (5.0) | Truth packets are still arriving; the post-touchdown rows are the contact-velocity evidence |
+| `infeasible` / `aborted` | `terminal_shutdown_grace_sec` (2.0) | Nothing left to record — just flush the CSVs and let the motor stop land |
+
+**Dead runs end in the air.** `enable_terminal_motor_stop` stops the motors on
+`infeasible` and `aborted` so PX4 disarms and the next run starts against a
+clean SITL rather than one still hovering under a failsafe. This is a **tester**
+policy and is deliberately not a landing strategy: a real system would command
+a descent here. Revisit it once the gates themselves are validated.
+
+### 9.5 The commit-gate ablation
+
+`enable_commit_gate = False` is the paired control for the campaign's severe
+condition. It disables **only the commit decision**:
+
+- the probes still run, and `peak_accel` is unchanged;
+- `k_min` is still computed and **still imposed** as the descent floor;
+- every gate verdict is still evaluated, attributed to an axis and a criterion,
+  and logged;
+- the descent proceeds regardless.
+
+Two things about it are easy to get wrong, and both are test-pinned.
+
+**The floor clamp has to be released with it.** Normally
+`k_floor = min(max(k_min, k_target), k_start)`, because the descent schedule is
+a monotone decay from the FINAL_PROBE gain. In a severe run `k_min` is *above*
+`k_start`, so keeping that clamp would return the gated schedule in exactly the
+cases the ablation exists to expose, and the paired comparison would show
+nothing. `impose_ceiling_floor=False` sets `k_floor = k_min` outright, which is
+a gain **step up** at descent entry rather than a decay. That is the intended
+reading of "K_min is still imposed". `test_gate_off_imposes_k_min_above_the_ceiling`.
+
+**The probe gain stays ceiling-limited in both arms.** `_compute_probe_gain()`
+is untouched by the flag. Probing above the ceiling feeds self-induced
+oscillation into `peak_accel` (§5.4), which is the one number the two arms are
+compared on — releasing it there would corrupt the measurement instead of
+testing the decision. `test_gate_off_does_not_change_the_probe_gain`.
+
+### 9.6 rho
+
+`rho = k_min / k_ceiling_leg` is the dimensionless margin at landing-gear
+height: afforded when `rho <= 1`, region empty when `rho > 1`. It is computed
+per axis from fields `GateResult` already carried, so it is plumbing rather than
+new maths, and it is reported on **every** verdict rather than only refusals so
+the two conditions stay comparable. An unmeasurable ceiling reports `inf`, never
+a number that would read as a comfortable margin.
+
+`predicted_crossing_height` is `gate.h_crit`, which was already logged as
+`h_crit_m`. In a gate-off run it is the height at which the flown gain crosses
+the ceiling, so it can be compared directly against the height at which
+oscillation is observed.
+
+### 9.7 The outcome record
+
+A fourth file joins the three CSVs: `bee_outcome_<runid>.json`, written by
+`DiagnosticsWriter.write_outcome` and sharing their run id.
+
+It is JSON and not a fourth CSV because the cardinality differs. The three CSVs
+are time series — one row per control tick, per truth packet, per wind packet.
+This is one verdict per run, and the campaign runner reads it programmatically:
+resumability is keyed on whether it exists.
+
+**It is written in two passes, and the controller only writes the first.**
+
+| Pass | Written by | Fields |
+|---|---|---|
+| Controller | `bee_node.close()` | status, `abort_phase`, reason, `verdict_reached`, refusal attribution, rho per axis, `predicted_crossing_height_m`, the probed envelope, `k_min` / `k_floor` / `k_ceiling_leg` |
+| Offline | the post-run pass (not written yet) | `contact_v_vertical`, `contact_v_lateral_rel`, `true_peak_rel_accel`, `measured_T` |
+
+Splitting it this way keeps the node's "no physical truth enters the
+controller" property: computing contact velocities in flight would mean keeping
+a rolling buffer of truth rows and doing physics on them mid-loop, for numbers
+nobody reads until the campaign is over. The record carries `controller_csv`,
+`truth_csv` and `wind_csv`, so the offline pass finds its inputs from the record
+itself rather than by reconstructing filenames.
+
+`postprocessed: false` marks the controller's half. **The runner must treat a
+record with `postprocessed: false` as complete enough to skip on resume** —
+otherwise a campaign that dies between the two passes re-runs everything it had
+already flown.
+
+Three details that are load-bearing:
+
+- **Written in `close()`, which runs in `main()`'s `finally`.** A run that dies
+  mid-flight still produces a record, with `status: "crashed"`. A directory with
+  no record therefore means the run never started, which is a different repair.
+  `timeout` is not ours to report: a run the harness had to kill never reaches
+  this code.
+- **Written atomically** — temporary file then `os.replace`. A partial record
+  left by a crash mid-write would look finished to the resume check and the run
+  would be skipped forever.
+- **`rho` is legitimately `inf`** when the ceiling is unmeasurable, and NaN
+  reaches these fields from any unseeded estimator. `json.dump` emits both as
+  bare `Infinity` / `NaN`, which strict parsers reject, so non-finite floats are
+  written as `null` and `allow_nan=False` makes anything missed raise loudly.
+
+**Refusal attribution is guarded on `verdict_reached`.** The gate results are
+default-constructed until FINAL_PROBE evaluates them, and their booleans default
+to False — so an unguarded read reports a full set of rejections for a run the
+gates never saw. An aborted run reports `refusal_criteria: null`. This is the
+same counter contamination the three-way outcome exists to prevent, one layer
+down. `test_an_abort_contributes_no_refusal_reasons` pins it.
+
+### 9.8 The campaign CLI
+
+`bee_node` takes three arguments; everything else stays in `core/config.py`.
+
+| Flag | Effect |
+|---|---|
+| `--outdir DIR` | Where the three CSVs and the outcome record go. Default `logs`. |
+| `--gate on\|off` | `off` disables the COMMIT decision only — see §9.5. |
+| `--seed N` | Recorded in the outcome record; does not alter the controller. |
+
+The seed is recorded rather than used: the scenario is baked into the world
+file before the node starts, so the seed's only job here is to name the
+scenario that produced a given outcome.
+
+The automation that drives all three lives in `controller/automation/`; see
+`README_automation.md` there.
+
+### 9.9 What is still missing
+
+The offline pass that fills the truth-derived fields of the outcome record
+(`contact_v_vertical`, `contact_v_lateral_rel`, `true_peak_rel_accel`,
+`measured_T`) from the truth and controller CSVs.
+
 ## Part 8 — "I want to change X" → edit this
 
 | I want to… | Edit | Also touch |
@@ -1299,6 +1519,11 @@ describing a handoff that no longer happens.
 | **Change the commanded-wind layout** | `diagnostics/wind_layout.py` | the WindController plugin — they share this |
 | **Change ROS topics / QoS** | `core/config.py` (`TopicsConfig`) / `bee_node.__init__` | — |
 | **Change timer rates** | `core/config.py` (`SchedulingConfig`) | — |
+| **Change how a run ends** | the terminal phase file (`aborted.py` / `infeasible.py` / `landed.py`) | `core/config.py` for the grace periods |
+| **Add a terminal outcome** | `mission/phases/<n>.py` with `terminal=True` and a `TerminalRequest` | **nothing in `bee_node`** |
+| **Change an operational gate** | the phase that owns it (`center.py` / `approach_probe.py`) | `core/config.py` §2/§3 for its timeout |
+| **Change what the ablation disables** | `MissionRoutine._commit_gate_permits_descent` | `gates.py` `impose_ceiling_floor` if the floor also moves |
+| **Add a field to the campaign record** | `bee_node._record_outcome` | — |
 | **Add a regression test** | `tests/test_contracts.py` | — |
 
 ### Two rules of thumb
@@ -1336,15 +1561,15 @@ describing a handoff that no longer happens.
 | `mission/trim.py` | 125 | `VisualTrim`: slow image equilibrium vs. live residual |
 | `mission/schedule.py` | 118 | `k(t)`, `critical_time`, `predicted_height` |
 | `mission/math_utils.py` | 31 | `clamp`, `raised_cosine01`, `G_ACCEL`, `blank` |
-| `mission/phases/center.py` | 238 | Visual hover until centred and settled; learns the adaptive centre |
-| `mission/phases/approach_probe.py` | 190 | Far-field descent + visual-height hold; probes build envelopes |
+| `mission/phases/center.py` | 265 | Visual hover until centred and settled; learns the adaptive centre; timeout gate |
+| `mission/phases/approach_probe.py` | 258 | Far-field descent + visual-height hold; probes build envelopes; timeout gate |
 | `mission/phases/descend.py` | 167 | Scheduled-gain descent, per-axis |
 | `mission/phases/final_probe.py` | 103 | Near-field hold; the verdict and three-way handoff |
-| `mission/phases/infeasible.py` | 86 | Active hover after rejection + structured reason |
+| `mission/phases/infeasible.py` | 100 | **Terminal.** The refusal: active hover + structured reason + rho |
 | `mission/phases/__init__.py` | 72 | The phase registry |
-| `mission/phases/aborted.py` | 62 | Terminal, latched by the node |
+| `mission/phases/aborted.py` | 67 | Terminal. Operational failure before any verdict |
 | `mission/phases/probe_hold.py` | 62 | `probe_only` mode |
-| `mission/phases/landed.py` | 60 | Terminal, latched by the node |
+| `mission/phases/landed.py` | 64 | Terminal, latched by the node on truth contact |
 | `control/control_law.py` | 632 | Acceleration-domain visual PD + allocation |
 | `interfaces/mavsdk_worker.py` | 402 | Takeoff + terminal motor stop |
 | `interfaces/flight_sequencer.py` | 276 | Outer lifecycle + setpoint authority |
@@ -1353,7 +1578,7 @@ describing a handoff that no longer happens.
 | `diagnostics/truth_layout.py` | 116 | Gazebo truth field layout |
 | `diagnostics/telemetry.py` | 102 | The `TelemetrySource` contract |
 | `diagnostics/wind_layout.py` | 38 | Commanded-wind field layout |
-| `tests/test_contracts.py` | 1163 | ROS-free contract regression tests |
+| `tests/test_contracts.py` | 1700 | ROS-free contract regression tests |
 | `tests/_optical_flow_debug.py` | ~780 | Divergence-reduction bench, synthetic scene, analytic truth |
 | `tests/_optFlow_targetAcqu_debug.py` | ~600 | End-to-end detector -> ROI -> flow, scored under FOV saturation |
 | `tests/_divergence_estimators.py` | ~430 | The seven reductions + shared comparison rendering |
@@ -1380,6 +1605,8 @@ makes it easy to miss. `find_packages()` fixes it, provided every folder has an
 | Clock | `SteadyWallClock` survives a backward step; PX4 stamps stay monotonic across one; steps reach the log |
 | Wind trim | Feedforward is exactly zero until FINAL_PROBE; the seed comes from the passive APPROACH probe mean; the bias tracks the realized command at the configured `tau`; it holds outside the phase and on missing visual evidence; it cannot leave the APPROACH-seeded neighbourhood; DESCENT starts from the exact FINAL_PROBE value and shares that one neighbourhood |
 | Adaptive centre | The learned bias recentres while preserving the steady P error; large flow slows adaptation; the bias keeps adapting through APPROACH; it is not inverse-P-scaled; no acceleration feedforward leaks into the far field |
+| Terminals | The three outcomes are distinct; every terminal phase asks the node to end the run; a refusal cannot be relabelled an abort; CENTER and APPROACH timeouts end as `aborted` with the right `abort_phase` |
+| Ablation | Gate-off imposes `k_min` above the ceiling instead of returning the clamped schedule; the verdict survives it so runs can be paired; the probe gain is unchanged; `rho` is the reported ratio and reports `inf` on an unmeasurable ceiling |
 | Trim | The handoff trim admits no APPROACH-era sample; an unseeded trim cannot satisfy a gate and survives a dropout; every trim knob is a reachable config field |
 
 If you change a seam, one of these should fail. If none do, the seam probably wasn't

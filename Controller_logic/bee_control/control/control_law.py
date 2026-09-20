@@ -137,7 +137,7 @@ class ControlLaw:
         # (hypot of both axes), not separate per-axis thresholds, since "close
         # to centered" is inherently a 2D notion -- this keeps roll/pitch
         # scaled down together rather than asymmetrically.
-        large_offset_gain_scale: float = 0.45,   # multiplier applied at/beyond large_offset_threshold
+        large_offset_gain_scale: float = 0.40,   # multiplier applied at/beyond large_offset_threshold
         small_offset_threshold: float = 0.15,    # |offset| below this: FULL gain (scale=1.0)
         large_offset_threshold: float = 0.55,    # |offset| at/above this: large_offset_gain_scale
 

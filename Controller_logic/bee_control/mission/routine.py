@@ -168,6 +168,12 @@ class MissionRoutine:
         self._leg_clearance = float(cfg.leg_clearance_m)
         self._enable_descent = bool(cfg.enable_descent)
         self._probe_only = bool(cfg.probe_only)
+        # The ablation switch. False keeps the probe, k_min and every gate
+        # computation intact and logged, and descends anyway -- see
+        # _commit_gate_permits_descent().
+        self._enable_commit_gate = bool(cfg.enable_commit_gate)
+        self._approach_timeout = max(0.0, float(cfg.approach_timeout_sec))
+        self._approach_timeout_aborts = bool(cfg.approach_timeout_aborts)
 
         self._safety = max(1e-3, min(1.0, float(cfg.ceiling_safety_factor)))
         self._initial_thrust_gain = max(0.0, float(cfg.initial_thrust_gain))
@@ -191,6 +197,7 @@ class MissionRoutine:
         self._center_offset_radius_max = max(0.0, float(cfg.center_offset_radius_max))
         self._center_flow_radius_max = max(0.0, float(cfg.center_flow_radius_max_norm_s))
         self._center_timeout_allows_handoff = bool(cfg.center_timeout_allows_handoff)
+        self._center_timeout_aborts = bool(cfg.center_timeout_aborts)
 
         # Trim-aware CENTER gate. These are declared MissionConfig fields; they
         # used to be read with getattr() defaults, which silently made them
@@ -417,9 +424,42 @@ class MissionRoutine:
         self._t_descend_start: Optional[float] = None
         self._t_landed: Optional[float] = None
         self._t_aborted: Optional[float] = None
+        self._terminal_reason = ""
+        self._terminal_origin_substate = ""
+        self._verdict_reached = False
         self.last_control = MissionControl(substate=self._substate)
 
-    def mark_landed(self, t: float) -> None:
+    # ------------------------------------------------------------- terminals
+    @property
+    def terminal_reason(self) -> str:
+        """Why the run ended, in the words of whoever ended it."""
+        return self._terminal_reason
+
+    @property
+    def terminal_origin_substate(self) -> str:
+        """The substate that was running when the run ended.
+
+        For an ABORTED run this is the campaign's ``abort_phase``: it separates
+        a target lost during CENTER from one lost during the descent, which the
+        terminal substate alone cannot.
+        """
+        return self._terminal_origin_substate
+
+    def abort(self, inputs: MissionInputs, reason: str) -> MissionControl:
+        """Latch ABORTED from inside a phase and return its first control.
+
+        The mirror of the FINAL_PROBE -> INFEASIBLE handoff: the phase that
+        detects the failure owns the decision, records why, and hands back a
+        control that already belongs to the terminal phase.
+        """
+        if self._substate not in TERMINAL_SUBSTATES:
+            self._terminal_origin_substate = self._substate
+            self._terminal_reason = str(reason)
+            self._substate = ABORTED
+            self._t_aborted = float(inputs.t)
+        return phases.aborted.run(self, inputs, just_entered=True)
+
+    def mark_landed(self, t: float, reason: str = "") -> None:
         """Latch the terminal LANDED substate. Called by bee_node when its own
         touchdown detector fires (_enter_landed_phase).
 
@@ -433,8 +473,12 @@ class MissionRoutine:
         """
         if self._substate == LANDED:
             return
+        self._terminal_origin_substate = self._substate
+        self._terminal_reason = str(reason)
         self._substate = LANDED
         self._t_landed = float(t)
+        self.last_control = phases.landed.run(
+            self, self._terminal_inputs(float(t)), just_entered=True)
 
     @staticmethod
     def _terminal_inputs(t: float) -> MissionInputs:
@@ -520,6 +564,9 @@ class MissionRoutine:
         self._t_descend_start = None
         self._t_landed = None
         self._t_aborted = None
+        self._terminal_reason = ""
+        self._terminal_origin_substate = ""
+        self._verdict_reached = False
         self.last_control = MissionControl(substate=self._substate)
 
     def start(self, t: float, start_height_m: float) -> None:
@@ -532,7 +579,7 @@ class MissionRoutine:
     def substate(self) -> str:
         return self._substate
 
-    def mark_aborted(self, t: float) -> None:
+    def mark_aborted(self, t: float, reason: str = "") -> None:
         """Latch the terminal ABORTED substate.
 
         The mission cannot detect an abort itself -- loss of target, an offboard
@@ -550,6 +597,8 @@ class MissionRoutine:
         # is covered by adding it to phases/, not by editing this tuple.
         if self._substate in TERMINAL_SUBSTATES:
             return
+        self._terminal_origin_substate = self._substate
+        self._terminal_reason = str(reason)
         self._substate = ABORTED
         self._t_aborted = float(t)
         self.last_control = phases.aborted.run(
@@ -1646,6 +1695,7 @@ class MissionRoutine:
             stability_dt_sec=self._lateral_stability_dt,
             ceiling_safety_factor=self._safety,
             ceiling_margin=self._ceiling_margin,
+            impose_ceiling_floor=self._enable_commit_gate,
         )
         self.pitch_gate = compute_lateral_gate(
             peak_accel=self.pitch_probe_result.peak_accel,
@@ -1658,6 +1708,7 @@ class MissionRoutine:
             stability_dt_sec=self._lateral_stability_dt,
             ceiling_safety_factor=self._safety,
             ceiling_margin=self._ceiling_margin,
+            impose_ceiling_floor=self._enable_commit_gate,
         )
 
     def _feasibility_failures(self) -> list[tuple[str, str, str]]:
@@ -1722,6 +1773,78 @@ class MissionRoutine:
             ))
 
         return failures
+
+    # ------------------------------------------------------------------ rho
+    @staticmethod
+    def _rho(k_min: float, k_ceiling_leg: float) -> float:
+        """Dimensionless affordance margin at landing-gear height.
+
+        rho = K_min / K_max(h_gear). The landing is afforded on this axis when
+        rho <= 1: the disturbance-rejection floor still fits under the
+        sampled-data ceiling at the height the gear touches. An empty region
+        reports rho > 1, and an unmeasurable ceiling reports inf rather than a
+        number that would read as a comfortable margin.
+        """
+        ceiling = float(k_ceiling_leg)
+        if ceiling <= 1e-9:
+            return float("inf")
+        return float(k_min) / ceiling
+
+    @property
+    def vertical_rho(self) -> float:
+        return self._rho(self.gate.k_min, self.gate.k_ceiling_leg)
+
+    @property
+    def roll_rho(self) -> float:
+        return self._rho(self.roll_gate.k_min, self.roll_gate.k_ceiling_leg)
+
+    @property
+    def pitch_rho(self) -> float:
+        return self._rho(self.pitch_gate.k_min, self.pitch_gate.k_ceiling_leg)
+
+    def _commit_gate_permits_descent(self) -> bool:
+        """May FINAL_PROBE commit to a descent?
+
+        With the commit gate enabled this is the three-axis verdict. With it
+        disabled -- the ablation -- the verdict is still computed, still logged
+        and still attributed to an axis and a criterion; it simply does not
+        stop the descent. K_min remains imposed as the schedule floor, so the
+        run deliberately violates the sampled-data ceiling instead of flying an
+        unconstrained gain, which is what isolates the ceiling as the cause.
+        """
+        if not self._enable_commit_gate:
+            return True
+        return (
+            self.vertical_landing_feasible
+            and self.roll_landing_feasible
+            and self.pitch_landing_feasible
+        )
+
+    @property
+    def verdict_reached(self) -> bool:
+        """Did FINAL_PROBE ever evaluate the feasibility gates?
+
+        False for every run that ended before the near-field probe completed.
+        The gate results are default-constructed until that moment, and their
+        booleans default to False -- so anything reading them without this
+        guard reports a full set of rejections for a run the gates never saw.
+        """
+        return self._verdict_reached
+
+    @property
+    def refusal_criteria(self) -> str:
+        """Which feasibility criteria rejected, ``|``-separated.
+
+        Empty when no verdict was reached, so an aborted run cannot contribute
+        rejection reasons to the campaign record. Public because that record
+        needs it and ``bee_node`` must not reach past the mission's seam.
+        """
+        return self._failed_criteria() if self._verdict_reached else ""
+
+    @property
+    def refusal_axes(self) -> str:
+        """Which controlled axes rejected, ``|``-separated. Empty with no verdict."""
+        return self._failed_axes() if self._verdict_reached else ""
 
     def _gate_failure_reasons(self) -> list[str]:
         """Human-readable axis + criterion strings for console/CSV logging."""
