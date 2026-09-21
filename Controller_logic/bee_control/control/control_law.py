@@ -40,6 +40,7 @@ that tilt compensation is not lost by independent output filtering.
 import math
 from typing import Optional
 
+from bee_control.core.config import ControlConfig
 from bee_control.core.state import AttitudeSetpoint, FlowResult, TargetEstimate
 # Standard gravity: converts between normalized collective thrust and world-
 # vertical acceleration for the Herisse/de Croon accel-domain thrust law.
@@ -136,10 +137,12 @@ class ControlLaw:
         # derivative-discontinuity kick). Uses the RADIAL offset magnitude
         # (hypot of both axes), not separate per-axis thresholds, since "close
         # to centered" is inherently a 2D notion -- this keeps roll/pitch
-        # scaled down together rather than asymmetrically.
-        large_offset_gain_scale: float = 0.40,   # multiplier applied at/beyond large_offset_threshold
+        # axes symmetric while allowing P and D to retain different fractions
+        # of their nominal authority at large offsets.
+        large_offset_p_gain_scale: float = ControlConfig().large_offset_p_gain_scale,
+        large_offset_d_gain_scale: float = ControlConfig().large_offset_d_gain_scale,
         small_offset_threshold: float = 0.15,    # |offset| below this: FULL gain (scale=1.0)
-        large_offset_threshold: float = 0.55,    # |offset| at/above this: large_offset_gain_scale
+        large_offset_threshold: float = 0.55,    # |offset| at/above this: P/D floors above
 
         # --- Thrust axis. ---
         thrust_integral_gain_const: float = 0.1,
@@ -159,7 +162,7 @@ class ControlLaw:
         roll_limit: float = 0.20,
         pitch_limit: float = 0.20,
         thrust_min: float = 0.57,
-        thrust_max: float = 0.90,
+        thrust_max: float = 1.00,
         roll_output_sign: float = 1.0,
         pitch_output_sign: float = 1.0,
         
@@ -177,7 +180,8 @@ class ControlLaw:
         self._pitch_kp = float(pitch_kp)
         self._pitch_kd = float(pitch_kd)
 
-        self._large_offset_gain_scale = max(0.0, float(large_offset_gain_scale))
+        self._large_offset_p_gain_scale = max(0.0, float(large_offset_p_gain_scale))
+        self._large_offset_d_gain_scale = max(0.0, float(large_offset_d_gain_scale))
         self._small_offset_threshold = max(0.0, float(small_offset_threshold))
         self._large_offset_threshold = max(
             self._small_offset_threshold + 1e-6, float(large_offset_threshold)
@@ -386,18 +390,18 @@ class ControlLaw:
                 else float(pitch_gain_blend_setpoint)
             )
             # ``apply_offset_gain_blend`` is the master switch. When the caller
-            # turns the blend off, the multiplier is exactly 1.0 and BOTH
+            # turns the blend off, both multipliers are exactly 1.0 and BOTH
             # lateral branches keep the scales that were commanded -- the
             # references computed just above are then unused, which is fine:
             # computing them unconditionally keeps this branch free of a second
             # code path that could drift from the first.
-            err_scale = (
-                self._centring_error_gain_scale(
+            p_err_scale, d_err_scale = (
+                self._centring_error_gain_scales(
                     offset_x - blend_roll_reference,
                     offset_y - blend_pitch_reference,
                 )
                 if bool(apply_offset_gain_blend)
-                else 1.0
+                else (1.0, 1.0)
             )
             roll_p = max(0.0, float(
                 lateral_p_scale if roll_p_scale is None else roll_p_scale
@@ -416,7 +420,7 @@ class ControlLaw:
             # compound P+D request out of the collapsing-gain part of the angle
             # soft limit.  That transient belongs to CENTER, so CENTER is the
             # only phase that now passes ``apply_offset_gain_blend=True``;
-            # everywhere else ``err_scale`` is pinned at 1.0 above and the two
+            # everywhere else both offset scales are pinned at 1.0 above and the two
             # ``attenuate_d`` branches below are inert.
             #
             # Whether it also attenuates D is the CALLER's decision, not an
@@ -435,12 +439,12 @@ class ControlLaw:
             roll_p_active = roll_p > 1e-12
             pitch_p_active = pitch_p > 1e-12
             attenuate_d = bool(scale_lateral_d_with_offset)
-            roll_p *= err_scale
-            pitch_p *= err_scale
+            roll_p *= p_err_scale
+            pitch_p *= p_err_scale
             if roll_p_active and attenuate_d:
-                roll_d *= err_scale
+                roll_d *= d_err_scale
             if pitch_p_active and attenuate_d:
-                pitch_d *= err_scale
+                pitch_d *= d_err_scale
 
             roll_accel_cmd = float(roll_accel_feedforward_m_s2) + (
                 self._roll_output_sign * -(
@@ -669,17 +673,15 @@ class ControlLaw:
         w = self._raw_divergence_weight
         return (1.0 - w) * filtered + w * raw
 
-    def _centring_error_gain_scale(
+    def _centring_error_gain_scales(
         self, roll_centring_error: float, pitch_centring_error: float
-    ) -> float:
-        """1.0 (full gain) when the radial CENTRING ERROR is small; falls to
-        large_offset_gain_scale as it grows past small_offset_threshold,
-        reaching that floor at large_offset_threshold. Raised-cosine blend
-        (same shape/reasoning as the D* ramp): zero slope at both ends, no
-        derivative-discontinuity kick at either threshold. Applied to BOTH
-        lateral_p_scale and lateral_d_scale equally (compound pre-saturation
-        signal protection, not a P/D balance concern -- see compute()'s
-        docstring for that distinction) -- upstream of _soft_limit.
+    ) -> tuple[float, float]:
+        """Return the P and D large-offset blend multipliers.
+
+        Both are 1.0 while the radial CENTRING ERROR is small and follow the
+        same raised-cosine transition between the two offset thresholds. At
+        large offsets they reach independent floors: P can be softened more
+        strongly to limit capture overshoot while D keeps more damping authority.
 
         The argument is a CENTRING error, not a raw image offset and not
         necessarily the P error: the caller chooses the reference it is measured
@@ -687,13 +689,16 @@ class ControlLaw:
         constructor arguments; they bound this error."""
         err = math.hypot(float(roll_centring_error), float(pitch_centring_error))
         if err <= self._small_offset_threshold:
-            return 1.0
+            return 1.0, 1.0
         if err >= self._large_offset_threshold:
-            return self._large_offset_gain_scale
+            return self._large_offset_p_gain_scale, self._large_offset_d_gain_scale
+
         span = self._large_offset_threshold - self._small_offset_threshold
         frac = (err - self._small_offset_threshold) / span
         shaped = 0.5 * (1.0 - math.cos(math.pi * frac))
-        return 1.0 + (self._large_offset_gain_scale - 1.0) * shaped
+        p_scale = 1.0 + (self._large_offset_p_gain_scale - 1.0) * shaped
+        d_scale = 1.0 + (self._large_offset_d_gain_scale - 1.0) * shaped
+        return p_scale, d_scale
 
     @staticmethod
     def _soft_limit(value: float, limit: float) -> float:
