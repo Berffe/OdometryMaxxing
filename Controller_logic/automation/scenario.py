@@ -51,6 +51,12 @@ class WindSpec:
     axis_x: tuple = ()
     axis_y: tuple = ()
     axis_z: tuple = ()
+    # Explicit components written beside the synthesis: (amplitude, frequency,
+    # phase). The plugin sums both, so a seeded dominant gust can ride on top
+    # of the synthesised background turbulence.
+    gust_x: tuple = ()
+    gust_y: tuple = ()
+    gust_z: tuple = ()
 
 
 @dataclass(frozen=True)

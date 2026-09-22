@@ -155,9 +155,15 @@ def _set_wind(plugin, wind) -> None:
         f"{wind.mean_velocity[2]:.4f}")
     ET.SubElement(plugin, "max_wind_speed").text = f"{wind.max_wind_speed:.4f}"
 
-    for tag, spec in (("axis_x", wind.axis_x), ("axis_y", wind.axis_y),
-                      ("axis_z", wind.axis_z)):
+    for tag, spec, gusts in (("axis_x", wind.axis_x, wind.gust_x),
+                             ("axis_y", wind.axis_y, wind.gust_y),
+                             ("axis_z", wind.axis_z, wind.gust_z)):
         axis = ET.SubElement(plugin, tag)
+        for amplitude, frequency, phase in gusts:
+            component = ET.SubElement(axis, "component")
+            ET.SubElement(component, "amplitude").text = f"{amplitude:.6f}"
+            ET.SubElement(component, "frequency").text = f"{frequency:.6f}"
+            ET.SubElement(component, "phase").text = f"{phase:.6f}"
         if not spec:
             continue
         count, amp_lo, amp_hi, freq_lo, freq_hi = spec

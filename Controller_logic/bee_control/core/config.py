@@ -270,8 +270,8 @@ class ControlConfig:
 
     # Large-offset CENTER capture blend. P is softened more strongly to limit
     # overshoot, while D retains more authority to keep the transient damped.
-    large_offset_p_gain_scale: float = 0.60
-    large_offset_d_gain_scale: float = 0.70
+    large_offset_p_gain_scale: float = 0.55
+    large_offset_d_gain_scale: float = 0.75
 
 
 
@@ -506,7 +506,7 @@ class MissionConfig:
     # FINAL_PROBE resets all three acceleration probes before applying these
     # near-field constants, so no APPROACH envelope can enter a gate.
     near_probe_window_sec: float = 0.6 * PROBE_DESIGN_PERIOD_SEC
-    near_probe_decay_tau_sec: float = 7.0 * PROBE_DESIGN_PERIOD_SEC
+    near_probe_decay_tau_sec: float = 8.0 * PROBE_DESIGN_PERIOD_SEC
     near_probe_highpass_tau_sec: float = 4.0 * PROBE_DESIGN_PERIOD_SEC
 
     # --- Envelope protection ---
