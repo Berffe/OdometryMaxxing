@@ -31,7 +31,7 @@ cp -r /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Gazebo_defs/plugins/
 
 cp -r ~/PX4-Autopilot/BEE_LAND/controller/logs/* /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Flight_Analysis/logs/valid
 
-cp -r ~/PX4-Autopilot/BEE_LAND/controller/logs/smoke_20260920_211624/* /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Flight_Analysis/logs/smoke01
+cp -r ~/PX4-Autopilot/BEE_LAND/controller/logs/campaign_01/* /mnt/c/Users/Pipef/OneDrive/Academiques/Stage/CodeGit/Flight_Analysis/logs/campaign_01/
 ```
 
 Sometimes the environment needs to be rebuilt:

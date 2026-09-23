@@ -270,7 +270,7 @@ class ControlConfig:
 
     # Large-offset CENTER capture blend. P is softened more strongly to limit
     # overshoot, while D retains more authority to keep the transient damped.
-    large_offset_p_gain_scale: float = 0.55
+    large_offset_p_gain_scale: float = 0.70
     large_offset_d_gain_scale: float = 0.75
 
 
@@ -373,7 +373,7 @@ class MissionConfig:
     # underneath the vehicle.
     center_offset_radius_max: float = 0.05
     center_flow_radius_max_norm_s: float = 0.10
-    center_timeout_sec: float = 25.0
+    center_timeout_sec: float = 30.0
     # Timeout never hands off: do not leave CENTER merely because the clock
     # expired while the target is still moving / off-centre.
     center_timeout_allows_handoff: bool = False

@@ -295,7 +295,7 @@ class ControlLaw:
         roll_gain_blend_setpoint: Optional[float] = None,
         pitch_gain_blend_setpoint: Optional[float] = None,
         apply_offset_gain_blend: bool = True,
-        scale_lateral_d_with_offset: bool = True,
+        scale_lateral_d_with_offset: bool = False,
         enable_integral: bool = True,
     ) -> AttitudeSetpoint:
         """Desired roll/pitch/yaw/thrust from visual data only.

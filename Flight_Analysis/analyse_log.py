@@ -1584,20 +1584,27 @@ def _wind_axis_components(
 	return relative_accel, wind_compensation, relative_accel + wind_compensation
 
 
-def _wind_force_scale_is_usable(data: AnalysisData) -> bool:
-	"""True when the wind->acceleration conversion can be trusted.
+def _atomic_drone_acceleration(
+	data: AnalysisData,
+	at_sim_time: np.ndarray,
+	*,
+	truth_axis: str,
+	truth_sign: float,
+) -> np.ndarray:
+	"""Return the Gazebo-native drone acceleration in controller-channel coordinates.
 
-	Either no wind was commanded (the contribution is identically zero and the
-	drag coefficient is irrelevant), or the caller supplied a real
-	``--wind-force-scale``. The 1.0 default is a placeholder, not a measurement:
-	using it with a 6 m/s wind reports ~6 m/s2 of demand against a probe mean
-	near 0.8, which does not just mislabel the curve, it rescales the axis and
-	hides the probe traces entirely.
+	The atomic truth packet already contains the drone's linear acceleration at
+	the same Gazebo physics timestamp as the rest of the truth state.  Do not
+	reconstruct this quantity from wind speed, vehicle velocity, commanded
+	acceleration or platform motion.
+
+	``truth_sign`` maps Gazebo world axes into the controller channels:
+	vertical -> +Z, roll/image-X -> -Y, pitch/image-Y -> -X.
 	"""
-	enabled = _num(data.wind, "wind_enabled", 0.0).to_numpy(float)
-	if not np.any(np.isfinite(enabled) & (enabled > 0.5)):
-		return True
-	return abs(float(data.wind_force_scale) - 1.0) > 1e-9
+	tc = np.asarray(at_sim_time, dtype=float)
+	return float(truth_sign) * _interp_truth(
+		data, f"truth_drone_linear_acceleration_{truth_axis}_m_s2", tc
+	)
 
 
 def _plot_probe_axis(
@@ -1612,34 +1619,31 @@ def _plot_probe_axis(
 	capacity_ceiling_column: str,
 	filename: str,
 ) -> None:
-	"""Plot the probe quantities that matter, against an INDEPENDENT truth.
+	"""Plot one command-derived acceleration probe against atomic Gazebo truth.
 
-	Panel 1 compares the command-derived probe acceleration with the full truth
-	acceleration in gate coordinates. Both terms of that truth come from
-	outside the controller:
+	Panel 1 compares the acceleration reconstructed online from the controller
+	command history with the drone acceleration published directly by the atomic
+	``/bee_land/truth`` packet.  This is the physical response that actually
+	occurred in Gazebo; no WindEffects force law, drag coefficient, platform
+	subtraction or probe-derived static term is used to manufacture the truth
+	reference.
 
-	    truth = (drone - platform) dynamic acceleration   [truth CSV]
-	          + the acceleration needed to cancel the wind [wind CSV]
+	The comparison is deliberately between two different things:
 
-	The second term used to be the probe's OWN static mean, which made the
-	comparison circular -- the reference was built from the estimate it was
-	supposed to validate, so the two curves agreed by construction and the plot
-	could not show a wrong static term. The wind CSV carries the commanded wind
-	the simulator actually applied, so the reference is now independent of
-	anything the controller believes.
+	    probe acceleration  = acceleration inferred from the commanded control
+	    atomic truth        = net drone linear acceleration produced by physics
 
-	Panel 2 shows the slowly varying probe mean, gate envelope and stability
-	capacity in the exact coordinates used by the feasibility logic, with the
-	same independent wind contribution alongside the probe's estimate of it --
-	those two curves agreeing IS the thing worth checking.
+	Their dynamic agreement is useful for validating whether the command-history
+	probe follows the vehicle response.  A steady offset between them is not
+	automatically a probe error: under a steady disturbance the controller can
+	command a non-zero acceleration-like trim while the net inertial acceleration
+	of the stabilized vehicle remains near zero.
 
-	One caveat that comes with the independence: the wind CSV logs a VELOCITY,
-	so turning it into an acceleration needs the airframe's drag coefficient,
-	which is ``--wind-force-scale`` (Gazebo's
-	force_approximation_scaling_factor). It defaults to 1.0, which is not a
-	physical value for this airframe, so the wind curves carry the scale in
-	their label and are suppressed entirely when wind is enabled and the scale
-	was left at its default -- a mis-scaled reference is worse than none.
+	Panel 2 therefore stays in the feasibility gate's own coordinates only:
+	probe mean, gate envelope and stability-capacity envelope.  The former
+	commanded-wind reconstruction has been removed from the probe figures; the
+	separate ``--wind`` diagnostics retain WindEffects reconstruction where it is
+	still explicitly useful.
 	"""
 	c_all = data.control
 	probe_end_sim = _probe_plot_end_sim_time(data)
@@ -1654,27 +1658,11 @@ def _plot_probe_axis(
 
 	t = _relative_time(c["_sim_time"], data.t0)
 	tc = c["_sim_time"].to_numpy(float)
-	relative_accel, wind_compensation, full_truth_accel = _wind_axis_components(
+	atomic_drone_accel = _atomic_drone_acceleration(
 		data, tc, truth_axis=truth_axis, truth_sign=truth_sign
 	)
 
 	static_mean = _num(c, f"mission_{probe_prefix}_mean_accel_m_s2").to_numpy(float)
-	# ``full_truth_accel`` is the sum returned above: Gazebo's dynamic relative
-	# acceleration plus the wind cancellation the COMMANDED wind demands. That
-	# is what the controller has to produce, reconstructed without reference to
-	# any probe output.
-	wind_scale_known = _wind_force_scale_is_usable(data)
-	if not wind_scale_known:
-		# Fall back to the dynamic term alone rather than showing a curve that is
-		# wrong by an unknown drag coefficient.
-		full_truth_accel = relative_accel
-		wind_compensation = np.full_like(relative_accel, np.nan)
-	truth_label = (
-		"Full truth acceleration (Gazebo dynamic + commanded wind"
-		f", K_w={data.wind_force_scale:g})"
-		if wind_scale_known
-		else "Full truth acceleration (dynamic only, no K_w)"
-	)
 	peak_used = _num(c, peak_column).to_numpy(float)
 	capacity_ceiling = _last_finite_value(c_all, capacity_ceiling_column)
 
@@ -1696,13 +1684,13 @@ def _plot_probe_axis(
 		linewidth=1.8,
 		label="Command-derived probe acceleration",
 	)
-	if np.isfinite(full_truth_accel).any():
+	if np.isfinite(atomic_drone_accel).any():
 		axes[0].plot(
 			t,
-			full_truth_accel,
-			alpha=0.78,
+			atomic_drone_accel,
+			alpha=0.82,
 			linewidth=1.6,
-			label=truth_label,
+			label="Atomic Gazebo drone acceleration",
 		)
 	if upper_peak is not None:
 		peak_line = axes[0].plot(
@@ -1714,20 +1702,14 @@ def _plot_probe_axis(
 		)
 	axes[0].axhline(0.0, linestyle=":", linewidth=0.9, alpha=0.55)
 	axes[0].set_ylabel("Acceleration [m/s²]")
-	axes[0].set_title(f"{axis_name} probe: demand, truth response and gate envelope")
+	axes[0].set_title(
+		f"{axis_name} probe: command-history estimate vs atomic drone acceleration"
+	)
 	_legend(axes[0], ncol=3)
 
 	if np.isfinite(static_mean).any():
 		axes[1].plot(
 			t, static_mean, linestyle=":", linewidth=2.0, label="Probe mean acceleration"
-		)
-	# The independent target for that mean: what the commanded wind actually
-	# demands on this axis. Divergence between these two is a wrong static term,
-	# and it is only visible because the reference no longer comes from the probe.
-	if np.isfinite(wind_compensation).any():
-		axes[1].plot(
-			t, wind_compensation, linewidth=1.6, alpha=0.85,
-			label=f"Commanded-wind contribution (truth, K_w={data.wind_force_scale:g})",
 		)
 	if upper_peak is not None:
 		peak_line_mid = axes[1].plot(

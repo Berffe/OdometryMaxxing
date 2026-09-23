@@ -43,7 +43,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-import campaign  # noqa: E402
+import Controller_logic.automation.campaign_01 as campaign_01  # noqa: E402
 import scenario as scenario_mod  # noqa: E402
 from make_world import generate  # noqa: E402
 
@@ -190,7 +190,7 @@ def _reject_non_finite(token: str):
 
 
 def inspect_outcome(run_dir: Path, spec, report: Report) -> dict | None:
-    path = campaign.outcome_path(run_dir)
+    path = campaign_01.outcome_path(run_dir)
     if path is None:
         report.check(False, f"{spec.run_id}: wrote an outcome record",
                      "no bee_outcome_*.json; close()'s finally block did not run")
@@ -294,9 +294,9 @@ def main() -> int:
     parser.add_argument("--base-seed", type=int, default=20260920)
     parser.add_argument("--name", default=None,
                         help="Output directory name. Defaults to a timestamp.")
-    parser.add_argument("--logs-dir", type=Path, default=campaign.DEFAULT_LOGS_DIR)
-    parser.add_argument("--bee-dir", type=Path, default=campaign.DEFAULT_BEE_DIR)
-    parser.add_argument("--px4-dir", type=Path, default=campaign.DEFAULT_PX4_DIR)
+    parser.add_argument("--logs-dir", type=Path, default=campaign_01.DEFAULT_LOGS_DIR)
+    parser.add_argument("--bee-dir", type=Path, default=campaign_01.DEFAULT_BEE_DIR)
+    parser.add_argument("--px4-dir", type=Path, default=campaign_01.DEFAULT_PX4_DIR)
     parser.add_argument("--source-world", type=Path, default=None)
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--dry-run", action="store_true",
@@ -340,7 +340,7 @@ def main() -> int:
     records: dict[str, dict] = {}
     for index, spec in enumerate(specs, start=1):
         print(f"\n[{index}/{len(specs)}] {spec.run_id}", flush=True)
-        status = campaign.run_one(spec, test_dir, source_world,
+        status = campaign_01.run_one(spec, test_dir, source_world,
                                   timeout_sec=args.timeout,
                                   bee_dir=args.bee_dir, px4_dir=args.px4_dir)
         print(f"    -> {status}", flush=True)
