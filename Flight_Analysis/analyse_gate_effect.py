@@ -14,8 +14,10 @@ The two headline observables are:
 2. contact position: drone-centre position at first contact in platform axes.
 
 The x/y/z relative-velocity components over the same 0.10 s window are retained
-and plotted as diagnostics.  Normal pad closing rate remains available but is no
-longer the headline speed metric.
+as signed direction diagnostics.  Their mean absolute magnitudes are the preferred
+component-intensity observables, so sign changes cannot cancel inside the averaging
+window.  Normal pad closing rate remains available but is no longer the headline
+speed metric.
 
 Because the campaign pairs gate ON and OFF with the same physical scenario, the
 script also builds a pair table and reports within-scenario touchdown differences
@@ -29,6 +31,8 @@ Example
 from __future__ import annotations
 
 import argparse
+import ast
+import json
 import math
 from pathlib import Path
 from typing import Iterable
@@ -128,6 +132,9 @@ def _pair_table(df: pd.DataFrame) -> pd.DataFrame:
             "contact_relative_velocity_x_mean_m_s",
             "contact_relative_velocity_y_mean_m_s",
             "contact_relative_velocity_z_mean_m_s",
+            "contact_relative_velocity_x_abs_mean_m_s",
+            "contact_relative_velocity_y_abs_mean_m_s",
+            "contact_relative_velocity_z_abs_mean_m_s",
             "contact_relative_speed_from_mean_components_m_s",
             "contact_closing_rate_m_s",
             "contact_closing_speed_abs_m_s",
@@ -181,6 +188,263 @@ def _save_outcomes(df: pd.DataFrame, out: Path) -> pd.DataFrame:
     plt.close(fig)
     return counts
 
+
+
+def _decode_sequence(value: object) -> list:
+    if isinstance(value, (list, tuple)):
+        return list(value)
+    if value is None or (isinstance(value, float) and np.isnan(value)):
+        return []
+    text = str(value).strip()
+    if not text:
+        return []
+    for parser in (json.loads, ast.literal_eval):
+        try:
+            decoded = parser(text)
+        except Exception:  # noqa: BLE001 - this is best-effort metadata parsing.
+            continue
+        if isinstance(decoded, (list, tuple)):
+            return list(decoded)
+    return []
+
+
+def _case_names(condition: object) -> tuple[str, str]:
+    text = str(condition).strip()
+    if "-" not in text:
+        return text, ""
+    wind, platform = text.split("-", 1)
+    return wind, platform
+
+
+def _axis_synthesis_amplitude_bound(value: object) -> float:
+    seq = _decode_sequence(value)
+    if len(seq) < 3:
+        return math.nan
+    try:
+        return float(seq[0]) * float(seq[2])
+    except (TypeError, ValueError):
+        return math.nan
+
+
+def _motion_component_bounds(value: object) -> tuple[float, float]:
+    """Return (displacement bound, acceleration bound) for [A, f, phase] terms."""
+    seq = _decode_sequence(value)
+    displacement = 0.0
+    acceleration = 0.0
+    used = False
+    for item in seq:
+        if not isinstance(item, (list, tuple)) or len(item) < 2:
+            continue
+        try:
+            amplitude = abs(float(item[0]))
+            frequency = abs(float(item[1]))
+        except (TypeError, ValueError):
+            continue
+        displacement += amplitude
+        acceleration += amplitude * (2.0 * math.pi * frequency) ** 2
+        used = True
+    return (displacement, acceleration) if used else (math.nan, math.nan)
+
+
+def _scenario_outcome_exports(df: pd.DataFrame, out: Path) -> None:
+    """Export one-row-per-run factor table and a compact full-campaign matrix."""
+    table = df.copy()
+    names = table.get("condition", pd.Series("", index=table.index)).apply(_case_names)
+    table["wind_case"] = names.apply(lambda item: item[0])
+    table["platform_case"] = names.apply(lambda item: item[1])
+
+    def mean_wind_norm(value: object) -> float:
+        seq = _decode_sequence(value)
+        try:
+            arr = np.asarray(seq, dtype=float)
+        except (TypeError, ValueError):
+            return math.nan
+        return float(np.linalg.norm(arr)) if arr.size else math.nan
+
+    table["wind_mean_speed_m_s"] = (
+        table["spec_wind__mean_velocity"].apply(mean_wind_norm)
+        if "spec_wind__mean_velocity" in table.columns else np.nan
+    )
+    table["wind_max_speed_bound_m_s"] = (
+        _num(table, "spec_wind__max_wind_speed")
+        if "spec_wind__max_wind_speed" in table.columns else np.nan
+    )
+    table["wind_background_x_amplitude_bound_m_s"] = (
+        table["spec_wind__axis_x"].apply(_axis_synthesis_amplitude_bound)
+        if "spec_wind__axis_x" in table.columns else np.nan
+    )
+    table["wind_background_y_amplitude_bound_m_s"] = (
+        table["spec_wind__axis_y"].apply(_axis_synthesis_amplitude_bound)
+        if "spec_wind__axis_y" in table.columns else np.nan
+    )
+
+    for axis in ("heave", "surge", "sway"):
+        column = f"spec_platform__{axis}"
+        if column in table.columns:
+            bounds = table[column].apply(_motion_component_bounds)
+            table[f"platform_{axis}_displacement_bound_m"] = bounds.apply(lambda item: item[0])
+            table[f"platform_{axis}_acceleration_bound_m_s2"] = bounds.apply(lambda item: item[1])
+
+    keep = [
+        "run_id", "pair_key", "wind_case", "platform_case", "condition",
+        "platform_radius_m", "gate", "status", "verdict_reached",
+        "refusal_criteria", "refusal_axes",
+        "wind_mean_speed_m_s", "wind_max_speed_bound_m_s",
+        "wind_background_x_amplitude_bound_m_s",
+        "wind_background_y_amplitude_bound_m_s",
+        "platform_heave_displacement_bound_m",
+        "platform_heave_acceleration_bound_m_s2",
+        "platform_surge_displacement_bound_m",
+        "platform_surge_acceleration_bound_m_s2",
+        "platform_sway_displacement_bound_m",
+        "platform_sway_acceleration_bound_m_s2",
+    ]
+    keep = [column for column in keep if column in table.columns]
+    scenario = table[keep].copy()
+    sort_cols = [c for c in ("platform_radius_m", "gate", "platform_case", "wind_case") if c in scenario.columns]
+    if sort_cols:
+        scenario = scenario.sort_values(sort_cols)
+    scenario.to_csv(out / "campaign_scenario_outcomes.csv", index=False)
+
+    wind_level_cols = [
+        "wind_case", "wind_mean_speed_m_s", "wind_max_speed_bound_m_s",
+        "wind_background_x_amplitude_bound_m_s",
+        "wind_background_y_amplitude_bound_m_s",
+    ]
+    wind_level_cols = [c for c in wind_level_cols if c in table.columns]
+    if wind_level_cols:
+        (
+            table[wind_level_cols]
+            .drop_duplicates()
+            .sort_values("wind_case")
+            .to_csv(out / "wind_case_levels.csv", index=False)
+        )
+
+    platform_level_cols = [
+        "platform_case",
+        "platform_heave_displacement_bound_m",
+        "platform_heave_acceleration_bound_m_s2",
+        "platform_surge_displacement_bound_m",
+        "platform_surge_acceleration_bound_m_s2",
+        "platform_sway_displacement_bound_m",
+        "platform_sway_acceleration_bound_m_s2",
+    ]
+    platform_level_cols = [c for c in platform_level_cols if c in table.columns]
+    if platform_level_cols:
+        (
+            table[platform_level_cols]
+            .drop_duplicates()
+            .sort_values("platform_case")
+            .to_csv(out / "platform_case_levels.csv", index=False)
+        )
+
+    if not {"wind_case", "platform_case", "platform_radius_m", "gate", "status"}.issubset(table.columns):
+        return
+    radii = sorted(_num(table, "platform_radius_m").dropna().unique().tolist())
+    gates = [gate for gate in ("on", "off") if np.any(_clean(table["gate"]) == gate)]
+    discovered_winds = [x for x in table["wind_case"].dropna().astype(str).unique() if x]
+    discovered_platforms = [x for x in table["platform_case"].dropna().astype(str).unique() if x]
+    preferred_winds = ["ww1", "ww2", "ww3", "ws1", "ws2", "ws3"]
+    preferred_platforms = ["pw1", "pw2", "pw3", "ps1", "ps2", "ps3"]
+    wind_cases = [x for x in preferred_winds if x in discovered_winds] + sorted(
+        x for x in discovered_winds if x not in preferred_winds
+    )
+    platform_cases = [x for x in preferred_platforms if x in discovered_platforms] + sorted(
+        x for x in discovered_platforms if x not in preferred_platforms
+    )
+
+    wind_labels = {}
+    for wind in wind_cases:
+        part = table[table["wind_case"].astype(str) == wind]
+        mean_speed = _num(part, "wind_mean_speed_m_s").dropna()
+        bound = _num(part, "wind_max_speed_bound_m_s").dropna()
+        label = wind
+        if not mean_speed.empty and not bound.empty:
+            label += f"\n|W0|={mean_speed.iloc[0]:.1f}\nVb={bound.iloc[0]:.1f} m/s"
+        wind_labels[wind] = label
+
+    platform_labels = {}
+    for platform in platform_cases:
+        part = table[table["platform_case"].astype(str) == platform]
+        disp = _num(part, "platform_heave_displacement_bound_m").dropna()
+        accel = _num(part, "platform_heave_acceleration_bound_m_s2").dropna()
+        label = platform
+        if not disp.empty and not accel.empty:
+            label += f"\nΣAz={disp.iloc[0]:.2f} m\nâz={accel.iloc[0]:.2f} m/s²"
+        platform_labels[platform] = label
+    panels = [(radius, gate) for radius in radii for gate in gates]
+    if not panels or not wind_cases or not platform_cases:
+        return
+
+    ncols = 2 if len(panels) > 1 else 1
+    nrows = int(math.ceil(len(panels) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(7.0 * ncols, 4.6 * nrows), squeeze=False)
+    status_fill = {
+        "landed": "#d9ead3",
+        "infeasible": "#fce5cd",
+        "aborted": "#f4cccc",
+        "crashed": "#ead1dc",
+        "launch_failed": "#d9d2e9",
+        "timeout": "#cfe2f3",
+        "": "#eeeeee",
+    }
+    status_label = {
+        "landed": "LANDED",
+        "infeasible": "INFEAS.",
+        "aborted": "ABORTED",
+        "crashed": "CRASHED",
+        "launch_failed": "LAUNCH FAIL",
+        "timeout": "TIMEOUT",
+        "": "—",
+    }
+
+    clean_gate = _clean(table["gate"])
+    clean_status = _clean(table["status"])
+    radius_values = _num(table, "platform_radius_m")
+    for ax, (radius, gate) in zip(axes.flat, panels):
+        cell_text = []
+        cell_colours = []
+        for platform in platform_cases:
+            row_text = []
+            row_colours = []
+            for wind in wind_cases:
+                mask = (
+                    np.isclose(radius_values.to_numpy(float), float(radius), equal_nan=False)
+                    & (clean_gate.to_numpy() == gate)
+                    & (table["wind_case"].astype(str).to_numpy() == wind)
+                    & (table["platform_case"].astype(str).to_numpy() == platform)
+                )
+                values = clean_status[mask]
+                status = str(values.iloc[0]) if len(values) else ""
+                row_text.append(status_label.get(status, status.upper() if status else "—"))
+                row_colours.append(status_fill.get(status, "#eeeeee"))
+            cell_text.append(row_text)
+            cell_colours.append(row_colours)
+        ax.axis("off")
+        tbl = ax.table(
+            cellText=cell_text,
+            cellColours=cell_colours,
+            rowLabels=[platform_labels[p] for p in platform_cases],
+            colLabels=[wind_labels[w] for w in wind_cases],
+            cellLoc="center",
+            rowLoc="center",
+            loc="center",
+        )
+        tbl.auto_set_font_size(False)
+        tbl.set_fontsize(7.8)
+        tbl.scale(1.0, 1.75)
+        ax.set_title(f"Platform radius = {float(radius):g} m — Gate {gate.upper()}")
+
+    for ax in axes.flat[len(panels):]:
+        ax.axis("off")
+    fig.suptitle(
+        "Campaign scenario outcomes — every wind × platform × radius × gate cell\n"
+        "Wind labels: mean speed and conservative speed bound; platform labels: "
+        "heave displacement and acceleration bounds"
+    )
+    fig.tight_layout()
+    fig.savefig(out / "campaign_scenario_outcomes.png", dpi=220, bbox_inches="tight")
+    plt.close(fig)
 
 def _distribution_plot(df: pd.DataFrame, out: Path) -> None:
     landed = df[_clean(df["status"]) == "landed"].copy()
@@ -241,9 +505,81 @@ def _component_distribution_plot(df: pd.DataFrame, out: Path) -> None:
     axes[0].set_ylabel("Mean component over final 0.10 s [m/s]\n(platform axes when available)")
     fig.suptitle("Pre-contact relative-velocity components — landed runs only")
     fig.tight_layout()
-    fig.savefig(out / "contact_velocity_components_gate.png", dpi=220)
+    fig.savefig(out / "contact_velocity_components_signed_gate.png", dpi=220)
     plt.close(fig)
 
+
+
+def _component_magnitude_distribution_plot(df: pd.DataFrame, out: Path) -> None:
+    """ON/OFF distributions of mean absolute component magnitudes."""
+    landed = df[_clean(df["status"]) == "landed"].copy()
+    if landed.empty:
+        return
+    metrics = [
+        ("contact_relative_velocity_x_abs_mean_m_s", "x"),
+        ("contact_relative_velocity_y_abs_mean_m_s", "y"),
+        ("contact_relative_velocity_z_abs_mean_m_s", "z"),
+    ]
+    if not any(metric in landed.columns for metric, _ in metrics):
+        return
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4.8), sharey=True)
+    rng = np.random.default_rng(20260922)
+    for ax, (metric, axis_name) in zip(axes, metrics):
+        plotted = []
+        labels = []
+        for gate, label in (("on", "Gate ON"), ("off", "Gate OFF")):
+            values = _num(landed[_clean(landed["gate"]) == gate], metric).dropna().to_numpy(float)
+            if values.size:
+                plotted.append(values)
+                labels.append(label)
+        if plotted:
+            ax.boxplot(plotted, showmeans=True)
+            ax.set_xticks(np.arange(1, len(labels) + 1), labels, rotation=15)
+            for i, values in enumerate(plotted, start=1):
+                jitter = rng.normal(0.0, 0.035, size=len(values))
+                ax.scatter(np.full(len(values), i) + jitter, values, s=13, alpha=0.30)
+        ax.set_title(rf"Mean $|v_{{{axis_name}}}|$")
+        ax.grid(axis="y", alpha=0.25)
+    axes[0].set_ylabel("Mean absolute component over final 0.10 s [m/s]\n(platform axes when available)")
+    fig.suptitle("Pre-contact relative-velocity component magnitudes — landed runs only")
+    fig.tight_layout()
+    fig.savefig(out / "contact_velocity_component_magnitudes_gate.png", dpi=220)
+    plt.close(fig)
+
+
+def _refusal_consequence_plot(pairs: pd.DataFrame, out: Path) -> None:
+    """What happened with gate OFF when the paired ON arm accepted or refused."""
+    if pairs.empty or "contact_relative_velocity_z_abs_mean_m_s_off" not in pairs.columns:
+        return
+    eligible = pairs[pairs["status_off"] == "landed"].copy()
+    groups = [
+        ("ON landed", eligible[eligible["status_on"] == "landed"]),
+        ("ON refused", eligible[eligible["status_on"] == "infeasible"]),
+    ]
+    vertical, total, labels = [], [], []
+    for label, group in groups:
+        vz = pd.to_numeric(group["contact_relative_velocity_z_abs_mean_m_s_off"], errors="coerce").dropna().to_numpy(float)
+        speed = pd.to_numeric(group["contact_relative_speed_mean_m_s_off"], errors="coerce").dropna().to_numpy(float)
+        if vz.size and speed.size:
+            vertical.append(vz)
+            total.append(speed)
+            labels.append(label)
+    if not labels:
+        return
+    fig, axes = plt.subplots(1, 2, figsize=(10.5, 5.0))
+    for ax, data, ylabel, title in (
+        (axes[0], vertical, r"Gate-OFF mean $|v_z|$ [m/s]", "Vertical touchdown intensity"),
+        (axes[1], total, "Gate-OFF mean relative-speed magnitude [m/s]", "Total touchdown intensity"),
+    ):
+        ax.boxplot(data, showmeans=True)
+        ax.set_xticks(np.arange(1, len(labels) + 1), labels)
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
+        ax.grid(axis="y", alpha=0.25)
+    fig.suptitle("Paired counterfactual: gate-OFF touchdown grouped by gate-ON decision")
+    fig.tight_layout()
+    fig.savefig(out / "gate_refusal_touchdown_consequence.png", dpi=220)
+    plt.close(fig)
 
 def _position_plot(df: pd.DataFrame, out: Path) -> None:
     landed = df[_clean(df["status"]) == "landed"].copy()
@@ -366,6 +702,7 @@ def analyse(runs_csv: Path, out: Path) -> None:
     out.mkdir(parents=True, exist_ok=True)
 
     _save_outcomes(df, out)
+    _scenario_outcome_exports(df, out)
     pairs = _pair_table(df)
     pairs.to_csv(out / "gate_pair_table.csv", index=False)
 
@@ -376,13 +713,18 @@ def analyse(runs_csv: Path, out: Path) -> None:
         "contact_relative_velocity_x_mean_m_s",
         "contact_relative_velocity_y_mean_m_s",
         "contact_relative_velocity_z_mean_m_s",
+        "contact_relative_velocity_x_abs_mean_m_s",
+        "contact_relative_velocity_y_abs_mean_m_s",
+        "contact_relative_velocity_z_abs_mean_m_s",
         "contact_radial_error_normalized",
     ):
-        if not both.empty:
+        on_col = f"{metric}_on"
+        off_col = f"{metric}_off"
+        if not both.empty and on_col in both.columns and off_col in both.columns:
             stats_rows.append(
                 _paired_stats(
-                    pd.to_numeric(both[f"{metric}_on"], errors="coerce").to_numpy(float),
-                    pd.to_numeric(both[f"{metric}_off"], errors="coerce").to_numpy(float),
+                    pd.to_numeric(both[on_col], errors="coerce").to_numpy(float),
+                    pd.to_numeric(both[off_col], errors="coerce").to_numpy(float),
                     metric,
                 )
             )
@@ -393,8 +735,10 @@ def analyse(runs_csv: Path, out: Path) -> None:
 
     _distribution_plot(df, out)
     _component_distribution_plot(df, out)
+    _component_magnitude_distribution_plot(df, out)
     _position_plot(df, out)
     _paired_plot(pairs, out)
+    _refusal_consequence_plot(pairs, out)
     _write_text_summary(df, pairs, stats, out)
 
     print(f"Analysed {len(df)} runs and {len(pairs)} complete ON/OFF pairs")

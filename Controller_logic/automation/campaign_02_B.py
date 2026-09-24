@@ -1,46 +1,45 @@
-"""Run Campaign 03: frozen no-gust paired gate validation.
+"""Run Campaign 02_B: no-dominant-gust qualification of the current controller.
 
-    python3 campaign_03.py --campaign campaign_03 --base-seed 20260923 --dry-run
-    python3 campaign_03.py --campaign campaign_03 --base-seed 20260923 --limit 72
-    python3 campaign_03.py --campaign campaign_03 --base-seed 20260923
+    python3 campaign_02_B.py --campaign campaign_02_B --base-seed 20260921 --dry-run
+    python3 campaign_02_B.py --campaign campaign_02_B --base-seed 20260921 --limit 24
+    python3 campaign_02_B.py --campaign campaign_02_B --base-seed 20260921
 
 The matrix
 ----------
-6 wind cases x 6 platform cases x 2 deck radii x 2 gate settings = 144 runs,
-one repetition per cell. Gate-ON and gate-OFF twins share the same physical seed
-and are flown back to back.
+4 wind cases x 6 platform cases x 2 deck radii x 1 gate setting = 48 runs,
+one repetition per cell. This is still a controller-qualification campaign, not
+the final 144-run gate-validation campaign.
 
-This is the final paired validation matrix after Campaign 02_B qualified the
-current controller without the former dominant-gust term. The controller and
-gate tuning are frozen for this campaign. Wind consists only of
+Campaign 02_B keeps the exact Campaign 02 matrix, controller tuning, platform
+cases, radii, gate setting and base-seed convention. The ONLY intended physical
+change is the wind definition: the extra explicit dominant gust component is
+removed completely from every wind case. Wind therefore consists only of
 
     mean_velocity + background multi-sine axis synthesis
 
-with gust_x/gust_y empty in every generated WindSpec (and no z-axis gust).
+with no additional gust_x/gust_y component.
 
-Deck radii are 0.50 m and 1.50 m. The 0.50 m block is flown first, so
-``--limit 72`` completes that whole radius before the 1.50 m block. The former
-0.40 m deck is retained as a development stress case and is not part of this
-validation matrix.
+The selected wind names remain ww3/ws1/ws2/ws3 so results can be compared
+directly with Campaign 02 using the same scenario coordinates. After gust
+removal, ws1 has the same mean/background parameter envelope as ww3 but remains
+a different seeded realization because the wind-case name is part of the
+scenario seed. ws2 and ws3 retain their distinct mean/background definitions.
 
-All six no-gust wind families are retained from the campaign definitions.
-After removal of the explicit gust, ws1 intentionally has the same parameter
-envelope as ww3 but remains an independent seeded realization because the wind
-case name is part of the seed. This gives an extra replicate of the strongest
-straight-wind background condition.
+Deck radii are 0.50 m first and 0.40 m second. Therefore ``--limit 24`` runs the
+complete 0.50 m block before the 0.40 m small-target stress block. The commit
+gate remains ON only because CENTER is upstream of the commit decision.
 
-Use a NEW base seed for validation (20260923 in the examples) rather than the
-20260921 seed used during qualification/tuning. This prevents the final paired
-results from reusing the exact disturbance realizations used to choose the
-controller configuration.
+Controller under test
+---------------------
+This campaign does not override controller parameters. Use the repository's
+current tuning unchanged from Campaign 02. In particular, this file makes no
+further changes to CENTER gains, gain blending, adaptation or timeout.
 
 Resumability
 ------------
 A run is "done" when its directory holds an outcome record. Re-running the same
-command skips those and continues. The controller writes its outcome first and
-the separate offline pass can fill truth-derived metrics later. Harness-level
-launch failures/timeouts are also written as outcomes so the matrix remains
-auditable and resumable.
+command skips those and continues. Harness-level launch failures and wall-clock
+timeouts are still written as outcome records exactly as in Campaign 01/02.
 """
 from __future__ import annotations
 
@@ -82,7 +81,7 @@ class WindCase:
 
         (count, amp_min, amp_max, f_min, f_max)
 
-    with amplitudes in m/s and frequencies in Hz. In this final campaign the
+    with amplitudes in m/s and frequencies in Hz. In Campaign 02_B this
     background multi-sine synthesis is the only time-varying wind contribution.
     """
 
@@ -183,14 +182,26 @@ WIND_CASES = (
              turbulence_y=(3, 0.40, 0.80, *_BACKGROUND_BAND_HZ)),
 )
 
-# Final validation radii. 0.50 m preserves the demanding small-deck condition
-# qualified in Campaign 02_B; 1.50 m supplies the larger operational deck.
-PLATFORM_RADII_M = (0.50, 1.50)
+# Campaign 02 qualification subset.
+#
+# 0.50 m is the intended small-platform validation condition. 0.40 m is kept
+# only as a harsher target/FOV stress test because Campaign 01 concentrated
+# target/flow losses there.
+PLATFORM_RADII_M = (0.50, 0.40)
 
-# Paired ablation: same physical realization, commit gate ON then OFF.
-GATES = ("on", "off")
+# CENTER is upstream of the commit gate. Duplicating this qualification matrix
+# with gate OFF would not help determine whether CENTER survives these physical
+# wind/platform cases, so keep the gate enabled for every run here.
+GATES = ("on",)
 
-# Final validation uses all six no-gust wind cases defined above.
+# Retain the same four case names used by Campaign 02 so Campaign 02_B is a
+# direct no-gust replay of that qualification matrix. ws1 is now a second
+# seeded realization of the ww3 background envelope; ws2/ws3 retain their
+# distinct background synthesis and mean-wind definitions.
+QUALIFICATION_WIND_NAMES = ("ww3", "ws1", "ws2", "ws3")
+QUALIFICATION_WIND_CASES = tuple(
+    case for case in WIND_CASES if case.name in QUALIFICATION_WIND_NAMES
+)
 
 # Spawn geometry. The drone climbs vertically from its spawn point, so it must
 # start outside the deck footprint: radius + lateral motion + drone half-span.
@@ -239,8 +250,8 @@ def build(base_seed: int, wind: WindCase, platform: PlatformCase,
     seed = derive_seed(base_seed, wind, platform, radius_m, repetition)
     rng = scenario_mod._SplitMix64(seed)
 
-    # Deterministic physical scenario draws. There is intentionally NO separate
-    # dominant-gust draw in Campaign 03.
+    # Physical scenario draws retained from Campaign 02 up through spawn.
+    # There is intentionally NO separate gust draw in Campaign 02_B.
     phase_offsets = tuple(rng.uniform(0.0, 2.0 * math.pi) for _ in range(5))
     spawn = _spawn_pose(radius_m, rng)
 
@@ -265,7 +276,7 @@ def build(base_seed: int, wind: WindCase, platform: PlatformCase,
             axis_x=wind.turbulence_x,
             axis_y=wind.turbulence_y,
             axis_z=(),
-            # Explicitly empty: final validation has no dominant-gust layer.
+            # Explicitly empty: Campaign 02_B removes the dominant-gust layer.
             gust_x=(),
             gust_y=(),
         ),
@@ -282,25 +293,25 @@ def build(base_seed: int, wind: WindCase, platform: PlatformCase,
 
 
 def plan(base_seed: int, *, repetitions: int = 1) -> list[scenario_mod.Scenario]:
-    """The frozen paired validation matrix, in flight order.
+    """The campaign matrix, in flight order.
 
-    Gate-on and gate-off twins are flown back to back. derive_seed() deliberately
-    excludes the gate flag, so each pair sees the same spawn, platform phases and
-    wind realization.
+    Campaign 02_B is a no-gust controller-qualification campaign, not a gate ablation.
+    The commit gate is ON for every run because the failure mode under test is
+    CENTER acquisition/recovery, which occurs upstream of the gate decision.
     """
     return [
         build(base_seed, wind, platform, radius, gate, rep)
         for rep in range(repetitions)
         for radius in PLATFORM_RADII_M
         for platform in PLATFORM_CASES
-        for wind in WIND_CASES
+        for wind in QUALIFICATION_WIND_CASES
         for gate in GATES
     ]
 
 
 def matrix_description() -> dict:
     return {
-        "wind_cases": [asdict(case) for case in WIND_CASES],
+        "wind_cases": [asdict(case) for case in QUALIFICATION_WIND_CASES],
         "platform_cases": [asdict(case) for case in PLATFORM_CASES],
         "radii_m": list(PLATFORM_RADII_M),
         "gates": list(GATES),
@@ -409,7 +420,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--campaign", required=True,
-                        help="Campaign directory name, e.g. campaign_03.")
+                        help="Campaign directory name, e.g. campaign_02_B.")
     parser.add_argument("--base-seed", type=int, required=True)
     parser.add_argument("--logs-dir", type=Path, default=DEFAULT_LOGS_DIR)
     parser.add_argument("--bee-dir", type=Path, default=DEFAULT_BEE_DIR)

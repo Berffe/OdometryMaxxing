@@ -247,6 +247,9 @@ def _precontact_relative_velocity(
         "contact_relative_velocity_x_mean_m_s": math.nan,
         "contact_relative_velocity_y_mean_m_s": math.nan,
         "contact_relative_velocity_z_mean_m_s": math.nan,
+        "contact_relative_velocity_x_abs_mean_m_s": math.nan,
+        "contact_relative_velocity_y_abs_mean_m_s": math.nan,
+        "contact_relative_velocity_z_abs_mean_m_s": math.nan,
         "contact_relative_speed_mean_m_s": math.nan,
         "contact_relative_speed_from_mean_components_m_s": math.nan,
         "contact_velocity_samples": 0,
@@ -307,11 +310,15 @@ def _precontact_relative_velocity(
 
     matrix = np.vstack(components)
     mean_components = np.mean(matrix, axis=0)
+    mean_abs_components = np.mean(np.abs(matrix), axis=0)
     result.update(
         {
             "contact_relative_velocity_x_mean_m_s": float(mean_components[0]),
             "contact_relative_velocity_y_mean_m_s": float(mean_components[1]),
             "contact_relative_velocity_z_mean_m_s": float(mean_components[2]),
+            "contact_relative_velocity_x_abs_mean_m_s": float(mean_abs_components[0]),
+            "contact_relative_velocity_y_abs_mean_m_s": float(mean_abs_components[1]),
+            "contact_relative_velocity_z_abs_mean_m_s": float(mean_abs_components[2]),
             "contact_relative_speed_mean_m_s": float(np.mean(speeds)),
             "contact_relative_speed_from_mean_components_m_s": float(np.linalg.norm(mean_components)),
             "contact_velocity_samples": int(len(components)),
@@ -462,6 +469,9 @@ def _touchdown_metrics(
         "contact_relative_velocity_x_mean_m_s": math.nan,
         "contact_relative_velocity_y_mean_m_s": math.nan,
         "contact_relative_velocity_z_mean_m_s": math.nan,
+        "contact_relative_velocity_x_abs_mean_m_s": math.nan,
+        "contact_relative_velocity_y_abs_mean_m_s": math.nan,
+        "contact_relative_velocity_z_abs_mean_m_s": math.nan,
         "contact_relative_speed_mean_m_s": math.nan,
         "contact_relative_speed_from_mean_components_m_s": math.nan,
         "contact_speed_abs_m_s": math.nan,  # compatibility alias to relative-speed magnitude
@@ -898,6 +908,9 @@ def build_campaign(campaign_dir: Path, output_dir: Path, contact_window_sec: flo
         "contact_relative_velocity_x_mean_m_s",
         "contact_relative_velocity_y_mean_m_s",
         "contact_relative_velocity_z_mean_m_s",
+        "contact_relative_velocity_x_abs_mean_m_s",
+        "contact_relative_velocity_y_abs_mean_m_s",
+        "contact_relative_velocity_z_abs_mean_m_s",
         "contact_relative_speed_from_mean_components_m_s",
         "contact_closing_rate_m_s",
         "contact_closing_speed_abs_m_s",
